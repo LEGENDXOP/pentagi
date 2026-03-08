@@ -419,6 +419,10 @@ func (fp *flowProvider) performCoder(
 		return "", fmt.Errorf("failed to get task coder result: %w", err)
 	}
 
+	if codeResult.Result == "" {
+		return "", fmt.Errorf("agent chain completed without producing a code result")
+	}
+
 	if agentCtx, ok := tools.GetAgentContext(ctx); ok {
 		fp.putAgentLog(
 			ctx,
@@ -493,6 +497,10 @@ func (fp *flowProvider) performInstaller(
 		return "", fmt.Errorf("failed to get task installer result: %w", err)
 	}
 
+	if maintenanceResult.Result == "" {
+		return "", fmt.Errorf("agent chain completed without producing a maintenance result")
+	}
+
 	if agentCtx, ok := tools.GetAgentContext(ctx); ok {
 		fp.putAgentLog(
 			ctx,
@@ -547,6 +555,10 @@ func (fp *flowProvider) performMemorist(
 	err = fp.performAgentChain(ctx, optAgentType, msgChainID, taskID, subtaskID, chain, executor, fp.summarizer)
 	if err != nil {
 		return "", fmt.Errorf("failed to get task memorist result: %w", err)
+	}
+
+	if memoristResult.Result == "" {
+		return "", fmt.Errorf("agent chain completed without producing a memorist result")
 	}
 
 	if agentCtx, ok := tools.GetAgentContext(ctx); ok {
@@ -635,6 +647,10 @@ func (fp *flowProvider) performPentester(
 		return "", fmt.Errorf("failed to get task pentester result: %w", err)
 	}
 
+	if hackResult.Result == "" {
+		return "", fmt.Errorf("agent chain completed without producing a pentester result")
+	}
+
 	if agentCtx, ok := tools.GetAgentContext(ctx); ok {
 		fp.putAgentLog(
 			ctx,
@@ -695,6 +711,10 @@ func (fp *flowProvider) performSearcher(
 	err = fp.performAgentChain(ctx, optAgentType, msgChainID, taskID, subtaskID, chain, executor, fp.summarizer)
 	if err != nil {
 		return "", fmt.Errorf("failed to get task searcher result: %w", err)
+	}
+
+	if searchResult.Result == "" {
+		return "", fmt.Errorf("agent chain completed without producing a search result")
 	}
 
 	if agentCtx, ok := tools.GetAgentContext(ctx); ok {
@@ -764,6 +784,10 @@ func (fp *flowProvider) performEnricher(
 		return "", fmt.Errorf("failed to get task enricher result: %w", err)
 	}
 
+	if enricherResult.Result == "" {
+		return "", fmt.Errorf("agent chain completed without producing an enricher result")
+	}
+
 	if agentCtx, ok := tools.GetAgentContext(ctx); ok {
 		fp.putAgentLog(
 			ctx,
@@ -815,7 +839,7 @@ func (fp *flowProvider) performSimpleChain(
 			case <-ctx.Done():
 				return "", ctx.Err()
 			case <-time.After(time.Second * 5):
-			default:
+				// intentional delay between retries
 			}
 		}
 	}
@@ -868,6 +892,9 @@ func (fp *flowProvider) performSimpleChain(
 		TaskID:          database.Int64ToNullInt64(taskID),
 		SubtaskID:       database.Int64ToNullInt64(subtaskID),
 	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create msg chain: %w", err)
+	}
 
 	return strings.Join(parts, "\n\n"), nil
 }

@@ -707,7 +707,12 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 	)
 	ctx, _ = executorAgent.Observation(ctx)
 
-	performResult := PerformResultError
+	var performResultVal atomic.Int32
+	performResultVal.Store(int32(PerformResultError))
+	var endAgentOnce sync.Once
+	endAgent := func(opts ...langfuse.AgentOption) {
+		endAgentOnce.Do(func() { executorAgent.End(opts...) })
+	}
 	cfg := tools.PrimaryExecutorConfig{
 		TaskID:    taskID,
 		SubtaskID: subtaskID,
@@ -740,17 +745,17 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 					langfuse.WithAgentOutput(done.Result),
 				}
 				defer func() {
-					executorAgent.End(opts...)
+					endAgent(opts...)
 				}()
 
 				if !done.Success {
-					performResult = PerformResultError
+					performResultVal.Store(int32(PerformResultError))
 					opts = append(opts,
 						langfuse.WithAgentStatus("done handler: failed"),
 						langfuse.WithAgentLevel(langfuse.ObservationLevelWarning),
 					)
 				} else {
-					performResult = PerformResultDone
+					performResultVal.Store(int32(PerformResultDone))
 					opts = append(opts,
 						langfuse.WithAgentStatus("done handler: success"),
 					)
@@ -801,7 +806,7 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 				}
 
 			case tools.AskUserToolName:
-				performResult = PerformResultWaiting
+				performResultVal.Store(int32(PerformResultWaiting))
 
 				var askUser tools.AskUser
 				if err := json.Unmarshal(args, &askUser); err != nil {
@@ -809,7 +814,7 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 					return "", fmt.Errorf("failed to unmarshal ask user result: %w", err)
 				}
 
-				executorAgent.End(
+				endAgent(
 					langfuse.WithAgentOutput(askUser.Message),
 					langfuse.WithAgentStatus("ask user handler"),
 				)
@@ -825,22 +830,43 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 		return PerformResultError, wrapErrorEndAgentSpan(ctx, executorAgent, "failed to get primary executor", err)
 	}
 
+	// Create a global execution budget if one doesn't exist yet (top-level entry).
+	// Sub-agents inherit the budget from their parent via context.
+	if GetBudget(ctx) == nil {
+		ctx = WithBudget(ctx, NewExecutionBudget(defaultGlobalMaxToolCalls, defaultGlobalMaxDuration))
+	}
+
 	ctx = tools.PutAgentContext(ctx, msgChainType)
 	err = fp.performAgentChain(
 		ctx, optAgentType, msgChain.ID, &taskID, &subtaskID, chain, executor, fp.summarizer,
 	)
 	if err != nil {
-		return PerformResultError, wrapErrorEndAgentSpan(ctx, executorAgent, "failed to perform primary agent chain", err)
+		logrus.WithContext(ctx).WithError(err).Error("failed to perform primary agent chain")
+		endAgent(
+			langfuse.WithAgentStatus(err.Error()),
+			langfuse.WithAgentLevel(langfuse.ObservationLevelError),
+		)
+		return PerformResultError, fmt.Errorf("failed to perform primary agent chain: %w", err)
 	}
 
-	executorAgent.End()
+	endAgent()
 
-	return performResult, nil
+	return PerformResult(performResultVal.Load()), nil
 }
+
+const maxUserInputSize = 32 * 1024 // 32KB maximum user input size
 
 func (fp *flowProvider) PutInputToAgentChain(ctx context.Context, msgChainID int64, input string) error {
 	ctx, span := obs.Observer.NewSpan(ctx, obs.SpanKindInternal, "providers.flowProvider.PutInputToAgentChain")
 	defer span.End()
+
+	if len(input) == 0 {
+		return fmt.Errorf("user input is empty")
+	}
+
+	if len(input) > maxUserInputSize {
+		return fmt.Errorf("user input exceeds maximum size (%d > %d bytes)", len(input), maxUserInputSize)
+	}
 
 	logger := logrus.WithContext(ctx).WithFields(logrus.Fields{
 		"provider":     fp.Type(),

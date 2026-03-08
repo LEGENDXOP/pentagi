@@ -73,24 +73,12 @@ func (c *CallUsage) Fill(info map[string]any) {
 }
 
 func (c *CallUsage) Merge(other CallUsage) {
-	if other.Input > 0 {
-		c.Input = other.Input
-	}
-	if other.Output > 0 {
-		c.Output = other.Output
-	}
-	if other.CacheRead > 0 {
-		c.CacheRead = other.CacheRead
-	}
-	if other.CacheWrite > 0 {
-		c.CacheWrite = other.CacheWrite
-	}
-	if other.CostInput > 0 {
-		c.CostInput = other.CostInput
-	}
-	if other.CostOutput > 0 {
-		c.CostOutput = other.CostOutput
-	}
+	c.Input += other.Input
+	c.Output += other.Output
+	c.CacheRead += other.CacheRead
+	c.CacheWrite += other.CacheWrite
+	c.CostInput += other.CostInput
+	c.CostOutput += other.CostOutput
 }
 
 func (c *CallUsage) UpdateCost(price *PriceInfo) {
@@ -189,6 +177,13 @@ type ReasoningConfig struct {
 	MaxTokens int                  `json:"max_tokens,omitempty" yaml:"max_tokens,omitempty"`
 }
 
+// Execution limit defaults — used when config values are zero/unset
+const (
+	DefaultMaxToolCallsPerSubtask = 50
+	DefaultSubtaskTimeoutSec      = 900  // 15 minutes
+	DefaultMaxOutputSize          = 1048576 // 1 MB
+)
+
 // AgentConfig represents the configuration for a single agent
 type AgentConfig struct {
 	Model             string          `json:"model,omitempty" yaml:"model,omitempty"`
@@ -206,7 +201,37 @@ type AgentConfig struct {
 	ResponseMIMEType  string          `json:"response_mime_type,omitempty" yaml:"response_mime_type,omitempty"`
 	Reasoning         ReasoningConfig `json:"reasoning,omitempty" yaml:"reasoning,omitempty"`
 	Price             *PriceInfo      `json:"price,omitempty" yaml:"price,omitempty"`
-	raw               map[string]any  `json:"-" yaml:"-"`
+
+	// Execution limits (enforced at Go level, not prompt level)
+	MaxToolCallsPerSubtask int `json:"max_tool_calls_per_subtask,omitempty" yaml:"max_tool_calls_per_subtask,omitempty"`
+	SubtaskTimeoutSec      int `json:"subtask_timeout_sec,omitempty" yaml:"subtask_timeout_sec,omitempty"`
+	MaxOutputSize          int `json:"max_output_size,omitempty" yaml:"max_output_size,omitempty"`
+
+	raw map[string]any `json:"-" yaml:"-"`
+}
+
+// GetMaxToolCallsPerSubtask returns the configured limit or the default.
+func (ac *AgentConfig) GetMaxToolCallsPerSubtask() int {
+	if ac != nil && ac.MaxToolCallsPerSubtask > 0 {
+		return ac.MaxToolCallsPerSubtask
+	}
+	return DefaultMaxToolCallsPerSubtask
+}
+
+// GetSubtaskTimeoutSec returns the configured timeout or the default.
+func (ac *AgentConfig) GetSubtaskTimeoutSec() int {
+	if ac != nil && ac.SubtaskTimeoutSec > 0 {
+		return ac.SubtaskTimeoutSec
+	}
+	return DefaultSubtaskTimeoutSec
+}
+
+// GetMaxOutputSize returns the configured max output size or the default.
+func (ac *AgentConfig) GetMaxOutputSize() int {
+	if ac != nil && ac.MaxOutputSize > 0 {
+		return ac.MaxOutputSize
+	}
+	return DefaultMaxOutputSize
 }
 
 // ProviderConfig represents the configuration for all agents

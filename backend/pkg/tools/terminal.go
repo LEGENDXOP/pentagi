@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"pentagi/pkg/database"
@@ -19,6 +21,28 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/sirupsen/logrus"
 )
+
+// blockedCommandPatterns prevents obviously dangerous commands from executing.
+// Note: for a pentesting tool, some dangerous commands are legitimate against targets,
+// so this blocklist focuses on host/container-destructive patterns only.
+var blockedCommandPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)(curl|wget).*\|\s*(ba)?sh`),  // pipe-to-shell
+	regexp.MustCompile(`(?i)rm\s+-[a-z]*r[a-z]*f[a-z]*\s+/\s*$`), // rm -rf /
+	regexp.MustCompile(`(?i)rm\s+-[a-z]*f[a-z]*r[a-z]*\s+/\s*$`), // rm -fr /
+	regexp.MustCompile(`(?i)mkfs\s+/dev/`),                // format disks
+	regexp.MustCompile(`(?i):\(\)\{\s*:\|:&\s*\};:`),      // fork bomb
+	regexp.MustCompile(`(?i)>\s*/dev/sd[a-z]`),            // overwrite disk devices
+	regexp.MustCompile(`(?i)(shutdown|reboot|halt|poweroff)\b`), // system shutdown/reboot
+}
+
+func validateCommand(command string) error {
+	for _, pattern := range blockedCommandPatterns {
+		if pattern.MatchString(command) {
+			return fmt.Errorf("command blocked by security policy: matches dangerous pattern %q", pattern.String())
+		}
+	}
+	return nil
+}
 
 const (
 	defaultExecCommandTimeout = 5 * time.Minute
@@ -32,6 +56,7 @@ type execResult struct {
 }
 
 type terminal struct {
+	mu           sync.Mutex // enforce serial command execution (Fix 13)
 	flowID       int64
 	taskID       *int64
 	subtaskID    *int64
@@ -60,7 +85,7 @@ func (t *terminal) wrapCommandResult(ctx context.Context, args json.RawMessage, 
 	ctx, observation := obs.Observer.NewObservation(ctx)
 	if err != nil {
 		observation.Event(
-			langfuse.WithEventName("terminal tool error swallowed"),
+			langfuse.WithEventName("terminal tool error"),
 			langfuse.WithEventInput(args),
 			langfuse.WithEventStatus(err.Error()),
 			langfuse.WithEventLevel(langfuse.ObservationLevelWarning),
@@ -74,7 +99,18 @@ func (t *terminal) wrapCommandResult(ctx context.Context, args json.RawMessage, 
 			"tool":   name,
 			"result": result[:min(len(result), 1000)],
 		}).Error("terminal tool failed")
-		return fmt.Sprintf("terminal tool '%s' handled with error: %v", name, err), nil
+
+		// Prefix with [ERROR] so the system can detect and track tool failures
+		// instead of silently converting errors to success strings (Fix 30)
+		errMsg := fmt.Sprintf("[ERROR] terminal tool '%s' failed: %v", name, err)
+		if result != "" {
+			partial := result
+			if len(partial) > 4096 {
+				partial = partial[:4096]
+			}
+			errMsg += fmt.Sprintf("\nPartial output:\n%s", partial)
+		}
+		return errMsg, nil
 	}
 	return result, nil
 }
@@ -129,6 +165,15 @@ func (t *terminal) ExecCommand(
 	detach bool,
 	timeout time.Duration,
 ) (string, error) {
+	// Fix 13: enforce serial execution — only one command at a time
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Fix 10: validate command against blocklist
+	if err := validateCommand(command); err != nil {
+		return "", err
+	}
+
 	containerName := PrimaryTerminalName(t.flowID)
 
 	// create options for starting the exec process
@@ -210,11 +255,13 @@ func (t *terminal) getExecResult(ctx context.Context, id string, timeout time.Du
 	}
 	defer resp.Close()
 
+	const maxOutputSize = 512 * 1024 // 512 KB limit (Fix 11)
 	dst := bytes.Buffer{}
 	errChan := make(chan error, 1)
 
 	go func() {
-		_, copyErr := io.Copy(&dst, resp.Reader)
+		limitedReader := io.LimitReader(resp.Reader, int64(maxOutputSize)+1)
+		_, copyErr := io.Copy(&dst, limitedReader)
 		errChan <- copyErr
 	}()
 
@@ -241,6 +288,11 @@ func (t *terminal) getExecResult(ctx context.Context, id string, timeout time.Du
 	}
 
 	results := dst.String()
+	// Fix 11: truncate oversized output
+	if len(results) > maxOutputSize {
+		results = results[:maxOutputSize] + "\n\n[OUTPUT TRUNCATED: exceeded 512KB limit]"
+	}
+
 	formattedResults := FormatTerminalSystemOutput(results)
 	_, err = t.tlp.PutMsg(ctx, database.TermlogTypeStdout, formattedResults, t.containerID, t.taskID, t.subtaskID)
 	if err != nil {
@@ -303,9 +355,9 @@ func (t *terminal) ReadFile(ctx context.Context, flowID int64, path string) (str
 			)
 		}
 
-		const maxReadFileSize int64 = 100 * 1024 * 1024 // 100 MB limit
+		const maxReadFileSize int64 = 1 * 1024 * 1024 // 1 MB limit (Fix 31: reduced from 100MB)
 		if tarHeader.Size > maxReadFileSize {
-			return "", fmt.Errorf("file '%s' size %d exceeds maximum allowed size %d", tarHeader.Name, tarHeader.Size, maxReadFileSize)
+			return "", fmt.Errorf("file '%s' size %d exceeds maximum allowed size %d (1MB limit for LLM consumption)", tarHeader.Name, tarHeader.Size, maxReadFileSize)
 		}
 		if tarHeader.Size < 0 {
 			return "", fmt.Errorf("file '%s' has invalid size %d", tarHeader.Name, tarHeader.Size)
@@ -316,6 +368,16 @@ func (t *terminal) ReadFile(ctx context.Context, flowID int64, path string) (str
 		if err != nil && err != io.EOF {
 			return "", fmt.Errorf("failed to read file '%s' content: %w", tarHeader.Name, err)
 		}
+
+		// Fix 31: detect binary files — check first 512 bytes for null bytes
+		checkLen := min(len(fileContent), 512)
+		for _, b := range fileContent[:checkLen] {
+			if b == 0 {
+				return fmt.Sprintf("file '%s' appears to be binary (%d bytes), cannot display as text",
+					tarHeader.Name, tarHeader.Size), nil
+			}
+		}
+
 		buffer.Write(fileContent)
 
 		if stats.Mode.IsDir() {
@@ -334,6 +396,18 @@ func (t *terminal) ReadFile(ctx context.Context, flowID int64, path string) (str
 }
 
 func (t *terminal) WriteFile(ctx context.Context, flowID int64, content string, path string) (string, error) {
+	// Fix 12: restrict write paths to working directory and /tmp/
+	cleanPath := filepath.Clean(path)
+	if !strings.HasPrefix(cleanPath, docker.WorkFolderPathInContainer) && !strings.HasPrefix(cleanPath, "/tmp/") {
+		return "", fmt.Errorf("write path must be within %s or /tmp/, got: %s", docker.WorkFolderPathInContainer, path)
+	}
+	// Block known sensitive directories even within allowed prefixes
+	for _, blocked := range []string{"/etc/", "/proc/", "/sys/", "/root/", "/dev/"} {
+		if strings.HasPrefix(cleanPath, blocked) {
+			return "", fmt.Errorf("write to sensitive path %q is blocked by security policy", path)
+		}
+	}
+
 	containerName := PrimaryTerminalName(flowID)
 
 	isRunning, err := t.dockerClient.IsContainerRunning(ctx, t.containerLID)

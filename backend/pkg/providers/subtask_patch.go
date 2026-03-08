@@ -140,7 +140,10 @@ func applySubtaskOperations(
 				},
 			}
 
-			insertIdx := calculateInsertIndex(op.AfterID, idToIdx, len(result))
+			insertIdx, err := calculateInsertIndex(op.AfterID, idToIdx, removed, len(result))
+			if err != nil {
+				opLogger.WithError(err).Warn("insert index calculation had issues, using fallback position")
+			}
 			result = slices.Insert(result, insertIdx, newSubtask)
 
 			// Rebuild index map after insertion
@@ -173,7 +176,10 @@ func applySubtaskOperations(
 			idToIdx = buildIndexMap(result)
 
 			// Calculate new position and insert
-			insertIdx := calculateInsertIndex(op.AfterID, idToIdx, len(result))
+			insertIdx, err := calculateInsertIndex(op.AfterID, idToIdx, removed, len(result))
+			if err != nil {
+				opLogger.WithError(err).Warn("reorder target calculation had issues, using fallback position")
+			}
 			result = slices.Insert(result, insertIdx, subtaskToMove)
 
 			// Rebuild index map after insertion
@@ -217,18 +223,26 @@ func buildIndexMap(subtasks []tools.SubtaskInfoPatch) map[int64]int {
 	return idToIdx
 }
 
-// calculateInsertIndex determines the insertion index based on afterID
-func calculateInsertIndex(afterID *int64, idToIdx map[int64]int, length int) int {
+// calculateInsertIndex determines the insertion index based on afterID.
+// It also takes a removed map to detect when afterID references a subtask that
+// was removed in the same patch, returning an error instead of silently appending to the end.
+func calculateInsertIndex(afterID *int64, idToIdx map[int64]int, removed map[int64]bool, length int) (int, error) {
 	if afterID == nil || *afterID == 0 {
-		return 0 // Insert at beginning
+		return 0, nil // Insert at beginning
 	}
 
 	if idx, ok := idToIdx[*afterID]; ok {
-		return idx + 1 // Insert after the referenced subtask
+		return idx + 1, nil // Insert after the referenced subtask
+	}
+
+	if removed != nil && removed[*afterID] {
+		logrus.WithField("after_id", *afterID).Warn("afterID references a subtask removed in this patch, appending to end")
+		return length, fmt.Errorf("afterID %d was removed in this patch", *afterID)
 	}
 
 	// AfterID not found, append to end
-	return length
+	logrus.WithField("after_id", *afterID).Warn("afterID not found, appending to end")
+	return length, nil
 }
 
 // ValidateSubtaskPatch validates the operations in a SubtaskPatch

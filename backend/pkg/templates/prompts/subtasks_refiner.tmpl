@@ -67,4 +67,12 @@
   {{.ExecutionLogs}}
   </execution_logs>
   {{end}}
+
+  <deduplication_guidance>
+  IMPORTANT: Before finalizing your refined plan, compare each planned subtask against ALL completed subtask results above:
+  - If a planned subtask's objective is FULLY achieved by completed results → REMOVE it
+  - If a planned subtask is PARTIALLY covered by completed results → MODIFY it to cover only the remaining gap
+  - Never create new subtasks that duplicate work already successfully completed
+  - When checking for overlap, compare the semantic intent, not just the title — a completed "port scan" covers a planned "network reconnaissance" if ports were already scanned
+  </deduplication_guidance>
 </refinement_context>

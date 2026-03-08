@@ -46,18 +46,19 @@ type FlowWorker interface {
 }
 
 type flowWorker struct {
-	tc      TaskController
-	wg      *sync.WaitGroup
-	aws     map[int64]AssistantWorker
-	awsMX   *sync.Mutex
-	ctx     context.Context
-	cancel  context.CancelFunc
-	taskMX  *sync.Mutex
-	taskST  context.CancelFunc
-	taskWG  *sync.WaitGroup
-	input   chan flowInput
-	flowCtx *FlowContext
-	logger  *logrus.Entry
+	tc        TaskController
+	wg        *sync.WaitGroup
+	aws       map[int64]AssistantWorker
+	awsMX     *sync.Mutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+	taskMX    *sync.Mutex
+	taskST    context.CancelFunc
+	taskWG    *sync.WaitGroup
+	input     chan flowInput
+	closeOnce sync.Once
+	flowCtx   *FlowContext
+	logger    *logrus.Entry
 }
 
 type newFlowWorkerCtx struct {
@@ -594,9 +595,17 @@ func (fw *flowWorker) PutInput(ctx context.Context, input string) error {
 	}
 }
 
-func (fw *flowWorker) Finish(ctx context.Context) error {
+func (fw *flowWorker) Finish(ctx context.Context) (retErr error) {
 	ctx, span := obs.Observer.NewSpan(ctx, obs.SpanKindInternal, "controller.flowWorker.Finish")
 	defer span.End()
+
+	defer func() {
+		if retErr != nil {
+			// On any error path, mark the flow as failed so it doesn't remain
+			// in "Running" status on restart and attempt to resume corrupted state.
+			_ = fw.SetStatus(ctx, database.FlowStatusFailed)
+		}
+	}()
 
 	if err := fw.finish(); err != nil {
 		return err
@@ -685,7 +694,7 @@ func (fw *flowWorker) finish() error {
 	}
 
 	fw.cancel()
-	close(fw.input)
+	fw.closeOnce.Do(func() { close(fw.input) })
 	fw.wg.Wait()
 
 	return nil
@@ -788,7 +797,8 @@ func (fw *flowWorker) runTask(spanName, input string, task TaskWorker) error {
 	)
 
 	fw.taskMX.Lock()
-	fw.taskST()
+	fw.taskST()    // cancel previous task
+	fw.taskWG.Wait() // wait for previous task to fully stop before starting new one
 	ctx, taskST := context.WithCancel(fw.ctx)
 	fw.taskST = taskST
 	fw.taskMX.Unlock()

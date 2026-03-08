@@ -336,7 +336,7 @@ func (fte *flowToolsExecutor) SetEmbedder(embedder embeddings.Embedder) {
 	}
 
 	store, err := pgvector.New(
-		context.Background(),
+		context.TODO(), // Fix 42: TODO — pass ctx when SetEmbedder interface is updated
 		pgvector.WithConnectionURL(fte.cfg.DatabaseURL),
 		pgvector.WithEmbedder(embedder),
 	)
@@ -423,12 +423,42 @@ func (fte *flowToolsExecutor) Release(ctx context.Context) error {
 		fte.store.Close()
 	}
 
-	// TODO: here better to get flow containers list and delete all of them
-	if err := fte.docker.DeleteContainer(ctx, fte.primaryLID, fte.primaryID); err != nil {
-		containerName := PrimaryTerminalName(fte.flowID)
-		return fmt.Errorf("failed to delete container '%s': %w", containerName, err)
+	// Fix 40: clean up ALL flow containers, not just primary
+	containers, err := fte.db.GetFlowContainers(ctx, fte.flowID)
+	if err != nil {
+		logrus.WithError(err).WithField("flow_id", fte.flowID).
+			Warn("failed to list flow containers for cleanup, falling back to primary only")
+		// Fallback: at least try to delete the primary container
+		if delErr := fte.docker.DeleteContainer(ctx, fte.primaryLID, fte.primaryID); delErr != nil {
+			containerName := PrimaryTerminalName(fte.flowID)
+			return fmt.Errorf("failed to delete container '%s': %w", containerName, delErr)
+		}
+		return nil
 	}
 
+	var errs []error
+	for _, cnt := range containers {
+		if err := fte.docker.DeleteContainer(ctx, cnt.LocalID.String, cnt.ID); err != nil {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"container_id":    cnt.ID,
+				"container_name":  cnt.Name,
+				"container_local": cnt.LocalID.String,
+			}).Warn("failed to delete flow container during release")
+			errs = append(errs, fmt.Errorf("container %s (ID %d): %w", cnt.Name, cnt.ID, err))
+		}
+	}
+
+	// If no containers were found in DB (edge case), still try primary
+	if len(containers) == 0 {
+		if err := fte.docker.DeleteContainer(ctx, fte.primaryLID, fte.primaryID); err != nil {
+			containerName := PrimaryTerminalName(fte.flowID)
+			errs = append(errs, fmt.Errorf("failed to delete primary container '%s': %w", containerName, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("errors during container cleanup: %v", errs)
+	}
 	return nil
 }
 
@@ -500,7 +530,7 @@ func (fte *flowToolsExecutor) GetAssistantExecutor(cfg AssistantExecutorConfig) 
 		return nil, fmt.Errorf("searcher handler is required")
 	}
 
-	container, err := fte.db.GetFlowPrimaryContainer(context.Background(), fte.flowID)
+	container, err := fte.db.GetFlowPrimaryContainer(context.TODO(), fte.flowID) // Fix 42: TODO — pass ctx when interface is updated
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container %d: %w", fte.flowID, err)
 	}
@@ -790,7 +820,7 @@ func (fte *flowToolsExecutor) GetInstallerExecutor(cfg InstallerExecutorConfig) 
 		return nil, fmt.Errorf("searcher handler is required")
 	}
 
-	container, err := fte.db.GetFlowPrimaryContainer(context.Background(), fte.flowID)
+	container, err := fte.db.GetFlowPrimaryContainer(context.TODO(), fte.flowID) // Fix 42: TODO — pass ctx when interface is updated
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container %d: %w", fte.flowID, err)
 	}
@@ -982,7 +1012,7 @@ func (fte *flowToolsExecutor) GetPentesterExecutor(cfg PentesterExecutorConfig) 
 		return nil, fmt.Errorf("searcher handler is required")
 	}
 
-	container, err := fte.db.GetFlowPrimaryContainer(context.Background(), fte.flowID)
+	container, err := fte.db.GetFlowPrimaryContainer(context.TODO(), fte.flowID) // Fix 42: TODO — pass ctx when interface is updated
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container %d: %w", fte.flowID, err)
 	}
@@ -1264,7 +1294,7 @@ func (fte *flowToolsExecutor) GetGeneratorExecutor(cfg GeneratorExecutorConfig) 
 		return nil, fmt.Errorf("memorist handler is required")
 	}
 
-	container, err := fte.db.GetFlowPrimaryContainer(context.Background(), fte.flowID)
+	container, err := fte.db.GetFlowPrimaryContainer(context.TODO(), fte.flowID) // Fix 42: TODO — pass ctx when interface is updated
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container %d: %w", fte.flowID, err)
 	}
@@ -1327,7 +1357,7 @@ func (fte *flowToolsExecutor) GetRefinerExecutor(cfg RefinerExecutorConfig) (Con
 		return nil, fmt.Errorf("memorist handler is required")
 	}
 
-	container, err := fte.db.GetFlowPrimaryContainer(context.Background(), fte.flowID)
+	container, err := fte.db.GetFlowPrimaryContainer(context.TODO(), fte.flowID) // Fix 42: TODO — pass ctx when interface is updated
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container %d: %w", fte.flowID, err)
 	}
@@ -1386,7 +1416,7 @@ func (fte *flowToolsExecutor) GetMemoristExecutor(cfg MemoristExecutorConfig) (C
 		return nil, fmt.Errorf("search result handler is required")
 	}
 
-	container, err := fte.db.GetFlowPrimaryContainer(context.Background(), fte.flowID)
+	container, err := fte.db.GetFlowPrimaryContainer(context.TODO(), fte.flowID) // Fix 42: TODO — pass ctx when interface is updated
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container %d: %w", fte.flowID, err)
 	}

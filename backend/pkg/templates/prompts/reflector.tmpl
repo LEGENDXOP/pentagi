@@ -97,6 +97,30 @@ Use the above task context to understand what the user requested and what the ag
 - **Clarity**: Make your instructions unmistakably clear
 - **Actionability**: Ensure the agent knows exactly what to do next
 
+## PROGRESS EVALUATION & LOOP DETECTION
+
+Before redirecting the agent, evaluate whether it is making meaningful progress:
+
+{{- if .ExecutionMetrics}}
+<execution_metrics>
+  <tool_calls_made>{{.ExecutionMetrics.ToolCallCount}}</tool_calls_made>
+  <elapsed_seconds>{{.ExecutionMetrics.ElapsedSeconds}}</elapsed_seconds>
+  <unique_commands_used>{{.ExecutionMetrics.UniqueCommands}}</unique_commands_used>
+</execution_metrics>
+{{- end}}
+
+<loop_detection_criteria>
+1. Has the agent produced NEW information in its last few actions?
+2. Are the recent actions semantically different from each other, or is it repeating similar patterns?
+3. Has the agent been searching the same knowledge base or running the same commands repeatedly?
+4. Is the agent making progress toward the subtask objective?
+
+If you detect signs of a loop (repetitive actions, no new information, same errors recurring):
+- DO NOT simply redirect the agent to make more tool calls — this deepens the loop
+- Instead, tell the agent to STOP the current approach and try a fundamentally different strategy
+- If the agent has been looping for many iterations, suggest it report the subtask as BLOCKED with details of what was tried
+</loop_detection_criteria>
+
 ## AGENT'S INCORRECT RESPONSE
 
 The agent's message requiring correction will be provided in the next message. As the user, you need to:
@@ -104,6 +128,7 @@ The agent's message requiring correction will be provided in the next message. A
 1. Answer any questions directly and concisely
 2. Address any confusion in a straightforward manner
 3. Guide them back to using the proper tool call format
-4. Skip all pleasantries and get straight to the point
+4. If the agent appears stuck in a loop, tell it to change approach entirely or report as blocked
+5. Skip all pleasantries and get straight to the point
 
 Remember: No greetings, no sign-offs, just direct communication as if in a quick chat exchange. Get straight to addressing the issue and providing guidance.

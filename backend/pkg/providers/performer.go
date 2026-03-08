@@ -31,6 +31,8 @@ const (
 	maxRetriesToCallFunction    = 3
 	maxReflectorCallsPerChain   = 3
 	delayBetweenRetries         = 5 * time.Second
+	maxToolCallsPerSubtask      = 50                // hard cap per subtask
+	maxSubtaskDuration          = 15 * time.Minute   // hard time limit per subtask
 )
 
 type callResult struct {
@@ -54,9 +56,11 @@ func (fp *flowProvider) performAgentChain(
 	defer span.End()
 
 	var (
-		wantToStop        bool
-		detector          = &repeatingDetector{}
-		summarizerHandler = fp.GetSummarizeResultHandler(taskID, subtaskID)
+		wantToStop           bool
+		detector             = newRepeatingDetector()
+		summarizerHandler    = fp.GetSummarizeResultHandler(taskID, subtaskID)
+		toolCallCount        int
+		summarizerFailures   int
 	)
 
 	fields := logrus.Fields{
@@ -91,7 +95,16 @@ func (fp *flowProvider) performAgentChain(
 	groupID := fmt.Sprintf("flow-%d", fp.flowID)
 	toolTypeMapping := tools.GetToolTypeMapping()
 
+	// Hard time limit per subtask to prevent infinite execution
+	ctx, timeoutCancel := context.WithTimeout(ctx, maxSubtaskDuration)
+	defer timeoutCancel()
+
 	for {
+		if err := ctx.Err(); err != nil {
+			logger.WithError(err).Warn("context cancelled/timed out in agent chain loop")
+			return fmt.Errorf("agent chain loop terminated: %w", err)
+		}
+
 		result, err := fp.callWithRetries(ctx, chain, optAgentType, executor)
 		if err != nil {
 			logger.WithError(err).Error("failed to call agent chain")
@@ -191,6 +204,21 @@ func (fp *flowProvider) performAgentChain(
 			}
 		}
 
+		toolCallCount += len(result.funcCalls)
+		if toolCallCount >= maxToolCallsPerSubtask {
+			logger.WithField("tool_call_count", toolCallCount).
+				Warn("reached max tool calls per subtask, forcing stop")
+			return fmt.Errorf("subtask tool call limit reached (%d calls)", toolCallCount)
+		}
+
+		// Check global budget across entire delegation tree
+		if budget := GetBudget(ctx); budget != nil {
+			if err := budget.Consume(len(result.funcCalls)); err != nil {
+				logger.WithError(err).Warn("global execution budget exceeded")
+				return err
+			}
+		}
+
 		if wantToStop {
 			return nil
 		}
@@ -199,6 +227,7 @@ func (fp *flowProvider) performAgentChain(
 			// it returns the same chain state if error occurs
 			chain, err = summarizer.SummarizeChain(ctx, summarizerHandler, chain, fp.tcIDTemplate)
 			if err != nil {
+				summarizerFailures++
 				// log swallowed error
 				_, observation := obs.Observer.NewObservation(ctx)
 				observation.Event(
@@ -207,15 +236,23 @@ func (fp *flowProvider) performAgentChain(
 					langfuse.WithEventStatus(err.Error()),
 					langfuse.WithEventLevel(langfuse.ObservationLevelWarning),
 					langfuse.WithEventMetadata(langfuse.Metadata{
-						"tc_id_template": fp.tcIDTemplate,
-						"msg_chain_id":   chainID,
-						"error":          err.Error(),
+						"tc_id_template":      fp.tcIDTemplate,
+						"msg_chain_id":        chainID,
+						"error":               err.Error(),
+						"consecutive_failures": summarizerFailures,
 					}),
 				)
-				logger.WithError(err).Warn("failed to summarize chain")
-			} else if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
-				logger.WithError(err).Error("failed to update msg chain")
-				return err
+				logger.WithError(err).WithField("consecutive_failures", summarizerFailures).
+					Warn("failed to summarize chain")
+				if summarizerFailures >= 3 {
+					return fmt.Errorf("chain summarization repeatedly failed (%d times): %w", summarizerFailures, err)
+				}
+			} else {
+				summarizerFailures = 0 // reset on success
+				if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+					logger.WithError(err).Error("failed to update msg chain")
+					return err
+				}
 			}
 		}
 	}
@@ -388,7 +425,20 @@ func (fp *flowProvider) callWithRetries(
 
 		var streamCb streaming.Callback
 		if fp.streamCb != nil {
+			// Close abandoned stream from previous retry attempt
+			if result.streamID != 0 {
+				_ = fp.streamCb(ctx, &StreamMessageChunk{
+					Type:     StreamMessageChunkTypeFlush,
+					MsgType:  msgType,
+					StreamID: result.streamID,
+				})
+			}
 			result.streamID = fp.callCounter.Add(1)
+			// Reset result state for retry to avoid accumulating stale data
+			result.funcCalls = nil
+			result.content = ""
+			result.info = nil
+			result.thinking = nil
 			streamCb = func(ctx context.Context, chunk streaming.Chunk) error {
 				switch chunk.Type {
 				case streaming.ChunkTypeReasoning:

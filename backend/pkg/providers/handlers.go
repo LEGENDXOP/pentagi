@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -21,6 +22,10 @@ import (
 )
 
 func wrapError(ctx context.Context, msg string, err error) error {
+	if err == nil {
+		logrus.WithContext(ctx).Error(msg)
+		return errors.New(msg)
+	}
 	logrus.WithContext(ctx).WithError(err).Error(msg)
 	return fmt.Errorf("%s: %w", msg, err)
 }
@@ -427,36 +432,38 @@ func (fp *flowProvider) GetMemoristHandler(ctx context.Context, taskID, subtaskI
 		if action.TaskID != nil && taskID != nil && action.TaskID.Int64() == *taskID {
 			executionDetails += fmt.Sprintf("user requested current task '%d'\n", *taskID)
 		} else if action.TaskID != nil {
-			taskID := action.TaskID.Int64()
+			requestedTaskID := action.TaskID.Int64()
 			t, err := fp.db.GetFlowTask(ctx, database.GetFlowTaskParams{
-				ID:     taskID,
+				ID:     requestedTaskID,
 				FlowID: fp.flowID,
 			})
 			if err != nil {
-				executionDetails += fmt.Sprintf("failed to get requested task '%d': %s\n", taskID, err)
+				executionDetails += fmt.Sprintf("failed to get requested task '%d': %s\n", requestedTaskID, err)
 			}
 			requestedTask = &t
+		} else if taskID != nil {
+			executionDetails += fmt.Sprintf("user did not specify a task, using current task '%d'\n", *taskID)
 		} else {
-			executionDetails += fmt.Sprintf("user no specified task, using current task '%d'\n", taskID)
+			executionDetails += "user did not specify a task and no current task is set\n"
 		}
 
 		var requestedSubtask *database.Subtask
 		if action.SubtaskID != nil && subtaskID != nil && action.SubtaskID.Int64() == *subtaskID {
 			executionDetails += fmt.Sprintf("user requested current subtask '%d'\n", *subtaskID)
 		} else if action.SubtaskID != nil {
-			subtaskID := action.SubtaskID.Int64()
+			requestedSubtaskID := action.SubtaskID.Int64()
 			st, err := fp.db.GetFlowSubtask(ctx, database.GetFlowSubtaskParams{
-				ID:     subtaskID,
+				ID:     requestedSubtaskID,
 				FlowID: fp.flowID,
 			})
 			if err != nil {
-				executionDetails += fmt.Sprintf("failed to get requested subtask '%d': %s\n", subtaskID, err)
+				executionDetails += fmt.Sprintf("failed to get requested subtask '%d': %s\n", requestedSubtaskID, err)
 			}
 			requestedSubtask = &st
 		} else if subtaskID != nil {
-			executionDetails += fmt.Sprintf("user no specified subtask, using current subtask '%d'\n", *subtaskID)
+			executionDetails += fmt.Sprintf("user did not specify a subtask, using current subtask '%d'\n", *subtaskID)
 		} else {
-			executionDetails += "user no specified subtask, using all subtasks related to the task\n"
+			executionDetails += "user did not specify a subtask, using all subtasks related to the task\n"
 		}
 
 		memoristContext := map[string]map[string]any{
@@ -850,12 +857,48 @@ func (fp *flowProvider) GetSummarizeResultHandler(taskID, subtaskID *int64) tool
 			return "", wrapErrorEndAgentSpan(ctx, summarizerAgent, "failed to get summarizer template", err)
 		}
 
-		// TODO: here need to summarize result by chunks in iterations
+		// Preserve beginning, middle samples, and end to avoid silently dropping important content
 		if len(result) > 2*msgSummarizerLimit {
+			chunkSize := msgSummarizerLimit / 2
+			totalBudget := 2 * msgSummarizerLimit
+
+			// Always keep the first and last chunk
+			head := result[:chunkSize]
+			tail := result[len(result)-chunkSize:]
+
+			// Sample from the middle to fill remaining budget
+			middleBudget := totalBudget - 2*chunkSize
+			middleStart := chunkSize
+			middleEnd := len(result) - chunkSize
+			middleLen := middleEnd - middleStart
+
+			var middle string
+			if middleBudget > 0 && middleLen > 0 {
+				if middleLen <= middleBudget {
+					middle = result[middleStart:middleEnd]
+				} else {
+					// Take evenly spaced samples from the middle
+					numSamples := 3
+					sampleSize := middleBudget / numSamples
+					var samples []string
+					for i := 0; i < numSamples; i++ {
+						offset := middleStart + (middleLen*i)/numSamples
+						end := offset + sampleSize
+						if end > middleEnd {
+							end = middleEnd
+						}
+						samples = append(samples, result[offset:end])
+					}
+					middle = strings.Join(samples, "\n\n{...}\n\n")
+				}
+			}
+
 			result = database.SanitizeUTF8(
-				result[:msgSummarizerLimit] +
-					"\n\n{TRUNCATED}...\n\n" +
-					result[len(result)-msgSummarizerLimit:],
+				head +
+					"\n\n{SAMPLED_MIDDLE}...\n\n" +
+					middle +
+					"\n\n{...END_SECTION}...\n\n" +
+					tail,
 			)
 		}
 
@@ -924,6 +967,17 @@ func (fp *flowProvider) fixToolCallArgs(
 	toolCallFixerResult, err := fp.performSimpleChain(ctx, nil, nil, opt, msgChainType, systemToolCallFixerTmpl, userToolCallFixerTmpl)
 	if err != nil {
 		return nil, wrapErrorEndAgentSpan(ctx, toolCallFixerAgent, "failed to get tool call fixer result", err)
+	}
+
+	// Validate that the fixer produced valid JSON before returning
+	var fixedArgs map[string]any
+	if err := json.Unmarshal([]byte(toolCallFixerResult), &fixedArgs); err != nil {
+		toolCallFixerAgent.End(
+			langfuse.WithAgentStatus("invalid_json"),
+			langfuse.WithAgentOutput(toolCallFixerResult),
+			langfuse.WithAgentLevel(langfuse.ObservationLevelWarning),
+		)
+		return nil, fmt.Errorf("tool call fixer produced invalid JSON: %w", err)
 	}
 
 	toolCallFixerAgent.End(

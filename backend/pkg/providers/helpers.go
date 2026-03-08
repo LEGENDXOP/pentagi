@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -35,8 +34,15 @@ const (
 	msgLogResultEntrySizeLimit   = 1024      // 1 KB
 )
 
+const repeatingWindowSize = 10
+
 type repeatingDetector struct {
-	funcCalls []llms.FunctionCall
+	history   []llms.FunctionCall
+	threshold int
+}
+
+func newRepeatingDetector() *repeatingDetector {
+	return &repeatingDetector{threshold: RepeatingToolCallThreshold}
 }
 
 func (rd *repeatingDetector) detect(toolCall llms.ToolCall) bool {
@@ -45,21 +51,22 @@ func (rd *repeatingDetector) detect(toolCall llms.ToolCall) bool {
 	}
 
 	funcCall := rd.clearCallArguments(toolCall.FunctionCall)
-
-	if len(rd.funcCalls) == 0 {
-		rd.funcCalls = append(rd.funcCalls, funcCall)
-		return false
+	rd.history = append(rd.history, funcCall)
+	if len(rd.history) > repeatingWindowSize {
+		rd.history = rd.history[len(rd.history)-repeatingWindowSize:]
 	}
 
-	lastToolCall := rd.funcCalls[len(rd.funcCalls)-1]
-	if lastToolCall.Name != funcCall.Name || lastToolCall.Arguments != funcCall.Arguments {
-		rd.funcCalls = []llms.FunctionCall{funcCall}
-		return false
+	// Count frequency of each (name, args) pair in window
+	freq := make(map[string]int)
+	for _, fc := range rd.history {
+		key := fc.Name + "\x00" + fc.Arguments
+		freq[key]++
+		if freq[key] >= rd.threshold {
+			return true
+		}
 	}
 
-	rd.funcCalls = append(rd.funcCalls, funcCall)
-
-	return len(rd.funcCalls) >= RepeatingToolCallThreshold
+	return false
 }
 
 func (rd *repeatingDetector) clearCallArguments(toolCall *llms.FunctionCall) llms.FunctionCall {
@@ -69,20 +76,15 @@ func (rd *repeatingDetector) clearCallArguments(toolCall *llms.FunctionCall) llm
 	}
 
 	delete(v, "message")
-	var keys []string
-	for k := range v {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
 
-	var buffer strings.Builder
-	for _, k := range keys {
-		buffer.WriteString(fmt.Sprintf("%s: %v\n", k, v[k]))
+	canonical, err := json.Marshal(v)
+	if err != nil {
+		return *toolCall
 	}
 
 	return llms.FunctionCall{
 		Name:      toolCall.Name,
-		Arguments: buffer.String(),
+		Arguments: string(canonical),
 	}
 }
 
@@ -106,13 +108,15 @@ func (fp *flowProvider) getTasksInfo(ctx context.Context, taskID int64) (*tasksI
 		return nil, wrapErrorEndEvaluatorSpan(ctx, evaluator, "failed to get flow tasks", err)
 	}
 
-	for idx, t := range info.Tasks {
+	otherTasks := make([]database.Task, 0, len(info.Tasks))
+	for _, t := range info.Tasks {
 		if t.ID == taskID {
 			info.Task = t
-			info.Tasks = append(info.Tasks[:idx], info.Tasks[idx+1:]...)
-			break
+		} else {
+			otherTasks = append(otherTasks, t)
 		}
 	}
+	info.Tasks = otherTasks
 
 	info.Subtasks, err = fp.db.GetFlowSubtasks(ctx, fp.flowID)
 	if err != nil {
@@ -594,6 +598,11 @@ func (fp *flowProvider) prepareExecutionContext(ctx context.Context, taskID, sub
 				break
 			}
 		}
+	}
+
+	if subtasksInfo.Subtask == nil {
+		logrus.WithField("subtask_id", subtaskID).Error("subtask not found in task's subtask list")
+		return "", fmt.Errorf("subtask %d not found in task's subtask list", subtaskID)
 	}
 
 	executionContextRaw, err := fp.prompter.RenderTemplate(templates.PromptTypeFullExecutionContext, map[string]any{

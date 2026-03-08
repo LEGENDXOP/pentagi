@@ -226,6 +226,14 @@ func (ap *assistantProvider) PutInputToAgentChain(ctx context.Context, input str
 	ctx, span := obs.Observer.NewSpan(ctx, obs.SpanKindInternal, "providers.assistantProvider.PutInputToAgentChain")
 	defer span.End()
 
+	if len(input) == 0 {
+		return fmt.Errorf("user input is empty")
+	}
+
+	if len(input) > maxUserInputSize {
+		return fmt.Errorf("user input exceeds maximum size (%d > %d bytes)", len(input), maxUserInputSize)
+	}
+
 	logger := logrus.WithContext(ctx).WithFields(logrus.Fields{
 		"provider":     ap.fp.Type(),
 		"assistant_id": ap.id,

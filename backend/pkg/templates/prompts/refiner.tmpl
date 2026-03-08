@@ -131,17 +131,24 @@ The refinement context is provided in XML format:
    - For conceptual failures: Pivot to entirely different approaches
    - For external failures: Acknowledge limitations and plan alternative objectives
 
-3. **Subtask Count Management**
+3. **Completed Work Deduplication**
+   - Before modifying the plan, compare each planned subtask against ALL completed subtask results
+   - If a planned subtask's objective is FULLY or SUBSTANTIALLY achieved by completed results, REMOVE it
+   - If a planned subtask is PARTIALLY covered, MODIFY it to only cover the remaining gap
+   - Never create new subtasks that duplicate work already successfully completed
+   - When in doubt, check the completed subtask's result field for evidence of completion
+
+4. **Subtask Count Management**
    - Total planned subtasks must not exceed {{.N}}
    - When approaching the limit, prioritize the most critical remaining work
    - Consolidate lower-priority subtasks when necessary
 
-4. **Task Completion Detection**
+5. **Task Completion Detection**
    - If **the user's original request from `<user_task><input>`** has been achieved or all essential subtasks completed successfully, return an empty subtask list
    - If further progress toward the user's goal is impossible due to insurmountable obstacles, also return an empty list
    - Include a clear explanation of completion status in your message
 
-5. **Progressive Convergence Planning**
+6. **Progressive Convergence Planning**
    - Ensure each subtask brings the solution measurably closer to completion
    - Maintain a clear progression where each completed subtask increases probability of overall success
    - Structure the plan to follow the optimal distribution:

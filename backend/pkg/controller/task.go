@@ -196,43 +196,53 @@ func (tw *taskWorker) GetStatus(ctx context.Context) (database.TaskStatus, error
 
 // this function is exclusively change task internal properties "completed" and "waiting"
 func (tw *taskWorker) SetStatus(ctx context.Context, status database.TaskStatus) error {
+	// Acquire lock FIRST to prevent race between DB write and in-memory state read
+	tw.mx.Lock()
+
 	task, err := tw.taskCtx.DB.UpdateTaskStatus(ctx, database.UpdateTaskStatusParams{
 		Status: status,
 		ID:     tw.taskCtx.TaskID,
 	})
 	if err != nil {
+		tw.mx.Unlock()
 		return fmt.Errorf("failed to set task %d status: %w", tw.taskCtx.TaskID, err)
 	}
 
 	subtasks, err := tw.taskCtx.DB.GetTaskSubtasks(ctx, tw.taskCtx.TaskID)
 	if err != nil {
+		tw.mx.Unlock()
 		return fmt.Errorf("failed to get task %d subtasks: %w", tw.taskCtx.TaskID, err)
 	}
 
 	tw.taskCtx.Publisher.TaskUpdated(ctx, task, subtasks)
 
-	tw.mx.Lock()
-	defer tw.mx.Unlock()
-
+	// Update in-memory state while holding the lock
+	var flowStatus database.FlowStatus
 	switch status {
 	case database.TaskStatusRunning:
 		tw.completed = false
 		tw.waiting = false
-		err = tw.updater.SetStatus(ctx, database.FlowStatusRunning)
+		flowStatus = database.FlowStatusRunning
 	case database.TaskStatusWaiting:
 		tw.completed = false
 		tw.waiting = true
-		err = tw.updater.SetStatus(ctx, database.FlowStatusWaiting)
+		flowStatus = database.FlowStatusWaiting
 	case database.TaskStatusFinished, database.TaskStatusFailed:
 		tw.completed = true
 		tw.waiting = false
 		// the last task was done, set flow status to Waiting new user input
-		err = tw.updater.SetStatus(ctx, database.FlowStatusWaiting)
+		flowStatus = database.FlowStatusWaiting
 	default:
+		tw.mx.Unlock()
 		// status Created is not possible to set by this call
 		return fmt.Errorf("unsupported task status: %s", status)
 	}
-	if err != nil {
+
+	// Release lock BEFORE calling updater to prevent deadlock in the
+	// Task→Flow status propagation chain
+	tw.mx.Unlock()
+
+	if err := tw.updater.SetStatus(ctx, flowStatus); err != nil {
 		return fmt.Errorf("failed to set flow status in back propagation: %w", err)
 	}
 
@@ -269,13 +279,12 @@ func (tw *taskWorker) PutInput(ctx context.Context, input string) error {
 		if !st.IsCompleted() && st.IsWaiting() {
 			if err := st.PutInput(ctx, input); err != nil {
 				return fmt.Errorf("failed to put input to subtask %d: %w", st.GetSubtaskID(), err)
-			} else {
-				break
 			}
+			return nil
 		}
 	}
 
-	return nil
+	return fmt.Errorf("task %d is waiting but no subtask is waiting for input", tw.taskCtx.TaskID)
 }
 
 func (tw *taskWorker) Run(ctx context.Context) error {
