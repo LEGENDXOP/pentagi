@@ -28,6 +28,7 @@ const (
 	PerplexityToolName        = "perplexity"
 	SearxngToolName           = "searxng"
 	SploitusToolName          = "sploitus"
+	NucleiToolName            = "nuclei_scan"
 	SearchToolName            = "search"
 	SearchResultToolName      = "search_result"
 	EnricherResultToolName    = "enricher_result"
@@ -39,6 +40,9 @@ const (
 	SearchCodeToolName        = "search_code"
 	StoreCodeToolName         = "store_code"
 	GraphitiSearchToolName    = "graphiti_search"
+	InteractshGetURLToolName  = "interactsh_url"
+	InteractshPollToolName    = "interactsh_poll"
+	InteractshStatusToolName  = "interactsh_status"
 	ReportResultToolName      = "report_result"
 	SubtaskListToolName       = "subtask_list"
 	SubtaskPatchToolName      = "subtask_patch"
@@ -108,6 +112,7 @@ var toolsTypeMapping = map[string]ToolType{
 	PerplexityToolName:        SearchNetworkToolType,
 	SearxngToolName:           SearchNetworkToolType,
 	SploitusToolName:          SearchNetworkToolType,
+	NucleiToolName:            EnvironmentToolType,
 	SearchToolName:            AgentToolType,
 	SearchResultToolName:      StoreAgentResultToolType,
 	EnricherResultToolName:    StoreAgentResultToolType,
@@ -119,6 +124,9 @@ var toolsTypeMapping = map[string]ToolType{
 	SearchCodeToolName:        SearchVectorDbToolType,
 	StoreCodeToolName:         StoreVectorDbToolType,
 	GraphitiSearchToolName:    SearchVectorDbToolType,
+	InteractshGetURLToolName:  EnvironmentToolType,
+	InteractshPollToolName:    EnvironmentToolType,
+	InteractshStatusToolName:  EnvironmentToolType,
 	ReportResultToolName:      StoreAgentResultToolType,
 	SubtaskListToolName:       StoreAgentResultToolType,
 	SubtaskPatchToolName:      StoreAgentResultToolType,
@@ -134,6 +142,7 @@ var reflector = &jsonschema.Reflector{
 var allowedSummarizingToolsResult = []string{
 	TerminalToolName,
 	BrowserToolName,
+	NucleiToolName,
 }
 
 var allowedStoringInMemoryTools = []string{
@@ -147,6 +156,7 @@ var allowedStoringInMemoryTools = []string{
 	PerplexityToolName,
 	SearxngToolName,
 	SploitusToolName,
+	NucleiToolName,
 	MaintenanceToolName,
 	CoderToolName,
 	PentesterToolName,
@@ -246,6 +256,17 @@ var registryDefinitions = map[string]llms.FunctionDefinition{
 			"'CVE-2021-44228'). Returns exploit URLs, CVSS scores, CVE references, and publication dates.",
 		Parameters: reflector.Reflect(&SploitusAction{}),
 	},
+	NucleiToolName: {
+		Name: NucleiToolName,
+		Description: "Run ProjectDiscovery's Nuclei vulnerability scanner against a target URL or host. " +
+			"Nuclei uses community-maintained templates to detect CVEs, misconfigurations, default credentials, " +
+			"exposed panels, and other security issues. Specify template tags (e.g. 'cve,sqli,xss,lfi') and " +
+			"severity filters (critical,high,medium,low,info) to focus the scan. Returns structured findings " +
+			"with vulnerability type, severity, matched URL, and auto-tagged [VULN_TYPE] for compliance mapping. " +
+			"Findings are deduplicated against previously discovered vulnerabilities in the current engagement. " +
+			"Use this for broad automated vulnerability detection before deeper manual testing.",
+		Parameters: reflector.Reflect(&NucleiScanAction{}),
+	},
 	EnricherResultToolName: {
 		Name:        EnricherResultToolName,
 		Description: "Send the enriched user's question with additional information to the user",
@@ -309,6 +330,29 @@ var registryDefinitions = map[string]llms.FunctionDefinition{
 			"Use this to avoid repeating failed approaches, reuse successful exploitation techniques, understand entity relationships, " +
 			"and build on previous findings within the same penetration testing engagement.",
 		Parameters: reflector.Reflect(&GraphitiSearchAction{}),
+	},
+	InteractshGetURLToolName: {
+		Name: InteractshGetURLToolName,
+		Description: "Get a unique Out-of-Band (OOB) callback URL for detecting blind vulnerabilities. " +
+			"Use this when testing for blind SSRF, blind XSS, blind SQLi, blind RCE, blind XXE, or any vulnerability " +
+			"where the server makes an external request that you cannot observe directly. " +
+			"The generated URL will detect DNS, HTTP, and SMTP callbacks. " +
+			"After injecting the URL into your payload, use interactsh_poll to check for received callbacks.",
+		Parameters: reflector.Reflect(&InteractshGetURLAction{}),
+	},
+	InteractshPollToolName: {
+		Name: InteractshPollToolName,
+		Description: "Check for received OOB (Out-of-Band) interactions/callbacks. " +
+			"Use this after injecting OOB URLs (from interactsh_url) into attack payloads. " +
+			"Returns any DNS, HTTP, or SMTP callbacks that were received, correlated back to their attack IDs. " +
+			"Detected interactions confirm blind vulnerabilities (blind SSRF, blind XSS, blind RCE, etc.).",
+		Parameters: reflector.Reflect(&InteractshPollAction{}),
+	},
+	InteractshStatusToolName: {
+		Name: InteractshStatusToolName,
+		Description: "Check the status of the OOB (Out-of-Band) detection system, " +
+			"including whether interactsh is running, the base URL, and all registered attack probes.",
+		Parameters: reflector.Reflect(&InteractshStatusAction{}),
 	},
 	MemoristToolName: {
 		Name:        MemoristToolName,
@@ -375,6 +419,10 @@ func getMessageType(name string) database.MsglogType {
 		return database.MsglogTypeFile
 	case BrowserToolName:
 		return database.MsglogTypeBrowser
+	case NucleiToolName:
+		return database.MsglogTypeTerminal
+	case InteractshGetURLToolName, InteractshPollToolName, InteractshStatusToolName:
+		return database.MsglogTypeTerminal
 	case MemoristToolName, SearchToolName, GoogleToolName, DuckDuckGoToolName, TavilyToolName, TraversaalToolName,
 		PerplexityToolName, SearxngToolName, SploitusToolName,
 		SearchGuideToolName, SearchAnswerToolName, SearchCodeToolName, SearchInMemoryToolName, GraphitiSearchToolName:

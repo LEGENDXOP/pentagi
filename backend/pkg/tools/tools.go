@@ -343,6 +343,10 @@ func (fte *flowToolsExecutor) SetEmbedder(embedder embeddings.Embedder) {
 	)
 	if err == nil {
 		fte.store = &store
+		// Wire up fallback pgvector store for Graphiti circuit breaker
+		if fte.graphitiClient != nil {
+			fte.graphitiClient.SetFallbackStore(fte.store)
+		}
 	}
 }
 
@@ -376,6 +380,10 @@ func (fte *flowToolsExecutor) SetVectorStoreLogProvider(vslp VectorStoreLogProvi
 
 func (fte *flowToolsExecutor) SetGraphitiClient(client *graphiti.Client) {
 	fte.graphitiClient = client
+	// Wire up fallback pgvector store for circuit breaker fallback
+	if client != nil && fte.store != nil {
+		client.SetFallbackStore(fte.store)
+	}
 }
 
 func (fte *flowToolsExecutor) Prepare(ctx context.Context) error {
@@ -1117,6 +1125,23 @@ func (fte *flowToolsExecutor) GetPentesterExecutor(cfg PentesterExecutorConfig) 
 	if sploitus.IsAvailable() {
 		ce.definitions = append(ce.definitions, registryDefinitions[SploitusToolName])
 		ce.handlers[SploitusToolName] = sploitus.Handle
+	}
+
+	nucleiTool := NewNucleiTool(
+		fte.flowID,
+		cfg.TaskID,
+		cfg.SubtaskID,
+		fte.cfg.NucleiEnabled,
+		fte.cfg.NucleiRateLimit,
+		fte.cfg.NucleiTemplatesPath,
+		container.ID,
+		container.LocalID.String,
+		fte.docker,
+		fte.tlp,
+	)
+	if nucleiTool.IsAvailable() {
+		ce.definitions = append(ce.definitions, registryDefinitions[NucleiToolName])
+		ce.handlers[NucleiToolName] = nucleiTool.Handle
 	}
 
 	return ce, nil

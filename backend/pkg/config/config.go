@@ -172,10 +172,21 @@ type Config struct {
 	LangfusePublicKey string `env:"LANGFUSE_PUBLIC_KEY"`
 	LangfuseSecretKey string `env:"LANGFUSE_SECRET_KEY"`
 
+	// Nuclei vulnerability scanner
+	NucleiEnabled       bool   `env:"NUCLEI_ENABLED" envDefault:"true"`
+	NucleiRateLimit     int    `env:"NUCLEI_RATE_LIMIT" envDefault:"100"`
+	NucleiTemplatesPath string `env:"NUCLEI_TEMPLATES_PATH" envDefault:"/root/nuclei-templates"`
+
 	// Graphiti knowledge graph
 	GraphitiEnabled bool   `env:"GRAPHITI_ENABLED" envDefault:"false"`
 	GraphitiTimeout int    `env:"GRAPHITI_TIMEOUT" envDefault:"30"`
 	GraphitiURL     string `env:"GRAPHITI_URL"`
+
+	// Graphiti circuit breaker
+	GraphitiCBEnabled    bool `env:"GRAPHITI_CB_ENABLED" envDefault:"true"`
+	GraphitiCBThreshold  int  `env:"GRAPHITI_CB_THRESHOLD" envDefault:"3"`
+	GraphitiCBTimeout    int  `env:"GRAPHITI_CB_TIMEOUT" envDefault:"120"`
+	GraphitiCBMaxRetries int  `env:"GRAPHITI_CB_MAX_RETRIES" envDefault:"3"`
 }
 
 func NewConfig() (*Config, error) {

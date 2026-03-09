@@ -129,6 +129,14 @@ type SploitusAction struct {
 	Message     string `json:"message" jsonschema:"required,title=Search query message" jsonschema_description:"Not so long message with the expected result and path to reach goal to send to the user in user's language only"`
 }
 
+type NucleiScanAction struct {
+	Target    string `json:"target" jsonschema:"required" jsonschema_description:"Target URL or host to scan (e.g. 'https://target.com' or '192.168.1.100'). Only one target per scan."`
+	Tags      string `json:"tags,omitempty" jsonschema_description:"Comma-separated nuclei template tags to filter which checks to run (e.g. 'cve,sqli,xss,lfi,rce,misconfig'). Leave empty to use all available templates."`
+	Severity  string `json:"severity,omitempty" jsonschema:"enum=critical,enum=high,enum=medium,enum=low,enum=info" jsonschema_description:"Minimum severity filter for nuclei templates. Only templates at this severity or above will be executed. Options: critical, high, medium, low, info. Default: medium."`
+	RateLimit Int64  `json:"rate_limit" jsonschema:"type=integer" jsonschema_description:"Maximum requests per second for nuclei scanner (minimum 10; maximum 500; default 100). Lower values are safer for production targets."`
+	Message   string `json:"message" jsonschema:"required,title=Nuclei scan message" jsonschema_description:"Not so long message explaining why you are running this nuclei scan and what you expect to find, to send to the user in user's language only"`
+}
+
 type GraphitiSearchAction struct {
 	SearchType     string   `json:"search_type" jsonschema:"required,enum=temporal_window,enum=entity_relationships,enum=diverse_results,enum=episode_context,enum=successful_tools,enum=recent_context,enum=entity_by_label" jsonschema_description:"Type of search to perform: temporal_window (time-bounded search), entity_relationships (graph traversal from an entity), diverse_results (anti-redundancy search), episode_context (full agent reasoning and tool outputs), successful_tools (proven techniques), recent_context (latest findings), entity_by_label (type-specific entity search)"`
 	Query          string   `json:"query" jsonschema:"required" jsonschema_description:"Natural language query describing what to search for in English"`
