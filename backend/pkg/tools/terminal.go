@@ -480,3 +480,94 @@ func FormatTerminalSystemOutput(text string) string {
 func (t *terminal) IsAvailable() bool {
 	return t.dockerClient != nil
 }
+
+// FileInfo describes a file found in the workspace container directory.
+type FileInfo struct {
+	Path     string `json:"path"`
+	Size     int64  `json:"size"`
+	Modified string `json:"modified"`
+}
+
+// ListWorkspaceFiles lists files in the container's working directory (up to maxdepth 2).
+// It executes `find` inside the container and parses the output into FileInfo structs.
+func ListWorkspaceFiles(
+	ctx context.Context,
+	dockerClient docker.DockerClient,
+	containerName string,
+	containerLID string,
+	workdir string,
+) ([]FileInfo, error) {
+	if workdir == "" {
+		workdir = docker.WorkFolderPathInContainer
+	}
+
+	// Check if container is running
+	isRunning, err := dockerClient.IsContainerRunning(ctx, containerLID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect container: %w", err)
+	}
+	if !isRunning {
+		return nil, fmt.Errorf("container is not running")
+	}
+
+	// Use find with -printf to get path, size, and modification time in one shot
+	// Format: size_in_bytes\tmodified_time\tpath\n
+	cmd := []string{
+		"sh", "-c",
+		fmt.Sprintf(`find '%s' -maxdepth 2 -type f -printf '%%s\t%%TY-%%Tm-%%Td %%TH:%%TM\t%%p\n' 2>/dev/null | head -100`,
+			strings.ReplaceAll(workdir, "'", "'\\''")),
+	}
+
+	createResp, err := dockerClient.ContainerExecCreate(ctx, containerName, container.ExecOptions{
+		Cmd:          cmd,
+		AttachStdout: true,
+		AttachStderr: true,
+		WorkingDir:   workdir,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create exec for file listing: %w", err)
+	}
+
+	execCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	resp, err := dockerClient.ContainerExecAttach(execCtx, createResp.ID, container.ExecAttachOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to attach to exec for file listing: %w", err)
+	}
+	defer resp.Close()
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, resp.Reader)
+
+	output := buf.String()
+	if output == "" {
+		return nil, nil // empty workspace
+	}
+
+	var files []FileInfo
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 {
+			continue
+		}
+
+		var size int64
+		if _, err := fmt.Sscanf(parts[0], "%d", &size); err != nil {
+			size = 0
+		}
+
+		files = append(files, FileInfo{
+			Path:     parts[2],
+			Size:     size,
+			Modified: parts[1],
+		})
+	}
+
+	return files, nil
+}

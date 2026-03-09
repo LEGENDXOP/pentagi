@@ -590,6 +590,7 @@ func (fp *flowProvider) GetPentesterHandler(ctx context.Context, taskID, subtask
 				"Lang":                    fp.language,
 				"CurrentTime":             getCurrentTime(),
 				"ToolPlaceholder":         ToolPlaceholder,
+				"ExecutionMetrics":        &ExecutionMetrics{}, // zero-valued; refreshed in agent loop
 			},
 		}
 

@@ -258,6 +258,12 @@ func CreateDummyTemplateData() map[string]any {
 			},
 		},
 
+		// Workspace file listing for subtask generator
+		"WorkspaceFiles": []tools.FileInfo{
+			{Path: "/work/STATE.json", Size: 1234, Modified: "2025-07-02 12:00"},
+			{Path: "/work/FINDINGS.md", Size: 5678, Modified: "2025-07-02 12:15"},
+		},
+
 		// Barrier tools - using proper logic from tools package
 		"BarrierTools":     barrierTools,
 		"BarrierToolNames": []string{tools.FinalyToolName, tools.AskUserToolName},

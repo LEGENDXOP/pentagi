@@ -286,6 +286,7 @@ type FlowToolsExecutor interface {
 
 	Prepare(ctx context.Context) error
 	Release(ctx context.Context) error
+	ListWorkspaceFiles(ctx context.Context) ([]FileInfo, error)
 	GetCustomExecutor(cfg CustomExecutorConfig) (ContextToolsExecutor, error)
 	GetAssistantExecutor(cfg AssistantExecutorConfig) (ContextToolsExecutor, error)
 	GetPrimaryExecutor(cfg PrimaryExecutorConfig) (ContextToolsExecutor, error)
@@ -460,6 +461,11 @@ func (fte *flowToolsExecutor) Release(ctx context.Context) error {
 		return fmt.Errorf("errors during container cleanup: %v", errs)
 	}
 	return nil
+}
+
+func (fte *flowToolsExecutor) ListWorkspaceFiles(ctx context.Context) ([]FileInfo, error) {
+	containerName := PrimaryTerminalName(fte.flowID)
+	return ListWorkspaceFiles(ctx, fte.docker, containerName, fte.primaryLID, "")
 }
 
 func (fte *flowToolsExecutor) GetCustomExecutor(cfg CustomExecutorConfig) (ContextToolsExecutor, error) {

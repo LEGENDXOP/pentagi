@@ -81,8 +81,76 @@ Your final report MUST:
 - Include only the most critical details about what was/wasn't completed
 - Highlight any unexpected or particularly valuable outcomes
 - Indicate any remaining steps if the task is incomplete
+- If a `<cost_summary>` section is present in the input, include a brief "Resource Usage" or "Cost Summary" section at the end of your report with total tokens used and estimated cost in USD
 - Use language appropriate for {{.Lang}} audience
 - Never exceed {{.N}} characters in total length
+
+## COMPLIANCE MAPPING — OWASP TOP 10 2021 / CWE / CVSS
+
+When the task involves security testing or penetration testing, you MUST include a **Compliance Summary** section in your report. For EVERY vulnerability finding, map it to the standard compliance frameworks using the classification below.
+
+### OWASP Top 10 2021 Breakdown Table
+
+Include a table summarizing findings by OWASP Top 10 2021 category. Format:
+
+```
+OWASP TOP 10 2021 COMPLIANCE SUMMARY
+═══════════════════════════════════════════════════════════════
+Category                                          | Findings
+──────────────────────────────────────────────────────────────
+A01:2021-Broken Access Control                    | <count>
+A02:2021-Cryptographic Failures                   | <count>
+A03:2021-Injection                                | <count>
+A04:2021-Insecure Design                          | <count>
+A05:2021-Security Misconfiguration                | <count>
+A06:2021-Vulnerable and Outdated Components       | <count>
+A07:2021-Identification and Authentication Failures| <count>
+A08:2021-Software and Data Integrity Failures     | <count>
+A09:2021-Security Logging and Monitoring Failures | <count>
+A10:2021-Server-Side Request Forgery              | <count>
+═══════════════════════════════════════════════════════════════
+```
+
+Only include categories that have at least one finding. If no security findings exist, omit this table.
+
+### Per-Finding Compliance Reference
+
+For each individual vulnerability finding, append the following metadata:
+- **Vuln Type:** The standardized type tag (e.g., `sqli`, `xss_stored`, `idor`)
+- **OWASP:** The OWASP Top 10 2021 category
+- **CWE:** The relevant CWE identifier(s) (e.g., CWE-89, CWE-79)
+- **CVSS Base:** The estimated CVSS v3.1 base score and severity (e.g., 9.8 Critical)
+
+Example per-finding format:
+```
+[FINDING] SQL Injection in /api/users endpoint
+  Vuln Type: sqli
+  OWASP:     A03:2021-Injection
+  CWE:       CWE-89
+  CVSS:      9.8 (Critical)
+  Details:   Parameter 'id' is vulnerable to blind SQL injection...
+```
+
+### Executive Compliance Posture
+
+At the end of the compliance section, provide a 2-3 sentence executive summary of the target's compliance posture. Include:
+- Total number of findings and breakdown by severity (Critical/High/Medium/Low)
+- Which OWASP Top 10 categories are most affected
+- Overall risk assessment (e.g., "The target exhibits significant exposure in access control and injection categories, indicating systemic input validation and authorization weaknesses.")
+
+### Standard Vulnerability Type Tags
+
+Use these canonical tags when classifying findings. The pentester agent tags findings during discovery; validate and correct them as needed:
+
+```
+idor, auth_bypass, privilege_escalation, path_traversal, cors_misconfiguration,
+mass_assignment, cryptographic_failure, sensitive_data_exposure, sqli, xss_stored,
+xss_reflected, xss_dom, command_injection, ssti, ldap_injection, xpath_injection,
+business_logic, missing_rate_limit, security_misconfiguration, file_upload,
+vulnerable_component, broken_auth, session_hijacking, deserialization,
+insufficient_logging, ssrf, csrf, open_redirect, information_disclosure,
+api_abuse, xxe
+```
 
 ## CRITICAL EVALUATION PRINCIPLES
 

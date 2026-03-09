@@ -61,6 +61,8 @@ func (fp *flowProvider) performAgentChain(
 		summarizerHandler    = fp.GetSummarizeResultHandler(taskID, subtaskID)
 		toolCallCount        int
 		summarizerFailures   int
+		metrics              = &ExecutionMetrics{}
+		metricsStartTime     = time.Now()
 	)
 
 	fields := logrus.Fields{
@@ -105,6 +107,16 @@ func (fp *flowProvider) performAgentChain(
 			return fmt.Errorf("agent chain loop terminated: %w", err)
 		}
 
+		// Refresh system prompt with current execution metrics
+		if metrics.ToolCallCount > 0 && len(chain) > 0 {
+			if chain[0].Role == llms.ChatMessageTypeSystem && len(chain[0].Parts) > 0 {
+				if text, ok := chain[0].Parts[0].(llms.TextContent); ok {
+					updated := injectMetricsIntoSystemPrompt(text.Text, metrics.Snapshot(metricsStartTime))
+					chain[0].Parts[0] = llms.TextContent{Text: updated}
+				}
+			}
+		}
+
 		result, err := fp.callWithRetries(ctx, chain, optAgentType, executor)
 		if err != nil {
 			logger.WithError(err).Error("failed to call agent chain")
@@ -129,7 +141,8 @@ func (fp *flowProvider) performAgentChain(
 				result, err = fp.performReflector(
 					ctx, optAgentType, chainID, taskID, subtaskID,
 					append(chain, reflectorMsg),
-					fp.getLastHumanMessage(chain), result.content, executionContext, executor, 1)
+					fp.getLastHumanMessage(chain), result.content, executionContext, executor, 1,
+					metrics.Snapshot(metricsStartTime))
 				if err != nil {
 					fields := make(logrus.Fields)
 					if result != nil {
@@ -168,7 +181,15 @@ func (fp *flowProvider) performAgentChain(
 			}
 
 			funcName := toolCall.FunctionCall.Name
+			metrics.AddCommand(funcName)
+			metrics.LastToolName = funcName
+
 			response, err := fp.execToolCall(ctx, chainID, idx, result, detector, executor)
+
+			// Track repeated tool calls detected by the repeating detector
+			if strings.HasPrefix(response, "tool call '") && strings.HasSuffix(response, "' is repeating, please try another tool") {
+				metrics.RepeatedCalls++
+			}
 
 			if toolTypeMapping[funcName] != tools.AgentToolType {
 				fp.storeToolExecutionToGraphiti(
@@ -177,6 +198,7 @@ func (fp *flowProvider) performAgentChain(
 			}
 
 			if err != nil {
+				metrics.ErrorCount++
 				logger.WithError(err).WithFields(logrus.Fields{
 					"func_name": funcName,
 					"func_args": toolCall.FunctionCall.Arguments,
@@ -205,6 +227,7 @@ func (fp *flowProvider) performAgentChain(
 		}
 
 		toolCallCount += len(result.funcCalls)
+		metrics.ToolCallCount = toolCallCount
 		if toolCallCount >= maxToolCallsPerSubtask {
 			logger.WithField("tool_call_count", toolCallCount).
 				Warn("reached max tool calls per subtask, forcing stop")
@@ -516,6 +539,7 @@ func (fp *flowProvider) performReflector(
 	humanMessage, content, executionContext string,
 	executor tools.ContextToolsExecutor,
 	iteration int,
+	metrics ExecutionMetrics,
 ) (*callResult, error) {
 	ctx, span := obs.Observer.NewSpan(ctx, obs.SpanKindInternal, "providers.flowProvider.performReflector")
 	defer span.End()
@@ -564,9 +588,10 @@ func (fp *flowProvider) performReflector(
 			"BarrierToolNames": executor.GetBarrierToolNames(),
 		},
 		"system": {
-			"BarrierTools":     executor.GetBarrierTools(),
-			"CurrentTime":      getCurrentTime(),
-			"ExecutionContext": executionContext,
+			"BarrierTools":      executor.GetBarrierTools(),
+			"CurrentTime":       getCurrentTime(),
+			"ExecutionContext":   executionContext,
+			"ExecutionMetrics":  &metrics,
 		},
 	}
 
@@ -660,7 +685,7 @@ func (fp *flowProvider) performReflector(
 	chain = append(chain, reflectorMsg)
 	if len(result.funcCalls) == 0 {
 		return fp.performReflector(ctx, optOriginType, chainID, taskID, subtaskID, chain,
-			humanMessage, result.content, executionContext, executor, iteration+1)
+			humanMessage, result.content, executionContext, executor, iteration+1, metrics)
 	}
 
 	opts = append(opts, langfuse.WithAgentStatus("success"))
@@ -792,6 +817,11 @@ func (fp *flowProvider) updateMsgChainUsage(
 	price := fp.GetPriceInfo(optAgentType)
 	if price != nil {
 		usage.UpdateCost(price)
+	}
+
+	// Feed usage to the in-memory CostTracker if one is attached to the context.
+	if ct := GetCostTracker(ctx); ct != nil {
+		ct.AddUsage(string(optAgentType), usage)
 	}
 
 	_, err := fp.db.UpdateMsgChainUsage(ctx, database.UpdateMsgChainUsageParams{

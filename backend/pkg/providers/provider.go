@@ -11,6 +11,7 @@ import (
 	"pentagi/pkg/cast"
 	"pentagi/pkg/csum"
 	"pentagi/pkg/database"
+	"pentagi/pkg/docker"
 	"pentagi/pkg/graphiti"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/observability/langfuse"
@@ -285,11 +286,21 @@ func (fp *flowProvider) GenerateSubtasks(ctx context.Context, taskID int64) ([]t
 		return nil, fmt.Errorf("failed to get tasks info: %w", err)
 	}
 
+	// Collect workspace files so the generator knows what already exists in /work/
+	var workspaceFiles []tools.FileInfo
+	if files, err := fp.executor.ListWorkspaceFiles(ctx); err != nil {
+		logger.WithError(err).Warn("failed to list workspace files for generator context, continuing without them")
+	} else {
+		workspaceFiles = files
+	}
+
 	generatorContext := map[string]map[string]any{
 		"user": {
-			"Task":     tasksInfo.Task,
-			"Tasks":    tasksInfo.Tasks,
-			"Subtasks": tasksInfo.Subtasks,
+			"Task":           tasksInfo.Task,
+			"Tasks":          tasksInfo.Tasks,
+			"Subtasks":       tasksInfo.Subtasks,
+			"WorkspaceFiles": workspaceFiles,
+			"Cwd":            docker.WorkFolderPathInContainer,
 		},
 		"system": {
 			"SubtaskListToolName":     tools.SubtaskListToolName,
@@ -472,12 +483,17 @@ func (fp *flowProvider) GetTaskResult(ctx context.Context, taskID int64) (*tools
 	}
 
 	subtasksInfo := fp.getSubtasksInfo(taskID, tasksInfo.Subtasks)
+
+	// Collect cost summary from the flow-level usage stats in the database.
+	costSummaryText := fp.buildFlowCostSummary(ctx, taskID)
+
 	reporterContext := map[string]map[string]any{
 		"user": {
 			"Task":              tasksInfo.Task,
 			"Tasks":             tasksInfo.Tasks,
 			"CompletedSubtasks": subtasksInfo.Completed,
 			"PlannedSubtasks":   subtasksInfo.Planned,
+			"CostSummary":       costSummaryText,
 		},
 		"system": {
 			"ReportResultToolName":    tools.ReportResultToolName,
@@ -836,6 +852,13 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 		ctx = WithBudget(ctx, NewExecutionBudget(defaultGlobalMaxToolCalls, defaultGlobalMaxDuration))
 	}
 
+	// Create a CostTracker for this flow if one doesn't exist yet.
+	// Sub-agents inherit the tracker from their parent via context, so all
+	// costs within a single user request accumulate in one place.
+	if GetCostTracker(ctx) == nil {
+		ctx = WithCostTracker(ctx, NewCostTracker(fp.Model(optAgentType)))
+	}
+
 	ctx = tools.PutAgentContext(ctx, msgChainType)
 	err = fp.performAgentChain(
 		ctx, optAgentType, msgChain.ID, &taskID, &subtaskID, chain, executor, fp.summarizer,
@@ -947,4 +970,55 @@ func (fp *flowProvider) putAgentLog(
 	}
 
 	return agentLog.PutLog(ctx, initiator, executor, task, result, taskID, subtaskID)
+}
+
+// buildFlowCostSummary queries the database for flow-level usage stats and
+// returns a formatted cost summary string for inclusion in reporter context.
+// It also supplements with in-memory CostTracker data if available.
+// Returns empty string on error (non-fatal).
+func (fp *flowProvider) buildFlowCostSummary(ctx context.Context, taskID int64) string {
+	logger := logrus.WithContext(ctx).WithFields(logrus.Fields{
+		"flow_id": fp.flowID,
+		"task_id": taskID,
+	})
+
+	// Primary source: database aggregation (most accurate, includes all historical calls)
+	flowStats, err := fp.db.GetFlowUsageStats(ctx, fp.flowID)
+	if err != nil {
+		logger.WithError(err).Warn("failed to get flow usage stats for cost summary")
+		// Fall back to in-memory tracker if DB query fails
+		if ct := GetCostTracker(ctx); ct != nil {
+			return ct.FormatCostSummary(0)
+		}
+		return ""
+	}
+
+	totalCost := flowStats.TotalUsageCostIn + flowStats.TotalUsageCostOut
+	if flowStats.TotalUsageIn == 0 && flowStats.TotalUsageOut == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Total Input Tokens: %d\n", flowStats.TotalUsageIn))
+	sb.WriteString(fmt.Sprintf("Total Output Tokens: %d\n", flowStats.TotalUsageOut))
+	if flowStats.TotalUsageCacheIn > 0 || flowStats.TotalUsageCacheOut > 0 {
+		sb.WriteString(fmt.Sprintf("Cache Read Tokens: %d\n", flowStats.TotalUsageCacheIn))
+		sb.WriteString(fmt.Sprintf("Cache Write Tokens: %d\n", flowStats.TotalUsageCacheOut))
+	}
+	sb.WriteString(fmt.Sprintf("Total Estimated Cost: $%.4f USD\n", totalCost))
+
+	// Add per-agent-type breakdown
+	typeStats, err := fp.db.GetUsageStatsByTypeForFlow(ctx, fp.flowID)
+	if err != nil {
+		logger.WithError(err).Warn("failed to get usage stats by type for cost summary")
+	} else if len(typeStats) > 0 {
+		sb.WriteString("\nCost by Agent Type:\n")
+		for _, ts := range typeStats {
+			typeCost := ts.TotalUsageCostIn + ts.TotalUsageCostOut
+			sb.WriteString(fmt.Sprintf("  %-20s  in: %-10d  out: %-10d  cost: $%.4f\n",
+				ts.Type, ts.TotalUsageIn, ts.TotalUsageOut, typeCost))
+		}
+	}
+
+	return sb.String()
 }

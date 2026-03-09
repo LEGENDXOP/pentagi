@@ -88,6 +88,67 @@ func (rd *repeatingDetector) clearCallArguments(toolCall *llms.FunctionCall) llm
 	}
 }
 
+// ExecutionMetrics tracks real-time execution telemetry for template rendering.
+// Templates reference these fields via {{.ExecutionMetrics.FieldName}} in conditional blocks.
+type ExecutionMetrics struct {
+	ToolCallCount  int      `json:"tool_call_count"`
+	ElapsedSeconds int      `json:"elapsed_seconds"`
+	UniqueCommands []string `json:"unique_commands"`
+	ErrorCount     int      `json:"error_count"`
+	LastToolName   string   `json:"last_tool_name"`
+	RepeatedCalls  int      `json:"repeated_calls"`
+}
+
+// AddCommand records a tool/command name, maintaining uniqueness.
+func (em *ExecutionMetrics) AddCommand(name string) {
+	for _, cmd := range em.UniqueCommands {
+		if cmd == name {
+			return
+		}
+	}
+	em.UniqueCommands = append(em.UniqueCommands, name)
+}
+
+// Snapshot returns a copy with elapsed time updated to the current moment.
+func (em *ExecutionMetrics) Snapshot(startTime time.Time) ExecutionMetrics {
+	snap := *em
+	snap.ElapsedSeconds = int(time.Since(startTime).Seconds())
+	return snap
+}
+
+// injectMetricsIntoSystemPrompt replaces or inserts the <execution_metrics> block
+// in a rendered system prompt. This avoids full template re-rendering.
+func injectMetricsIntoSystemPrompt(systemPrompt string, metrics ExecutionMetrics) string {
+	metricsBlock := fmt.Sprintf(
+		"<execution_metrics>\n"+
+			"  <tool_calls_made>%d</tool_calls_made>\n"+
+			"  <elapsed_seconds>%d</elapsed_seconds>\n"+
+			"  <unique_commands_used>%v</unique_commands_used>\n"+
+			"</execution_metrics>",
+		metrics.ToolCallCount,
+		metrics.ElapsedSeconds,
+		metrics.UniqueCommands,
+	)
+
+	// Try to replace existing block
+	startTag := "<execution_metrics>"
+	endTag := "</execution_metrics>"
+	startIdx := strings.Index(systemPrompt, startTag)
+	endIdx := strings.Index(systemPrompt, endTag)
+	if startIdx >= 0 && endIdx > startIdx {
+		return systemPrompt[:startIdx] + metricsBlock + systemPrompt[endIdx+len(endTag):]
+	}
+
+	// Insert before </anti_loop_protocol> if present
+	insertPoint := strings.Index(systemPrompt, "</anti_loop_protocol>")
+	if insertPoint >= 0 {
+		return systemPrompt[:insertPoint] + metricsBlock + "\n" + systemPrompt[insertPoint:]
+	}
+
+	// Fallback: append to end
+	return systemPrompt + "\n" + metricsBlock
+}
+
 func (fp *flowProvider) getTasksInfo(ctx context.Context, taskID int64) (*tasksInfo, error) {
 	var (
 		err  error
@@ -611,6 +672,8 @@ func (fp *flowProvider) prepareExecutionContext(ctx context.Context, taskID, sub
 		"CompletedSubtasks": subtasksInfo.Completed,
 		"Subtask":           subtasksInfo.Subtask,
 		"PlannedSubtasks":   subtasksInfo.Planned,
+		// ExecutionMetrics is nil at context preparation time (before agent loop);
+		// the {{if .ExecutionMetrics}} guard in the template safely skips the block.
 	})
 	if err != nil {
 		return "", wrapErrorEndEvaluatorSpan(ctx, evaluator, "failed to render execution context", err)

@@ -59,4 +59,10 @@
   {{.ExecutionLogs}}
   </execution_logs>
   {{end}}
+
+  {{if .CostSummary}}
+  <cost_summary>
+  {{.CostSummary}}
+  </cost_summary>
+  {{end}}
 </task_report_context>
