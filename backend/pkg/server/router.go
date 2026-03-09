@@ -141,6 +141,7 @@ func NewRouter(
 	screenshotService := services.NewScreenshotService(orm, cfg.DataDir)
 	promptService := services.NewPromptService(orm)
 	analyticsService := services.NewAnalyticsService(orm)
+	progressService := services.NewProgressService(orm, db)
 	tokenService := services.NewTokenService(orm, cfg.CookieSigningSalt, tokenCache, subscriptions)
 	graphqlService := services.NewGraphqlService(
 		db, cfg, baseURL, cfg.CorsOrigins, tokenCache, providers, controller, subscriptions,
@@ -234,6 +235,7 @@ func NewRouter(
 		setScreenshotsGroup(privateGroup, screenshotService)
 		setPromptsGroup(privateGroup, promptService)
 		setAnalyticsGroup(privateGroup, analyticsService)
+		setProgressGroup(privateGroup, progressService)
 	}
 
 	privateUserGroup := api.Group("/")
@@ -561,5 +563,15 @@ func setTokensGroup(parent *gin.RouterGroup, svc *services.TokenService) {
 		tokensGroup.GET("/:tokenID", svc.GetToken)
 		tokensGroup.PUT("/:tokenID", svc.UpdateToken)
 		tokensGroup.DELETE("/:tokenID", svc.DeleteToken)
+	}
+}
+
+func setProgressGroup(parent *gin.RouterGroup, svc *services.ProgressService) {
+	progressGroup := parent.Group("/flows/:flowID")
+	{
+		progressGroup.GET("/progress", svc.GetFlowProgress)
+		progressGroup.GET("/findings", svc.GetFlowFindings)
+		progressGroup.GET("/cost", svc.GetFlowCost)
+		progressGroup.GET("/timeline", svc.GetFlowTimeline)
 	}
 }
