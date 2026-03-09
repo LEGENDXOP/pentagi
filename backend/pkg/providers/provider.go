@@ -27,6 +27,11 @@ import (
 	"github.com/vxcontrol/langchaingo/llms/streaming"
 )
 
+// FlowControlCheckpoint is a function called at each iteration of the agent loop.
+// It returns a steer message (if any) and an error if the flow was aborted.
+// The function blocks while the flow is paused.
+type FlowControlCheckpoint func(ctx context.Context, flowID int64) (steerMessage string, err error)
+
 const ToolPlaceholder = "Always use your function calling functionality, instead of returning a text result."
 
 const TasksNumberLimit = 15
@@ -86,6 +91,7 @@ type FlowProvider interface {
 	SetTitle(title string)
 	SetAgentLogProvider(agentLog tools.AgentLogProvider)
 	SetMsgLogProvider(msgLog tools.MsgLogProvider)
+	SetFlowControlCheckpoint(checkpoint FlowControlCheckpoint)
 
 	GetTaskTitle(ctx context.Context, input string) (string, error)
 	GenerateSubtasks(ctx context.Context, taskID int64) ([]tools.SubtaskInfo, error)
@@ -130,6 +136,7 @@ type flowProvider struct {
 	embedder          embeddings.Embedder
 	graphitiClient    *graphiti.Client
 	interactshEnabled bool
+	authStoreEnabled  bool
 
 	flowID   int64
 	publicIP string
@@ -143,15 +150,23 @@ type flowProvider struct {
 
 	tcIDTemplate string
 
-	prompter templates.Prompter
-	executor tools.FlowToolsExecutor
-	agentLog tools.AgentLogProvider
-	msgLog   tools.MsgLogProvider
-	streamCb StreamMessageHandler
+	prompter     templates.Prompter
+	executor     tools.FlowToolsExecutor
+	agentLog     tools.AgentLogProvider
+	msgLog       tools.MsgLogProvider
+	streamCb     StreamMessageHandler
+	flowControl  FlowControlCheckpoint
 
 	summarizer csum.Summarizer
 
 	provider.Provider
+}
+
+func (fp *flowProvider) SetFlowControlCheckpoint(checkpoint FlowControlCheckpoint) {
+	fp.mx.Lock()
+	defer fp.mx.Unlock()
+
+	fp.flowControl = checkpoint
 }
 
 func (fp *flowProvider) SetAgentLogProvider(agentLog tools.AgentLogProvider) {
@@ -295,6 +310,14 @@ func (fp *flowProvider) GenerateSubtasks(ctx context.Context, taskID int64) ([]t
 		workspaceFiles = files
 	}
 
+	// Render the strategy planner template to inject budget awareness into subtask generation.
+	budgetCfg := LoadAttackBudgetConfigFromEnv()
+	strategyContext, strategyErr := RenderStrategyPlanner(fp.prompter, tasksInfo.Task.Input, budgetCfg)
+	if strategyErr != nil {
+		logger.WithError(strategyErr).Warn("failed to render strategy planner template, continuing without it")
+		strategyContext = ""
+	}
+
 	generatorContext := map[string]map[string]any{
 		"user": {
 			"Task":           tasksInfo.Task,
@@ -317,6 +340,11 @@ func (fp *flowProvider) GenerateSubtasks(ctx context.Context, taskID int64) ([]t
 			"N":                       TasksNumberLimit,
 			"ToolPlaceholder":         ToolPlaceholder,
 		},
+	}
+
+	// Inject strategy planner context into the user context for budget-aware subtask generation.
+	if strategyContext != "" {
+		generatorContext["user"]["ExecutionState"] = strategyContext
 	}
 
 	ctx, observation := obs.Observer.NewObservation(ctx)
@@ -858,6 +886,13 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 	// costs within a single user request accumulate in one place.
 	if GetCostTracker(ctx) == nil {
 		ctx = WithCostTracker(ctx, NewCostTracker(fp.Model(optAgentType)))
+	}
+
+	// Create an AttackBudgetManager if one doesn't exist yet.
+	// This tracks per-phase/vector time and failure budgets to prevent rabbit-holing.
+	// Sub-agents inherit the manager from their parent via context.
+	if GetAttackBudget(ctx) == nil {
+		ctx = WithAttackBudget(ctx, NewAttackBudgetManager(LoadAttackBudgetConfigFromEnv()))
 	}
 
 	ctx = tools.PutAgentContext(ctx, msgChainType)

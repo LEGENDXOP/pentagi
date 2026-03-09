@@ -7,6 +7,7 @@ import { FlowStatusIcon } from '@/components/icons/flow-status-icon';
 import { ProviderIcon } from '@/components/icons/provider-icon';
 import { Breadcrumb, BreadcrumbItem, BreadcrumbList, BreadcrumbPage } from '@/components/ui/breadcrumb';
 import { Button } from '@/components/ui/button';
+import FlowControlBar from '@/features/flows/control/flow-control-bar';
 import {
     DropdownMenu,
     DropdownMenuContent,
@@ -145,7 +146,7 @@ const Flow = () => {
     const navigate = useNavigate();
 
     // Get flow data from FlowProvider
-    const { flowData, flowError, isLoading: isFlowLoading } = useFlow();
+    const { flowData, flowError, flowId, flowStatus, isLoading: isFlowLoading } = useFlow();
 
     // Redirect to flows list if there's an error loading flow data or flow not found
     useEffect(() => {
@@ -202,6 +203,10 @@ const Flow = () => {
                     {!!(flowData?.tasks ?? [])?.length && <FlowReportDropdown />}
                 </div>
             </header>
+            <FlowControlBar
+                flowId={flowId}
+                flowStatus={flowStatus}
+            />
             <div className="relative flex h-[calc(100dvh-3rem)] w-full max-w-full flex-1">
                 {isFlowLoading && (
                     <div className="absolute inset-0 z-50 flex items-center justify-center bg-background/50">

@@ -127,6 +127,9 @@ func (fp *flowProvider) performAgentChain(
 	groupID := fmt.Sprintf("flow-%d", fp.flowID)
 	toolTypeMapping := tools.GetToolTypeMapping()
 
+	// Retrieve the attack budget manager from context (if attached by the flow).
+	attackBudget := GetAttackBudget(ctx)
+
 	// Hard time limit per subtask to prevent infinite execution
 	ctx, timeoutCancel := context.WithTimeout(ctx, maxSubtaskDuration)
 	defer timeoutCancel()
@@ -135,6 +138,50 @@ func (fp *flowProvider) performAgentChain(
 		if err := ctx.Err(); err != nil {
 			logger.WithError(err).Warn("context cancelled/timed out in agent chain loop")
 			return fmt.Errorf("agent chain loop terminated: %w", err)
+		}
+
+		// Flow control checkpoint: pause/steer/abort
+		if fp.flowControl != nil {
+			steerMsg, fcErr := fp.flowControl(ctx, fp.flowID)
+			if fcErr != nil {
+				logger.WithError(fcErr).Warn("flow control: checkpoint returned error (abort or context cancel)")
+				return fmt.Errorf("flow control checkpoint: %w", fcErr)
+			}
+			if steerMsg != "" {
+				// Inject operator override as a system message into the chain
+				overrideContent := fmt.Sprintf("[OPERATOR OVERRIDE] %s", steerMsg)
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: overrideContent},
+					},
+				})
+				logger.WithField("steer_message", steerMsg).Info("flow control: operator steer message injected into chain")
+			}
+		}
+
+		// Attack budget auto-pivot: check if the current attack vector's budget is exhausted.
+		// If so, inject a pivot prompt directing the agent to switch vectors.
+		if attackBudget != nil && metrics.LastToolName != "" {
+			pivotAction := CheckAndBuildPivot(ctx, attackBudget, fp.prompter, metrics.LastToolName)
+			if pivotAction != nil && pivotAction.ShouldPivot {
+				logger.WithFields(logrus.Fields{
+					"pivot_phase":  pivotAction.Phase,
+					"pivot_vector": pivotAction.Vector,
+					"pivot_reason": pivotAction.Reason,
+				}).Info("attack budget exhausted, injecting pivot instruction")
+
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: pivotAction.PivotMessage},
+					},
+				})
+				if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+					logger.WithError(err).Error("failed to update msg chain after pivot injection")
+					return err
+				}
+			}
 		}
 
 		// Refresh system prompt with current execution metrics
@@ -247,6 +294,14 @@ func (fp *flowProvider) performAgentChain(
 				IsError:   isError,
 				Timestamp: time.Now(),
 			})
+
+			// Record attempt in attack budget tracker for auto-pivot decisions.
+			if attackBudget != nil && toolTypeMapping[funcName] != tools.AgentToolType {
+				phase := ClassifyToolPhase(funcName)
+				vector := ClassifyToolVector(funcName)
+				success := IsToolCallSuccess(response, isRepeating)
+				attackBudget.RecordAttempt(phase, vector, success)
+			}
 
 			if toolTypeMapping[funcName] != tools.AgentToolType {
 				fp.storeToolExecutionToGraphiti(

@@ -804,6 +804,7 @@ type Query {
   # API Tokens management
   apiToken(tokenId: String!): APIToken
   apiTokens: [APIToken!]!
+
 }
 
 type Mutation {
@@ -842,6 +843,7 @@ type Mutation {
   # User preferences management
   addFavoriteFlow(flowId: ID!): ResultType!
   deleteFavoriteFlow(flowId: ID!): ResultType!
+
 }
 
 type Subscription {
@@ -880,4 +882,5 @@ type Subscription {
 
   # User preferences events
   settingsUserUpdated: UserPreferences!
+
 }

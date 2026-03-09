@@ -27,6 +27,9 @@ var reconTools = map[string]bool{
 	tools.TavilyToolName:         true,
 	tools.TraversaalToolName:     true,
 	tools.PerplexityToolName:     true,
+	tools.SearxngToolName:        true,
+	tools.SploitusToolName:       true,
+	tools.SearchInMemoryToolName: true,
 }
 
 // postExploitTools are tool names associated with the post-exploitation phase.

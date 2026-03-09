@@ -188,10 +188,23 @@ type Config struct {
 	GraphitiCBTimeout    int  `env:"GRAPHITI_CB_TIMEOUT" envDefault:"120"`
 	GraphitiCBMaxRetries int  `env:"GRAPHITI_CB_MAX_RETRIES" envDefault:"3"`
 
+	// Auth Store session management for pentester agent
+	AuthStoreEnabled bool `env:"AUTH_STORE_ENABLED" envDefault:"true"`
+
+	// Playwright browser automation (headless browser inside container)
+	BrowserPlaywrightEnabled bool `env:"BROWSER_PLAYWRIGHT_ENABLED" envDefault:"true"`
+	BrowserPlaywrightTimeout int  `env:"BROWSER_PLAYWRIGHT_TIMEOUT" envDefault:"30"`
+
 	// Interactsh OOB (Out-of-Band) detection for blind vulnerability testing
 	InteractshEnabled      bool   `env:"INTERACTSH_ENABLED" envDefault:"false"`
 	InteractshServer       string `env:"INTERACTSH_SERVER" envDefault:"oast.fun"`
 	InteractshPollInterval int    `env:"INTERACTSH_POLL_INTERVAL" envDefault:"10"`
+
+	// Attack budget configuration for time-boxed auto-pivot
+	BudgetReconMinutes       int `env:"BUDGET_RECON_MINUTES" envDefault:"30"`
+	BudgetAttackMinutes      int `env:"BUDGET_ATTACK_MINUTES" envDefault:"45"`
+	BudgetPostExploitMinutes int `env:"BUDGET_POST_EXPLOIT_MINUTES" envDefault:"20"`
+	BudgetFailureLimit       int `env:"BUDGET_FAILURE_LIMIT" envDefault:"5"`
 }
 
 func NewConfig() (*Config, error) {

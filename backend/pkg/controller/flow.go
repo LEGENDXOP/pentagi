@@ -73,11 +73,12 @@ type newFlowWorkerCtx struct {
 }
 
 type flowWorkerCtx struct {
-	db     database.Querier
-	cfg    *config.Config
-	docker docker.DockerClient
-	provs  providers.ProviderController
-	subs   subscriptions.SubscriptionsController
+	db          database.Querier
+	cfg         *config.Config
+	docker      docker.DockerClient
+	provs       providers.ProviderController
+	subs        subscriptions.SubscriptionsController
+	flowControl FlowControlManager
 
 	flowProviderControllers
 }
@@ -216,16 +217,22 @@ func NewFlowWorker(
 	executor.SetVectorStoreLogProvider(workers.vslw)
 	executor.SetGraphitiClient(fwc.provs.GraphitiClient())
 
+	// Wire flow control checkpoint into the provider's agent loop
+	if fwc.flowWorkerCtx.flowControl != nil {
+		flowProvider.SetFlowControlCheckpoint(fwc.flowWorkerCtx.flowControl.CheckPoint)
+	}
+
 	flowCtx := &FlowContext{
-		DB:         fwc.db,
-		UserID:     fwc.userID,
-		FlowID:     flow.ID,
-		Executor:   executor,
-		Provider:   flowProvider,
-		Publisher:  pub,
-		MsgLog:     workers.mlw,
-		TermLog:    workers.tlw,
-		Screenshot: workers.sw,
+		DB:          fwc.db,
+		UserID:      fwc.userID,
+		FlowID:      flow.ID,
+		Executor:    executor,
+		Provider:    flowProvider,
+		Publisher:   pub,
+		FlowControl: fwc.flowWorkerCtx.flowControl,
+		MsgLog:      workers.mlw,
+		TermLog:     workers.tlw,
+		Screenshot:  workers.sw,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, _ = obs.Observer.NewObservation(ctx, langfuse.WithObservationTraceID(observation.TraceID()))
@@ -365,16 +372,22 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 	executor.SetVectorStoreLogProvider(workers.vslw)
 	executor.SetGraphitiClient(fwc.provs.GraphitiClient())
 
+	// Wire flow control checkpoint into the provider's agent loop
+	if fwc.flowControl != nil {
+		flowProvider.SetFlowControlCheckpoint(fwc.flowControl.CheckPoint)
+	}
+
 	flowCtx := &FlowContext{
-		DB:         fwc.db,
-		UserID:     flow.UserID,
-		FlowID:     flow.ID,
-		Executor:   executor,
-		Provider:   flowProvider,
-		Publisher:  pub,
-		MsgLog:     workers.mlw,
-		TermLog:    workers.tlw,
-		Screenshot: workers.sw,
+		DB:          fwc.db,
+		UserID:      flow.UserID,
+		FlowID:      flow.ID,
+		Executor:    executor,
+		Provider:    flowProvider,
+		Publisher:   pub,
+		FlowControl: fwc.flowControl,
+		MsgLog:      workers.mlw,
+		TermLog:     workers.tlw,
+		Screenshot:  workers.sw,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, _ = obs.Observer.NewObservation(ctx, langfuse.WithObservationTraceID(observation.TraceID()))

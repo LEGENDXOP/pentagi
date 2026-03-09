@@ -62,6 +62,8 @@ const (
 	PromptTypeShortExecutionContext PromptType = "short_execution_context" // prepares minimal context for quick processing
 	PromptTypeToolCallIDCollector   PromptType = "tool_call_id_collector"  // requests function call to collect tool call ID sample
 	PromptTypeToolCallIDDetector    PromptType = "tool_call_id_detector"   // analyzes tool call ID samples to detect pattern template
+	PromptTypePivot                 PromptType = "pivot"                   // instructs agent to pivot away from exhausted attack vector
+	PromptTypeStrategyPlanner       PromptType = "strategy_planner"        // generates initial attack strategy with budget awareness
 )
 
 var PromptVariables = map[PromptType][]string{
@@ -122,6 +124,12 @@ var PromptVariables = map[PromptType][]string{
 		"InteractshGetURLToolName",
 		"InteractshPollToolName",
 		"InteractshStatusToolName",
+		"AuthStoreEnabled",
+		"AuthLoginToolName",
+		"AuthStatusToolName",
+		"AuthInjectToolName",
+		"AuthRefreshToolName",
+		"AuthLogoutToolName",
 		"SearchToolName",
 		"CoderToolName",
 		"AdviceToolName",
@@ -252,6 +260,7 @@ var PromptVariables = map[PromptType][]string{
 		"Subtasks",
 		"WorkspaceFiles",
 		"Cwd",
+		"ExecutionState",
 	},
 	PromptTypeRefiner: {
 		"SubtaskPatchToolName",
@@ -373,6 +382,23 @@ var PromptVariables = map[PromptType][]string{
 		"FunctionName",
 		"Samples",
 		"PreviousAttempts",
+	},
+	PromptTypePivot: {
+		"ExhaustedVector",
+		"Phase",
+		"TimeSpent",
+		"Attempts",
+		"Failures",
+		"Reason",
+		"SuggestedVectors",
+		"BudgetSummary",
+	},
+	PromptTypeStrategyPlanner: {
+		"TaskInput",
+		"ReconMinutes",
+		"AttackMinutes",
+		"PostExploitMinutes",
+		"FailureLimit",
 	},
 }
 

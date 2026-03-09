@@ -218,6 +218,43 @@ type StoreCodeAction struct {
 	Message     string `json:"message" jsonschema:"required,title=Store code result message" jsonschema_description:"Not so long message with the summary of the code sample to send to the user in user's language only"`
 }
 
+// BrowserNavigateAction is the argument schema for the browser_navigate tool
+type BrowserNavigateAction struct {
+	URL       string `json:"url" jsonschema:"required" jsonschema_description:"URL to navigate to in the headless browser (e.g., 'https://target.com/login'). Supports http and https."`
+	WaitUntil string `json:"wait_until,omitempty" jsonschema:"enum=domcontentloaded,enum=load,enum=networkidle" jsonschema_description:"When to consider navigation complete: 'domcontentloaded' (default, fast), 'load' (all resources), 'networkidle' (no network activity for 500ms, slowest but most complete)"`
+	Message   string `json:"message" jsonschema:"required,title=Navigation message" jsonschema_description:"Not so long message explaining what page you want to visit and why, to send to the user in user's language only"`
+}
+
+// BrowserClickAction is the argument schema for the browser_click tool
+type BrowserClickAction struct {
+	Selector string `json:"selector" jsonschema:"required" jsonschema_description:"CSS selector or text selector to click (e.g., '#submit-btn', 'button:has-text(\"Login\")', 'a[href=\"/admin\"]'). Supports Playwright selector syntax."`
+	Message  string `json:"message" jsonschema:"required,title=Click message" jsonschema_description:"Not so long message explaining what element you want to click and why, to send to the user in user's language only"`
+}
+
+// BrowserFillAction is the argument schema for the browser_fill tool
+type BrowserFillAction struct {
+	Selector string `json:"selector" jsonschema:"required" jsonschema_description:"CSS selector for the input field to fill (e.g., '#username', 'input[name=\"email\"]', '[placeholder=\"Password\"]')"`
+	Value    string `json:"value" jsonschema:"required" jsonschema_description:"Value to type into the input field"`
+	Message  string `json:"message" jsonschema:"required,title=Fill message" jsonschema_description:"Not so long message explaining what field you want to fill and why, to send to the user in user's language only"`
+}
+
+// BrowserScreenshotAction is the argument schema for the browser_screenshot tool
+type BrowserScreenshotAction struct {
+	FullPage Bool   `json:"full_page" jsonschema:"type=boolean" jsonschema_description:"If true (default), captures the entire scrollable page. If false, captures only the viewport."`
+	Message  string `json:"message" jsonschema:"required,title=Screenshot message" jsonschema_description:"Not so long message explaining why you want to take a screenshot, to send to the user in user's language only"`
+}
+
+// BrowserEvaluateAction is the argument schema for the browser_evaluate tool
+type BrowserEvaluateAction struct {
+	Expression string `json:"expression" jsonschema:"required" jsonschema_description:"JavaScript expression to evaluate in the browser page context (e.g., 'document.title', 'document.querySelectorAll(\"a\").length', 'localStorage.getItem(\"token\")'). The expression is evaluated as page.evaluate(() => <expression>)."`
+	Message    string `json:"message" jsonschema:"required,title=Evaluate message" jsonschema_description:"Not so long message explaining what JavaScript you want to run and why, to send to the user in user's language only"`
+}
+
+// BrowserCookiesAction is the argument schema for the browser_cookies tool
+type BrowserCookiesAction struct {
+	Message string `json:"message" jsonschema:"required,title=Cookies message" jsonschema_description:"Not so long message explaining why you want to retrieve cookies, to send to the user in user's language only"`
+}
+
 type MaintenanceAction struct {
 	Question string `json:"question" jsonschema:"required" jsonschema_description:"Question to DevOps team member as a task to maintain local environment and tools inside the docker container in English"`
 	Message  string `json:"message" jsonschema:"required,title=Maintenance task message" jsonschema_description:"Not so long message with the task and question to maintain local environment to send to the user in user's language only"`

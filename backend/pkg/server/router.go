@@ -142,7 +142,10 @@ func NewRouter(
 	promptService := services.NewPromptService(orm)
 	analyticsService := services.NewAnalyticsService(orm)
 	progressService := services.NewProgressService(orm, db)
+	flowEventsService := services.NewFlowEventsService(orm, db)
+	flowControlService := services.NewFlowControlService(controller)
 	tokenService := services.NewTokenService(orm, cfg.CookieSigningSalt, tokenCache, subscriptions)
+	attackPathService := services.NewAttackPathService(orm, db)
 	graphqlService := services.NewGraphqlService(
 		db, cfg, baseURL, cfg.CorsOrigins, tokenCache, providers, controller, subscriptions,
 	)
@@ -236,6 +239,9 @@ func NewRouter(
 		setPromptsGroup(privateGroup, promptService)
 		setAnalyticsGroup(privateGroup, analyticsService)
 		setProgressGroup(privateGroup, progressService)
+		setAttackPathsGroup(privateGroup, attackPathService)
+		setFlowEventsGroup(privateGroup, flowEventsService)
+		setFlowControlGroup(privateGroup, flowControlService)
 	}
 
 	privateUserGroup := api.Group("/")
@@ -573,5 +579,30 @@ func setProgressGroup(parent *gin.RouterGroup, svc *services.ProgressService) {
 		progressGroup.GET("/findings", svc.GetFlowFindings)
 		progressGroup.GET("/cost", svc.GetFlowCost)
 		progressGroup.GET("/timeline", svc.GetFlowTimeline)
+	}
+}
+
+func setAttackPathsGroup(parent *gin.RouterGroup, svc *services.AttackPathService) {
+	attackPathsGroup := parent.Group("/flows/:flowID")
+	{
+		attackPathsGroup.GET("/attack-paths", svc.GetFlowAttackPaths)
+	}
+}
+
+func setFlowEventsGroup(parent *gin.RouterGroup, svc *services.FlowEventsService) {
+	eventsGroup := parent.Group("/flows/:flowID")
+	{
+		eventsGroup.GET("/events", svc.StreamFlowEvents)
+	}
+}
+
+func setFlowControlGroup(parent *gin.RouterGroup, svc *services.FlowControlService) {
+	controlGroup := parent.Group("/flows/:flowID/control")
+	{
+		controlGroup.GET("/", svc.GetFlowControlState)
+		controlGroup.POST("/pause", svc.PauseFlow)
+		controlGroup.POST("/resume", svc.ResumeFlow)
+		controlGroup.POST("/steer", svc.SteerFlow)
+		controlGroup.POST("/abort", svc.AbortFlow)
 	}
 }

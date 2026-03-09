@@ -48,23 +48,25 @@ type FlowController interface {
 	StopFlow(ctx context.Context, flowID int64) error
 	FinishFlow(ctx context.Context, flowID int64) error
 	RenameFlow(ctx context.Context, flowID int64, title string) error
+	GetFlowControlManager() FlowControlManager
 }
 
 type flowController struct {
-	db     database.Querier
-	mx     *sync.Mutex
-	cfg    *config.Config
-	flows  map[int64]FlowWorker
-	docker docker.DockerClient
-	provs  providers.ProviderController
-	subs   subscriptions.SubscriptionsController
-	alc    AgentLogController
-	mlc    MsgLogController
-	aslc   AssistantLogController
-	slc    SearchLogController
-	tlc    TermLogController
-	vslc   VectorStoreLogController
-	sc     ScreenshotController
+	db          database.Querier
+	mx          *sync.Mutex
+	cfg         *config.Config
+	flows       map[int64]FlowWorker
+	docker      docker.DockerClient
+	provs       providers.ProviderController
+	subs        subscriptions.SubscriptionsController
+	flowControl FlowControlManager
+	alc         AgentLogController
+	mlc         MsgLogController
+	aslc        AssistantLogController
+	slc         SearchLogController
+	tlc         TermLogController
+	vslc        VectorStoreLogController
+	sc          ScreenshotController
 }
 
 func NewFlowController(
@@ -75,21 +77,26 @@ func NewFlowController(
 	subs subscriptions.SubscriptionsController,
 ) FlowController {
 	return &flowController{
-		db:     db,
-		mx:     &sync.Mutex{},
-		cfg:    cfg,
-		flows:  make(map[int64]FlowWorker),
-		docker: docker,
-		provs:  provs,
-		subs:   subs,
-		alc:    NewAgentLogController(db),
-		mlc:    NewMsgLogController(db),
-		aslc:   NewAssistantLogController(db),
-		slc:    NewSearchLogController(db),
-		tlc:    NewTermLogController(db),
-		vslc:   NewVectorStoreLogController(db),
-		sc:     NewScreenshotController(db),
+		db:          db,
+		mx:          &sync.Mutex{},
+		cfg:         cfg,
+		flows:       make(map[int64]FlowWorker),
+		docker:      docker,
+		provs:       provs,
+		subs:        subs,
+		flowControl: NewFlowControlManager(),
+		alc:         NewAgentLogController(db),
+		mlc:         NewMsgLogController(db),
+		aslc:        NewAssistantLogController(db),
+		slc:         NewSearchLogController(db),
+		tlc:         NewTermLogController(db),
+		vslc:        NewVectorStoreLogController(db),
+		sc:          NewScreenshotController(db),
 	}
+}
+
+func (fc *flowController) GetFlowControlManager() FlowControlManager {
+	return fc.flowControl
 }
 
 func (fc *flowController) LoadFlows(ctx context.Context) error {
@@ -100,11 +107,12 @@ func (fc *flowController) LoadFlows(ctx context.Context) error {
 
 	for _, flow := range flows {
 		fw, err := LoadFlowWorker(ctx, flow, flowWorkerCtx{
-			db:     fc.db,
-			cfg:    fc.cfg,
-			docker: fc.docker,
-			provs:  fc.provs,
-			subs:   fc.subs,
+			db:          fc.db,
+			cfg:         fc.cfg,
+			docker:      fc.docker,
+			provs:       fc.provs,
+			subs:        fc.subs,
+			flowControl: fc.flowControl,
 			flowProviderControllers: flowProviderControllers{
 				mlc:  fc.mlc,
 				aslc: fc.aslc,
@@ -148,11 +156,12 @@ func (fc *flowController) CreateFlow(
 		prvtype:   prvtype,
 		functions: functions,
 		flowWorkerCtx: flowWorkerCtx{
-			db:     fc.db,
-			cfg:    fc.cfg,
-			docker: fc.docker,
-			provs:  fc.provs,
-			subs:   fc.subs,
+			db:          fc.db,
+			cfg:         fc.cfg,
+			docker:      fc.docker,
+			provs:       fc.provs,
+			subs:        fc.subs,
+			flowControl: fc.flowControl,
 			flowProviderControllers: flowProviderControllers{
 				mlc:  fc.mlc,
 				aslc: fc.aslc,
@@ -193,11 +202,12 @@ func (fc *flowController) CreateAssistant(
 	)
 
 	flowWorkerCtx := flowWorkerCtx{
-		db:     fc.db,
-		cfg:    fc.cfg,
-		docker: fc.docker,
-		provs:  fc.provs,
-		subs:   fc.subs,
+		db:          fc.db,
+		cfg:         fc.cfg,
+		docker:      fc.docker,
+		provs:       fc.provs,
+		subs:        fc.subs,
+		flowControl: fc.flowControl,
 		flowProviderControllers: flowProviderControllers{
 			mlc:  fc.mlc,
 			aslc: fc.aslc,
@@ -362,6 +372,7 @@ func (fc *flowController) FinishFlow(ctx context.Context, flowID int64) error {
 	}
 
 	delete(fc.flows, flowID)
+	fc.flowControl.Remove(flowID)
 
 	return nil
 }

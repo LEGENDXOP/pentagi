@@ -1089,6 +1089,37 @@ func (fte *flowToolsExecutor) GetPentesterExecutor(cfg PentesterExecutorConfig) 
 		ce.handlers[BrowserToolName] = browser.Handle
 	}
 
+	// Playwright browser automation tools (headless browser inside container)
+	playwrightBrowser := NewBrowserPlaywrightTool(
+		fte.flowID,
+		cfg.TaskID,
+		cfg.SubtaskID,
+		fte.cfg.BrowserPlaywrightEnabled,
+		fte.cfg.BrowserPlaywrightTimeout,
+		container.ID,
+		container.LocalID.String,
+		fte.docker,
+		fte.tlp,
+		fte.scp,
+	)
+	if playwrightBrowser.IsAvailable() {
+		ce.definitions = append(ce.definitions,
+			registryDefinitions[BrowserNavigateToolName],
+			registryDefinitions[BrowserClickToolName],
+			registryDefinitions[BrowserFillToolName],
+			registryDefinitions[BrowserScreenshotToolName],
+			registryDefinitions[BrowserEvaluateToolName],
+			registryDefinitions[BrowserCookiesToolName],
+		)
+		pwHandler := playwrightBrowser.(*browserPlaywright).Handle
+		ce.handlers[BrowserNavigateToolName] = pwHandler
+		ce.handlers[BrowserClickToolName] = pwHandler
+		ce.handlers[BrowserFillToolName] = pwHandler
+		ce.handlers[BrowserScreenshotToolName] = pwHandler
+		ce.handlers[BrowserEvaluateToolName] = pwHandler
+		ce.handlers[BrowserCookiesToolName] = pwHandler
+	}
+
 	guide := &guide{
 		flowID:    fte.flowID,
 		taskID:    cfg.TaskID,
@@ -1166,6 +1197,42 @@ func (fte *flowToolsExecutor) GetPentesterExecutor(cfg PentesterExecutorConfig) 
 			ce.handlers[InteractshPollToolName] = interactsh.Handle
 			ce.handlers[InteractshStatusToolName] = interactsh.Handle
 		}
+	}
+
+	// Auth store session management tools
+	if fte.cfg.AuthStoreEnabled {
+		authTool := NewAuthStoreTool(
+			fte.flowID,
+			cfg.TaskID,
+			cfg.SubtaskID,
+			true,
+		)
+		if authTool.IsAvailable() {
+			ce.definitions = append(ce.definitions,
+				registryDefinitions[AuthLoginToolName],
+				registryDefinitions[AuthStatusToolName],
+				registryDefinitions[AuthInjectToolName],
+				registryDefinitions[AuthRefreshToolName],
+				registryDefinitions[AuthLogoutToolName],
+			)
+			ce.handlers[AuthLoginToolName] = authTool.Handle
+			ce.handlers[AuthStatusToolName] = authTool.Handle
+			ce.handlers[AuthInjectToolName] = authTool.Handle
+			ce.handlers[AuthRefreshToolName] = authTool.Handle
+			ce.handlers[AuthLogoutToolName] = authTool.Handle
+		}
+	}
+
+	// Attack path analysis tool — always available (needs only DB).
+	attackPathTool := NewAttackPathTool(
+		fte.flowID,
+		cfg.TaskID,
+		cfg.SubtaskID,
+		fte.db,
+	)
+	if attackPathTool.IsAvailable() {
+		ce.definitions = append(ce.definitions, registryDefinitions[AttackPathAnalyzeToolName])
+		ce.handlers[AttackPathAnalyzeToolName] = attackPathTool.Handle
 	}
 
 	return ce, nil

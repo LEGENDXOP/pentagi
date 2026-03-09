@@ -134,6 +134,7 @@ type providerController struct {
 	embedder          embeddings.Embedder
 	graphitiClient    *graphiti.Client
 	interactshEnabled bool
+	authStoreEnabled  bool
 
 	startCallNumber *atomic.Int64
 
@@ -300,6 +301,7 @@ func NewProviderController(
 		embedder:          embedder,
 		graphitiClient:    graphitiClient,
 		interactshEnabled: cfg.InteractshEnabled,
+		authStoreEnabled:  cfg.AuthStoreEnabled,
 
 		startCallNumber: newAtomicInt64(0), // 0 means to make it random
 
@@ -386,6 +388,7 @@ func (pc *providerController) NewFlowProvider(
 		embedder:          pc.embedder,
 		graphitiClient:    pc.graphitiClient,
 		interactshEnabled: pc.interactshEnabled,
+		authStoreEnabled:  pc.authStoreEnabled,
 		flowID:            flowID,
 		publicIP:          pc.publicIP,
 		callCounter:       newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
@@ -426,6 +429,7 @@ func (pc *providerController) LoadFlowProvider(
 		embedder:          pc.embedder,
 		graphitiClient:    pc.graphitiClient,
 		interactshEnabled: pc.interactshEnabled,
+		authStoreEnabled:  pc.authStoreEnabled,
 		flowID:            flowID,
 		publicIP:          pc.publicIP,
 		callCounter:       newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
@@ -511,6 +515,7 @@ func (pc *providerController) NewAssistantProvider(
 			embedder:          pc.embedder,
 			graphitiClient:    pc.graphitiClient,
 			interactshEnabled: pc.interactshEnabled,
+		authStoreEnabled:  pc.authStoreEnabled,
 			flowID:            flowID,
 			publicIP:          pc.publicIP,
 			callCounter:       newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
@@ -555,6 +560,7 @@ func (pc *providerController) LoadAssistantProvider(
 			embedder:          pc.embedder,
 			graphitiClient:    pc.graphitiClient,
 			interactshEnabled: pc.interactshEnabled,
+		authStoreEnabled:  pc.authStoreEnabled,
 			flowID:            flowID,
 			publicIP:          pc.publicIP,
 			callCounter:       newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),

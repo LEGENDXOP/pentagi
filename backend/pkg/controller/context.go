@@ -22,9 +22,10 @@ type FlowContext struct {
 	UserID int64
 	FlowID int64
 
-	Executor  tools.FlowToolsExecutor
-	Provider  providers.FlowProvider
-	Publisher subscriptions.FlowPublisher
+	Executor    tools.FlowToolsExecutor
+	Provider    providers.FlowProvider
+	Publisher   subscriptions.FlowPublisher
+	FlowControl FlowControlManager
 
 	TermLog    FlowTermLogWorker
 	MsgLog     FlowMsgLogWorker
