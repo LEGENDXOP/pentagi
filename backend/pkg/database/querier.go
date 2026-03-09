@@ -233,6 +233,7 @@ type Querier interface {
 	UpdatePrompt(ctx context.Context, arg UpdatePromptParams) (Prompt, error)
 	UpdateProvider(ctx context.Context, arg UpdateProviderParams) (Provider, error)
 	UpdateSubtaskContext(ctx context.Context, arg UpdateSubtaskContextParams) (Subtask, error)
+	UpdateSubtaskContextWithTimestamp(ctx context.Context, arg UpdateSubtaskContextWithTimestampParams) error
 	UpdateSubtaskFailedResult(ctx context.Context, arg UpdateSubtaskFailedResultParams) (Subtask, error)
 	UpdateSubtaskFinishedResult(ctx context.Context, arg UpdateSubtaskFinishedResultParams) (Subtask, error)
 	UpdateSubtaskResult(ctx context.Context, arg UpdateSubtaskResultParams) (Subtask, error)

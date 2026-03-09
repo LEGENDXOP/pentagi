@@ -63,7 +63,13 @@ func (fp *flowProvider) performAgentChain(
 		summarizerFailures   int
 		metrics              = &ExecutionMetrics{}
 		metricsStartTime     = time.Now()
+		toolHistory          = NewToolHistory(defaultToolHistorySize)
+		execState            = NewExecutionState()
 	)
+
+	// Async state writer — batches DB writes so the agent loop isn't blocked.
+	stateWriter := NewAsyncStateWriter(fp.db)
+	defer stateWriter.Close()
 
 	fields := logrus.Fields{
 		"provider":     fp.Type(),
@@ -92,6 +98,29 @@ func (fp *flowProvider) performAgentChain(
 	if err != nil {
 		logger.WithError(err).Error("failed to get execution context")
 		return fmt.Errorf("failed to get execution context: %w", err)
+	}
+
+	// Load persisted execution state from DB for resume (if any).
+	if subtaskID != nil {
+		if dbSubtask, err := fp.db.GetSubtask(ctx, *subtaskID); err == nil && dbSubtask.Context != "" {
+			if loaded := ParseExecutionState(dbSubtask.Context); loaded != nil {
+				execState = loaded
+				// Restore metrics from persisted state so the agent resumes
+				// with accurate counters instead of zero.
+				toolCallCount = loaded.ToolCallCount
+				metrics.ToolCallCount = loaded.ToolCallCount
+				metrics.ErrorCount = loaded.ErrorCount
+				for _, cmd := range loaded.AttacksDone {
+					metrics.AddCommand(cmd)
+				}
+				metrics.LastToolName = loaded.CurrentAttack
+				logger.WithFields(logrus.Fields{
+					"resumed_tool_calls": loaded.ToolCallCount,
+					"resumed_phase":      loaded.Phase,
+					"resumed_errors":     loaded.ErrorCount,
+				}).Info("resumed execution state from DB")
+			}
+		}
 	}
 
 	groupID := fmt.Sprintf("flow-%d", fp.flowID)
@@ -142,7 +171,7 @@ func (fp *flowProvider) performAgentChain(
 					ctx, optAgentType, chainID, taskID, subtaskID,
 					append(chain, reflectorMsg),
 					fp.getLastHumanMessage(chain), result.content, executionContext, executor, 1,
-					metrics.Snapshot(metricsStartTime))
+					metrics.Snapshot(metricsStartTime), toolHistory)
 				if err != nil {
 					fields := make(logrus.Fields)
 					if result != nil {
@@ -187,9 +216,21 @@ func (fp *flowProvider) performAgentChain(
 			response, err := fp.execToolCall(ctx, chainID, idx, result, detector, executor)
 
 			// Track repeated tool calls detected by the repeating detector
-			if strings.HasPrefix(response, "tool call '") && strings.HasSuffix(response, "' is repeating, please try another tool") {
+			isRepeating := strings.HasPrefix(response, "tool call '") && strings.HasSuffix(response, "' is repeating, please try another tool")
+			if isRepeating {
 				metrics.RepeatedCalls++
 			}
+
+			isError := err != nil || isRepeating
+
+			// Record in tool history for loop analysis
+			toolHistory.Add(ToolHistoryEntry{
+				Name:      funcName,
+				Arguments: toolCall.FunctionCall.Arguments,
+				Result:    response,
+				IsError:   isError,
+				Timestamp: time.Now(),
+			})
 
 			if toolTypeMapping[funcName] != tools.AgentToolType {
 				fp.storeToolExecutionToGraphiti(
@@ -228,6 +269,19 @@ func (fp *flowProvider) performAgentChain(
 
 		toolCallCount += len(result.funcCalls)
 		metrics.ToolCallCount = toolCallCount
+
+		// Persist execution state to DB asynchronously after each tool call batch.
+		if subtaskID != nil {
+			phase := "executing"
+			if wantToStop {
+				phase = "finishing"
+			}
+			execState.Update(metrics, phase)
+			if stateJSON, err := execState.ToJSON(); err == nil {
+				stateWriter.Write(*subtaskID, stateJSON)
+			}
+		}
+
 		if toolCallCount >= maxToolCallsPerSubtask {
 			logger.WithField("tool_call_count", toolCallCount).
 				Warn("reached max tool calls per subtask, forcing stop")
@@ -244,6 +298,42 @@ func (fp *flowProvider) performAgentChain(
 
 		if wantToStop {
 			return nil
+		}
+
+		// Proactive reflector: check if tool history signals a behavioral loop
+		if shouldTrigger, reason := toolHistory.ShouldTriggerProactiveReflector(toolCallCount); shouldTrigger {
+			logger.WithFields(logrus.Fields{
+				"trigger_reason":  reason,
+				"tool_call_count": toolCallCount,
+				"pattern_score":   toolHistory.GetPatternScore(),
+				"error_rate_5":    toolHistory.GetErrorRate(5),
+			}).Info("proactive reflector triggered")
+
+			// Build a synthetic "status report" content for the reflector
+			proactiveContent := fmt.Sprintf(
+				"[PROACTIVE LOOP CHECK — triggered by: %s]\n\n"+
+					"The agent has been executing tool calls. Review the execution history below "+
+					"and determine if the agent should CONTINUE, CHANGE_APPROACH, or STOP.\n\n%s",
+				reason, toolHistory.FormatForPrompt())
+
+			proactiveMsg := llms.MessageContent{Role: llms.ChatMessageTypeAI}
+			proactiveMsg.Parts = append(proactiveMsg.Parts, llms.TextContent{Text: proactiveContent})
+
+			proactiveResult, proactiveErr := fp.performReflector(
+				ctx, optAgentType, chainID, taskID, subtaskID,
+				append(chain, proactiveMsg),
+				fp.getLastHumanMessage(chain), proactiveContent, executionContext, executor, 1,
+				metrics.Snapshot(metricsStartTime), toolHistory)
+			if proactiveErr != nil {
+				// Proactive reflector failure is non-fatal; log and continue
+				logger.WithError(proactiveErr).Warn("proactive reflector failed, continuing execution")
+			} else if proactiveResult != nil && len(proactiveResult.funcCalls) > 0 {
+				// Reflector provided a corrective tool call — inject it as the next result
+				result = proactiveResult
+				// Re-process the corrective tool calls by continuing the loop
+				// The next iteration will pick up result.funcCalls from the reflector
+				logger.Info("proactive reflector provided corrective tool calls")
+			}
 		}
 
 		if summarizer != nil {
@@ -540,6 +630,7 @@ func (fp *flowProvider) performReflector(
 	executor tools.ContextToolsExecutor,
 	iteration int,
 	metrics ExecutionMetrics,
+	toolHistory *ToolHistory,
 ) (*callResult, error) {
 	ctx, span := obs.Observer.NewSpan(ctx, obs.SpanKindInternal, "providers.flowProvider.performReflector")
 	defer span.End()
@@ -597,6 +688,23 @@ func (fp *flowProvider) performReflector(
 
 	if humanMessage != "" {
 		reflectorContext["system"]["Request"] = humanMessage
+	}
+
+	// Inject tool history summary when available
+	if toolHistory != nil && toolHistory.Len() > 0 {
+		reflectorContext["system"]["ToolHistorySummary"] = toolHistory.FormatForPrompt()
+
+		// Pre-compute loop detection signals for template
+		patternScore := toolHistory.GetPatternScore()
+		errorRate := toolHistory.GetErrorRate(5)
+		mostFreqName, mostFreqCount := toolHistory.GetMostFrequentInLast(repeatingWindowSize)
+		reflectorContext["system"]["LoopDetection"] = map[string]any{
+			"PatternScore":        fmt.Sprintf("%.2f", patternScore),
+			"ErrorRate":           fmt.Sprintf("%.0f%%", errorRate*100),
+			"MostFrequentTool":    mostFreqName,
+			"MostFrequentCount":   mostFreqCount,
+			"IsLoopLikely":        patternScore > 0.7 || errorRate > 0.5 || mostFreqCount > 3,
+		}
 	}
 
 	ctx, observation := obs.Observer.NewObservation(ctx)
@@ -685,7 +793,7 @@ func (fp *flowProvider) performReflector(
 	chain = append(chain, reflectorMsg)
 	if len(result.funcCalls) == 0 {
 		return fp.performReflector(ctx, optOriginType, chainID, taskID, subtaskID, chain,
-			humanMessage, result.content, executionContext, executor, iteration+1, metrics)
+			humanMessage, result.content, executionContext, executor, iteration+1, metrics, toolHistory)
 	}
 
 	opts = append(opts, langfuse.WithAgentStatus("success"))

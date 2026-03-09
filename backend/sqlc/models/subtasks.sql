@@ -118,6 +118,11 @@ SET context = $1
 WHERE id = $2
 RETURNING *;
 
+-- name: UpdateSubtaskContextWithTimestamp :exec
+UPDATE subtasks
+SET context = $2, updated_at = NOW()
+WHERE id = $1;
+
 -- name: DeleteSubtask :exec
 DELETE FROM subtasks
 WHERE id = $1;

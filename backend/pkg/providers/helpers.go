@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"pentagi/pkg/cast"
@@ -147,6 +149,235 @@ func injectMetricsIntoSystemPrompt(systemPrompt string, metrics ExecutionMetrics
 
 	// Fallback: append to end
 	return systemPrompt + "\n" + metricsBlock
+}
+
+// ToolHistoryEntry records a single tool invocation with truncated payload.
+type ToolHistoryEntry struct {
+	Name      string    `json:"name"`
+	Arguments string    `json:"arguments"` // truncated to maxToolHistoryArgLen chars
+	Result    string    `json:"result"`    // truncated to maxToolHistoryResLen chars
+	IsError   bool      `json:"is_error"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+const (
+	maxToolHistoryArgLen = 200
+	maxToolHistoryResLen = 500
+	defaultToolHistorySize = 50
+)
+
+// ToolHistory is a thread-safe, bounded ring of recent tool call records.
+type ToolHistory struct {
+	mu      sync.Mutex
+	entries []ToolHistoryEntry
+	maxSize int
+}
+
+// NewToolHistory creates a new tool history tracker with the given capacity.
+func NewToolHistory(maxSize int) *ToolHistory {
+	if maxSize <= 0 {
+		maxSize = defaultToolHistorySize
+	}
+	return &ToolHistory{
+		entries: make([]ToolHistoryEntry, 0, maxSize),
+		maxSize: maxSize,
+	}
+}
+
+// Add appends an entry, evicting the oldest when at capacity.
+// Arguments and Result are automatically truncated.
+func (th *ToolHistory) Add(entry ToolHistoryEntry) {
+	if len(entry.Arguments) > maxToolHistoryArgLen {
+		entry.Arguments = entry.Arguments[:maxToolHistoryArgLen] + "…"
+	}
+	if len(entry.Result) > maxToolHistoryResLen {
+		entry.Result = entry.Result[:maxToolHistoryResLen] + "…"
+	}
+
+	th.mu.Lock()
+	defer th.mu.Unlock()
+
+	th.entries = append(th.entries, entry)
+	if len(th.entries) > th.maxSize {
+		th.entries = th.entries[len(th.entries)-th.maxSize:]
+	}
+}
+
+// GetLast returns the last n entries (fewer if history is shorter).
+func (th *ToolHistory) GetLast(n int) []ToolHistoryEntry {
+	th.mu.Lock()
+	defer th.mu.Unlock()
+
+	if n <= 0 || len(th.entries) == 0 {
+		return nil
+	}
+	if n > len(th.entries) {
+		n = len(th.entries)
+	}
+	out := make([]ToolHistoryEntry, n)
+	copy(out, th.entries[len(th.entries)-n:])
+	return out
+}
+
+// Len returns the current number of entries.
+func (th *ToolHistory) Len() int {
+	th.mu.Lock()
+	defer th.mu.Unlock()
+	return len(th.entries)
+}
+
+// GetErrorRate returns the fraction of entries that are errors in the last n calls.
+func (th *ToolHistory) GetErrorRate(n int) float64 {
+	last := th.GetLast(n)
+	if len(last) == 0 {
+		return 0
+	}
+	errCount := 0
+	for _, e := range last {
+		if e.IsError {
+			errCount++
+		}
+	}
+	return float64(errCount) / float64(len(last))
+}
+
+// GetPatternScore returns a score from 0.0 (all unique tool names) to 1.0
+// (all identical tool names) over the last 10 entries.
+// It measures how repetitive the recent tool usage is.
+func (th *ToolHistory) GetPatternScore() float64 {
+	last := th.GetLast(repeatingWindowSize)
+	if len(last) <= 1 {
+		return 0.0
+	}
+
+	// Count frequency of each tool name
+	freq := make(map[string]int)
+	for _, e := range last {
+		freq[e.Name]++
+	}
+
+	// Shannon entropy normalized to [0,1]
+	n := float64(len(last))
+	var entropy float64
+	for _, count := range freq {
+		p := float64(count) / n
+		if p > 0 {
+			entropy -= p * math.Log2(p)
+		}
+	}
+
+	// Max entropy when all tool names are unique
+	maxEntropy := math.Log2(n)
+	if maxEntropy == 0 {
+		return 1.0 // single entry, trivially "all same"
+	}
+
+	// Invert: low entropy => high pattern score
+	return 1.0 - (entropy / maxEntropy)
+}
+
+// GetMostFrequentInLast returns the tool name that appears most often in the last n entries
+// and its count. Returns ("", 0) on empty history.
+func (th *ToolHistory) GetMostFrequentInLast(n int) (string, int) {
+	last := th.GetLast(n)
+	if len(last) == 0 {
+		return "", 0
+	}
+	freq := make(map[string]int)
+	bestName := ""
+	bestCount := 0
+	for _, e := range last {
+		freq[e.Name]++
+		if freq[e.Name] > bestCount {
+			bestCount = freq[e.Name]
+			bestName = e.Name
+		}
+	}
+	return bestName, bestCount
+}
+
+// FormatForPrompt renders a human-readable summary of the last 10 entries
+// suitable for injection into an LLM prompt.
+func (th *ToolHistory) FormatForPrompt() string {
+	last := th.GetLast(repeatingWindowSize)
+	if len(last) == 0 {
+		return "No tool calls recorded yet."
+	}
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("=== Last %d Tool Calls ===\n", len(last)))
+
+	errCount := 0
+	nameFreq := make(map[string]int)
+	for i, e := range last {
+		nameFreq[e.Name]++
+		status := "OK"
+		if e.IsError {
+			status = "ERROR"
+			errCount++
+		}
+		b.WriteString(fmt.Sprintf("[%d] %s | %s | args: %s\n",
+			i+1, e.Name, status, e.Arguments))
+		if e.IsError && e.Result != "" {
+			b.WriteString(fmt.Sprintf("     error: %s\n", e.Result))
+		}
+	}
+
+	b.WriteString(fmt.Sprintf("\n--- Summary ---\n"))
+	b.WriteString(fmt.Sprintf("Total: %d | Errors: %d (%.0f%%)\n", len(last), errCount,
+		float64(errCount)/float64(len(last))*100))
+	b.WriteString(fmt.Sprintf("Pattern Score: %.2f (0=diverse, 1=repetitive)\n", th.GetPatternScore()))
+
+	// Show frequency breakdown
+	b.WriteString("Tool frequency: ")
+	parts := make([]string, 0, len(nameFreq))
+	for name, count := range nameFreq {
+		parts = append(parts, fmt.Sprintf("%s×%d", name, count))
+	}
+	b.WriteString(strings.Join(parts, ", "))
+	b.WriteString("\n")
+
+	// Detect repetition warnings
+	mostFreqName, mostFreqCount := th.GetMostFrequentInLast(repeatingWindowSize)
+	if mostFreqCount > 3 {
+		b.WriteString(fmt.Sprintf("⚠ WARNING: '%s' called %d times in last %d — possible loop!\n",
+			mostFreqName, mostFreqCount, len(last)))
+	}
+
+	return b.String()
+}
+
+// ShouldTriggerProactiveReflector checks whether tool history warrants a proactive
+// reflector invocation. Returns (shouldTrigger, reason).
+func (th *ToolHistory) ShouldTriggerProactiveReflector(totalCalls int) (bool, string) {
+	// Trigger 1: Every 10 tool calls (periodic checkpoint)
+	if totalCalls > 0 && totalCalls%10 == 0 {
+		return true, fmt.Sprintf("periodic checkpoint at %d tool calls", totalCalls)
+	}
+
+	// Trigger 2: Error rate > 50% in last 5 calls
+	if th.Len() >= 5 {
+		errorRate := th.GetErrorRate(5)
+		if errorRate > 0.5 {
+			return true, fmt.Sprintf("high error rate %.0f%% in last 5 calls", errorRate*100)
+		}
+	}
+
+	// Trigger 3: Pattern score > 0.7 (highly repetitive)
+	if th.Len() >= 5 {
+		score := th.GetPatternScore()
+		if score > 0.7 {
+			return true, fmt.Sprintf("high pattern score %.2f (repetitive tool usage)", score)
+		}
+	}
+
+	// Trigger 4: Same command > 3 times in last 10
+	mostFreq, count := th.GetMostFrequentInLast(repeatingWindowSize)
+	if count > 3 {
+		return true, fmt.Sprintf("'%s' called %d times in last %d calls", mostFreq, count, repeatingWindowSize)
+	}
+
+	return false, ""
 }
 
 func (fp *flowProvider) getTasksInfo(ctx context.Context, taskID int64) (*tasksInfo, error) {

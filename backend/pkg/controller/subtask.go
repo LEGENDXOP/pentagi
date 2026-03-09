@@ -29,6 +29,8 @@ type SubtaskWorker interface {
 	SetStatus(ctx context.Context, status database.SubtaskStatus) error
 	GetResult(ctx context.Context) (string, error)
 	SetResult(ctx context.Context, result string) error
+	GetContext(ctx context.Context) (string, error)
+	SetContext(ctx context.Context, data string) error
 	PutInput(ctx context.Context, input string) error
 	Run(ctx context.Context) error
 	Finish(ctx context.Context) error
@@ -246,6 +248,27 @@ func (stw *subtaskWorker) SetResult(ctx context.Context, result string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("failed to set subtask %d result: %w", stw.subtaskCtx.SubtaskID, err)
+	}
+
+	return nil
+}
+
+func (stw *subtaskWorker) GetContext(ctx context.Context) (string, error) {
+	subtask, err := stw.subtaskCtx.DB.GetSubtask(ctx, stw.subtaskCtx.SubtaskID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get subtask %d context: %w", stw.subtaskCtx.SubtaskID, err)
+	}
+
+	return subtask.Context, nil
+}
+
+func (stw *subtaskWorker) SetContext(ctx context.Context, data string) error {
+	err := stw.subtaskCtx.DB.UpdateSubtaskContextWithTimestamp(ctx, database.UpdateSubtaskContextWithTimestampParams{
+		ID:      stw.subtaskCtx.SubtaskID,
+		Context: data,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to set subtask %d context: %w", stw.subtaskCtx.SubtaskID, err)
 	}
 
 	return nil

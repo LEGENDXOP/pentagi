@@ -475,6 +475,22 @@ func (q *Queries) UpdateSubtaskContext(ctx context.Context, arg UpdateSubtaskCon
 	return i, err
 }
 
+const updateSubtaskContextWithTimestamp = `-- name: UpdateSubtaskContextWithTimestamp :exec
+UPDATE subtasks
+SET context = $2, updated_at = NOW()
+WHERE id = $1
+`
+
+type UpdateSubtaskContextWithTimestampParams struct {
+	ID      int64  `json:"id"`
+	Context string `json:"context"`
+}
+
+func (q *Queries) UpdateSubtaskContextWithTimestamp(ctx context.Context, arg UpdateSubtaskContextWithTimestampParams) error {
+	_, err := q.db.ExecContext(ctx, updateSubtaskContextWithTimestamp, arg.ID, arg.Context)
+	return err
+}
+
 const updateSubtaskFailedResult = `-- name: UpdateSubtaskFailedResult :one
 UPDATE subtasks
 SET status = 'failed', result = $1

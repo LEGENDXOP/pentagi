@@ -565,6 +565,18 @@ func (fp *flowProvider) GetPentesterHandler(ctx context.Context, taskID, subtask
 	}
 
 	pentesterHandler := func(ctx context.Context, action tools.PentesterAction) (string, error) {
+		// Load persisted execution state for this subtask (if any).
+		var subtaskContext string
+		if subtaskID != nil {
+			if st, err := fp.db.GetSubtask(ctx, *subtaskID); err == nil && st.Context != "" {
+				if parsed := ParseExecutionState(st.Context); parsed != nil {
+					if j, err := parsed.ToJSON(); err == nil {
+						subtaskContext = j
+					}
+				}
+			}
+		}
+
 		pentesterContext := map[string]map[string]any{
 			"user": {
 				"Question": action.Question,
@@ -587,6 +599,7 @@ func (fp *flowProvider) GetPentesterHandler(ctx context.Context, taskID, subtask
 				"Cwd":                     docker.WorkFolderPathInContainer,
 				"ContainerPorts":          fp.getContainerPortsDescription(),
 				"ExecutionContext":        executionContext,
+				"SubtaskContext":          subtaskContext,
 				"Lang":                    fp.language,
 				"CurrentTime":             getCurrentTime(),
 				"ToolPlaceholder":         ToolPlaceholder,
