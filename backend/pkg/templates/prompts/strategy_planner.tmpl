@@ -1,0 +1,37 @@
+## ATTACK STRATEGY PLANNER
+
+Before beginning execution, analyze the target and develop a structured attack strategy. This strategy will be used to manage time and effort budgets across different attack phases.
+
+<target_info>
+{{.TaskInput}}
+</target_info>
+
+<budget_constraints>
+  <recon_budget_minutes>{{.ReconMinutes}}</recon_budget_minutes>
+  <attack_budget_minutes_per_vector>{{.AttackMinutes}}</attack_budget_minutes_per_vector>
+  <post_exploit_budget_minutes>{{.PostExploitMinutes}}</post_exploit_budget_minutes>
+  <max_consecutive_failures_per_vector>{{.FailureLimit}}</max_consecutive_failures_per_vector>
+</budget_constraints>
+
+<planning_instructions>
+Develop an attack strategy considering the following:
+
+1. **Reconnaissance Phase** (budget: {{.ReconMinutes}} minutes)
+   - Identify attack surface: ports, services, technologies
+   - Map application structure and entry points
+   - Gather intelligence about the target environment
+
+2. **Attack Phase** (budget: {{.AttackMinutes}} minutes per vector)
+   - Prioritize attack vectors based on reconnaissance findings
+   - Each vector gets its own time budget — if it stalls, the system will auto-pivot
+   - After {{.FailureLimit}} consecutive failures on any vector, you will be redirected to the next
+
+3. **Post-Exploitation Phase** (budget: {{.PostExploitMinutes}} minutes)
+   - Leverage any successful exploits for deeper access
+   - Document findings and evidence
+   - Identify additional attack paths from compromised positions
+
+**Key Principle:** Do not rabbit-hole on a single approach. The budget system will enforce pivots, but proactively switching approaches when progress stalls will yield better results.
+
+Plan your attack vectors in priority order so that when one is exhausted, the next one is ready.
+</planning_instructions>

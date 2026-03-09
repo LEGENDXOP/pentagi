@@ -1,0 +1,36 @@
+## AUTO-PIVOT INSTRUCTION
+
+Your current attack vector has been exhausted by the automated budget system. You MUST pivot to a different approach immediately.
+
+<budget_exhaustion>
+  <exhausted_vector>{{.ExhaustedVector}}</exhausted_vector>
+  <phase>{{.Phase}}</phase>
+  <time_spent>{{.TimeSpent}}</time_spent>
+  <total_attempts>{{.Attempts}}</total_attempts>
+  <consecutive_failures>{{.Failures}}</consecutive_failures>
+  <reason>{{.Reason}}</reason>
+</budget_exhaustion>
+
+{{if .SuggestedVectors}}
+<suggested_alternatives>
+The following attack vectors are recommended based on attack chain analysis:
+{{range .SuggestedVectors}}
+- **{{.}}**: Try this approach as it may yield better results given the current target state
+{{end}}
+</suggested_alternatives>
+{{end}}
+
+{{if .BudgetSummary}}
+<current_budget_status>
+{{.BudgetSummary}}
+</current_budget_status>
+{{end}}
+
+<pivot_rules>
+1. Do NOT continue with the exhausted vector — the budget system has determined it is unproductive
+2. Choose a DIFFERENT attack technique or target surface
+3. If suggested alternatives are provided, prioritize them in order
+4. Document what was tried and why it failed before moving on
+5. Apply lessons learned from the failed vector to inform your next approach
+6. Report your pivot decision and reasoning using the appropriate result tool
+</pivot_rules>
