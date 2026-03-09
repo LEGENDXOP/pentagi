@@ -202,9 +202,12 @@ func (s *FlowEventsService) StreamFlowEvents(c *gin.Context) {
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
 
-	// Periodic metric ticker — poll DB for updated metrics every 5s
-	metricTicker := time.NewTicker(5 * time.Second)
-	defer metricTicker.Stop()
+	// Periodic poll ticker — poll DB for updated metrics + agent activity every 5s
+	pollTicker := time.NewTicker(5 * time.Second)
+	defer pollTicker.Stop()
+
+	// Track last seen agent log ID to detect new activity
+	var lastAgentLogID int64
 
 	clientGone := c.Request.Context().Done()
 
@@ -225,8 +228,15 @@ func (s *FlowEventsService) StreamFlowEvents(c *gin.Context) {
 				"timestamp": time.Now().UTC().Format(time.RFC3339),
 			})
 
-		case <-metricTicker.C:
+		case <-pollTicker.C:
+			// Send updated metrics from DB
 			s.sendMetrics(c, flowID)
+			// Send updated phase
+			s.sendPhaseUpdate(c, flowID)
+			// Send new agent activity if any
+			lastAgentLogID = s.sendNewAgentActivity(c, flowID, lastAgentLogID)
+			// Send any new findings from subtask results
+			s.sendFindingsUpdate(c, flowID)
 		}
 	}
 }
@@ -244,50 +254,43 @@ func (s *FlowEventsService) sendInitialState(c *gin.Context, flowID int64, flow 
 	// Send initial metrics
 	s.sendMetrics(c, flowID)
 
-	// Send existing findings
+	// Send existing findings from subtask results
 	s.sendExistingFindings(c, flowID)
+
+	// Send latest agent activity
+	s.sendLatestAgentActivity(c, flowID)
 }
 
-// sendMetrics polls the DB and sends a metric event.
+// sendMetrics queries real DB tables for metrics and sends a metric event.
 func (s *FlowEventsService) sendMetrics(c *gin.Context, flowID int64) {
 	ctx := c.Request.Context()
+
 	flow, err := s.dbc.GetFlow(ctx, flowID)
 	if err != nil {
 		return
 	}
 
-	tasks, err := s.dbc.GetFlowTasks(ctx, flowID)
-	if err != nil {
-		tasks = nil
+	// Get tool call count from toolcalls table
+	var commandsRun int
+	toolStats, err := s.dbc.GetFlowToolcallsStats(ctx, flowID)
+	if err == nil {
+		commandsRun = int(toolStats.TotalCount)
 	}
 
-	var commandsRun, findingsCount, attacksDone, attacksBlocked int
-	for _, task := range tasks {
-		subtasks, stErr := s.dbc.GetTaskSubtasks(ctx, task.ID)
-		if stErr != nil {
-			continue
-		}
-		for _, st := range subtasks {
-			if st.Context != "" {
-				var state struct {
-					ToolCallCount  int      `json:"tool_call_count"`
-					FindingsCount  int      `json:"findings_count"`
-					AttacksDone    []string `json:"attacks_done"`
-					AttacksBlocked int      `json:"attacks_blocked"`
-				}
-				if json.Unmarshal([]byte(st.Context), &state) == nil {
-					commandsRun += state.ToolCallCount
-					findingsCount += state.FindingsCount
-					attacksDone += len(state.AttacksDone)
-					attacksBlocked += state.AttacksBlocked
-				}
-			}
-			if strings.Contains(st.Result, "[FINDING") {
-				findingsCount += strings.Count(st.Result, "[FINDING")
-			}
-		}
+	// Get terminal log count as additional command indicator
+	termLogs, err := s.dbc.GetFlowTermLogs(ctx, flowID)
+	if err == nil && commandsRun == 0 {
+		// If no toolcalls, count terminal commands instead
+		commandsRun = len(termLogs)
 	}
 
+	// Count findings from subtask results (the real data source)
+	findingsCount := s.countFindings(ctx, flowID)
+
+	// Estimate attacks done based on toolcall function names
+	attacksDone, attacksBlocked := s.countAttacks(ctx, flowID)
+
+	// Calculate elapsed time
 	var elapsed int
 	if flow.CreatedAt.Valid {
 		elapsed = int(time.Since(flow.CreatedAt.Time).Seconds())
@@ -302,55 +305,317 @@ func (s *FlowEventsService) sendMetrics(c *gin.Context, flowID int64) {
 	})
 }
 
-// sendExistingFindings sends all existing findings for the flow.
-func (s *FlowEventsService) sendExistingFindings(c *gin.Context, flowID int64) {
-	ctx := c.Request.Context()
+// countFindings counts findings from subtask results AND agentlog results.
+func (s *FlowEventsService) countFindings(ctx context.Context, flowID int64) int {
+	count := 0
+
+	// Check subtask results for finding markers
 	tasks, err := s.dbc.GetFlowTasks(ctx, flowID)
 	if err != nil {
-		return
+		return 0
 	}
 
-	findingID := 0
 	for _, task := range tasks {
 		subtasks, stErr := s.dbc.GetTaskSubtasks(ctx, task.ID)
 		if stErr != nil {
 			continue
 		}
 		for _, st := range subtasks {
-			if !strings.Contains(st.Result, "FINDING") {
-				continue
-			}
-			lines := strings.Split(st.Result, "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if !strings.Contains(line, "[FINDING") {
-					continue
+			count += countFindingMarkers(st.Result)
+			// Also check subtask context for explicit findings_count
+			if st.Context != "" {
+				var state struct {
+					FindingsCount int `json:"findings_count"`
 				}
-				findingID++
-				severity := "MEDIUM"
-				for _, sev := range []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"} {
-					if strings.Contains(strings.ToUpper(line), sev) {
-						severity = sev
-						break
+				if json.Unmarshal([]byte(st.Context), &state) == nil && state.FindingsCount > 0 {
+					if state.FindingsCount > count {
+						count = state.FindingsCount
 					}
 				}
-				vulnType := ""
-				if idx := strings.Index(line, "[VULN_TYPE:"); idx >= 0 {
-					end := strings.Index(line[idx:], "]")
-					if end > 0 {
-						vulnType = strings.TrimSpace(line[idx+11 : idx+end])
-					}
-				}
-				s.writeSSE(c, SSEEventFinding, FindingEvent{
-					ID:       fmt.Sprintf("finding-%d", findingID),
-					Severity: severity,
-					Title:    truncate(line, 120),
-					Target:   "",
-					VulnType: vulnType,
-				})
 			}
 		}
 	}
+
+	// Also check agentlog results for findings
+	agentLogs, err := s.dbc.GetFlowAgentLogs(ctx, flowID)
+	if err == nil {
+		for _, log := range agentLogs {
+			count += countFindingMarkers(log.Result)
+		}
+	}
+
+	return count
+}
+
+// countAttacks estimates attacks done/blocked from toolcalls and termlogs.
+func (s *FlowEventsService) countAttacks(ctx context.Context, flowID int64) (done, blocked int) {
+	// First check subtask contexts for explicit attack tracking
+	tasks, err := s.dbc.GetFlowTasks(ctx, flowID)
+	if err != nil {
+		return 0, 0
+	}
+
+	for _, task := range tasks {
+		subtasks, stErr := s.dbc.GetTaskSubtasks(ctx, task.ID)
+		if stErr != nil {
+			continue
+		}
+		for _, st := range subtasks {
+			if st.Context != "" {
+				var state struct {
+					AttacksDone    []string `json:"attacks_done"`
+					AttacksBlocked int      `json:"attacks_blocked"`
+				}
+				if json.Unmarshal([]byte(st.Context), &state) == nil {
+					done += len(state.AttacksDone)
+					blocked += state.AttacksBlocked
+				}
+			}
+		}
+	}
+
+	// If no explicit tracking, estimate from toolcalls grouped by function name
+	if done == 0 {
+		funcStats, tcErr := s.dbc.GetToolcallsStatsByFunctionForFlow(ctx, flowID)
+		if tcErr == nil {
+			attackTools := map[string]bool{
+				"terminal":    true,
+				"nuclei":      true,
+				"nmap":        true,
+				"sqlmap":      true,
+				"interactsh":  true,
+				"exec_cmd":    true,
+				"run_command": true,
+			}
+			for _, fs := range funcStats {
+				name := strings.ToLower(fs.FunctionName)
+				if attackTools[name] || strings.Contains(name, "scan") || strings.Contains(name, "exploit") || strings.Contains(name, "attack") {
+					done += int(fs.TotalCount)
+				}
+			}
+		}
+	}
+
+	return done, blocked
+}
+
+// sendPhaseUpdate sends the current phase.
+func (s *FlowEventsService) sendPhaseUpdate(c *gin.Context, flowID int64) {
+	ctx := c.Request.Context()
+	flow, err := s.dbc.GetFlow(ctx, flowID)
+	if err != nil {
+		return
+	}
+
+	phase := inferPhaseFromFlow(ctx, s.dbc, flowID)
+	s.writeSSE(c, SSEEventPhaseChange, PhaseChangeEvent{
+		Phase:     phase,
+		Status:    string(flow.Status),
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// sendLatestAgentActivity sends the most recent agent activity.
+func (s *FlowEventsService) sendLatestAgentActivity(c *gin.Context, flowID int64) {
+	ctx := c.Request.Context()
+	agentLogs, err := s.dbc.GetFlowAgentLogs(ctx, flowID)
+	if err != nil || len(agentLogs) == 0 {
+		return
+	}
+
+	// agentLogs are ordered by created_at ASC, so last is latest
+	latest := agentLogs[len(agentLogs)-1]
+	agentName := string(latest.Executor)
+	if agentName == "" {
+		agentName = string(latest.Initiator)
+	}
+	if agentName == "" {
+		agentName = "agent"
+	}
+
+	summary := latest.Task
+	if summary == "" {
+		summary = truncate(latest.Result, 200)
+	}
+
+	s.writeSSE(c, SSEEventAgentActivity, AgentActivityEvent{
+		AgentName:     agentName,
+		ActionSummary: summary,
+	})
+}
+
+// sendNewAgentActivity sends agent activity that's newer than lastSeenID.
+// Returns the new lastSeenID.
+func (s *FlowEventsService) sendNewAgentActivity(c *gin.Context, flowID int64, lastSeenID int64) int64 {
+	ctx := c.Request.Context()
+	agentLogs, err := s.dbc.GetFlowAgentLogs(ctx, flowID)
+	if err != nil || len(agentLogs) == 0 {
+		return lastSeenID
+	}
+
+	// agentLogs are ordered by created_at ASC, so last is latest
+	latest := agentLogs[len(agentLogs)-1]
+	latestID := latest.ID
+	if latestID <= lastSeenID {
+		return lastSeenID // no new activity
+	}
+	agentName := string(latest.Executor)
+	if agentName == "" {
+		agentName = string(latest.Initiator)
+	}
+	if agentName == "" {
+		agentName = "agent"
+	}
+
+	summary := latest.Task
+	if summary == "" {
+		summary = truncate(latest.Result, 200)
+	}
+
+	s.writeSSE(c, SSEEventAgentActivity, AgentActivityEvent{
+		AgentName:     agentName,
+		ActionSummary: summary,
+	})
+
+	return latestID
+}
+
+// findingsTracker keeps track of which findings have already been sent.
+// This is a simple approach - in production you'd use a more robust dedup mechanism.
+var findingsSentPerFlow = sync.Map{} // flowID -> map[string]bool
+
+func (s *FlowEventsService) sendFindingsUpdate(c *gin.Context, flowID int64) {
+	ctx := c.Request.Context()
+
+	sentI, _ := findingsSentPerFlow.LoadOrStore(flowID, &sync.Map{})
+	sent := sentI.(*sync.Map)
+
+	findings := s.extractAllFindings(ctx, flowID)
+	for _, f := range findings {
+		if _, already := sent.LoadOrStore(f.ID, true); !already {
+			s.writeSSE(c, SSEEventFinding, f)
+		}
+	}
+}
+
+// sendExistingFindings sends all existing findings for the flow on initial connect.
+func (s *FlowEventsService) sendExistingFindings(c *gin.Context, flowID int64) {
+	ctx := c.Request.Context()
+
+	sentI, _ := findingsSentPerFlow.LoadOrStore(flowID, &sync.Map{})
+	sent := sentI.(*sync.Map)
+
+	findings := s.extractAllFindings(ctx, flowID)
+	for _, f := range findings {
+		sent.Store(f.ID, true)
+		s.writeSSE(c, SSEEventFinding, f)
+	}
+}
+
+// extractAllFindings extracts findings from subtask results and agentlog results.
+func (s *FlowEventsService) extractAllFindings(ctx context.Context, flowID int64) []FindingEvent {
+	var findings []FindingEvent
+	findingID := 0
+
+	// Extract from subtask results
+	tasks, err := s.dbc.GetFlowTasks(ctx, flowID)
+	if err == nil {
+		for _, task := range tasks {
+			subtasks, stErr := s.dbc.GetTaskSubtasks(ctx, task.ID)
+			if stErr != nil {
+				continue
+			}
+			for _, st := range subtasks {
+				extracted := extractFindingEvents(st.Result, &findingID)
+				findings = append(findings, extracted...)
+			}
+		}
+	}
+
+	// Also extract from agentlog results
+	agentLogs, err := s.dbc.GetFlowAgentLogs(ctx, flowID)
+	if err == nil {
+		for _, log := range agentLogs {
+			extracted := extractFindingEvents(log.Result, &findingID)
+			findings = append(findings, extracted...)
+		}
+	}
+
+	return findings
+}
+
+// extractFindingEvents extracts FindingEvent entries from a text block.
+func extractFindingEvents(text string, idCounter *int) []FindingEvent {
+	if !strings.Contains(text, "FINDING") && !strings.Contains(text, "finding") &&
+		!strings.Contains(text, "vulnerability") && !strings.Contains(text, "Vulnerability") {
+		return nil
+	}
+
+	var findings []FindingEvent
+	lines := strings.Split(text, "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Match various finding formats:
+		// - [FINDING: ...] style markers
+		// - Lines with severity keywords that look like findings
+		// - Markdown list items describing vulnerabilities
+		isFinding := false
+		if strings.Contains(line, "[FINDING") || strings.Contains(line, "[finding") {
+			isFinding = true
+		} else if (strings.Contains(line, "CRITICAL") || strings.Contains(line, "HIGH") ||
+			strings.Contains(line, "MEDIUM") || strings.Contains(line, "LOW")) &&
+			(strings.Contains(strings.ToLower(line), "vuln") ||
+				strings.Contains(strings.ToLower(line), "finding") ||
+				strings.Contains(strings.ToLower(line), "exploit")) {
+			isFinding = true
+		}
+
+		if !isFinding {
+			continue
+		}
+
+		*idCounter++
+		severity := "MEDIUM"
+		for _, sev := range []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"} {
+			if strings.Contains(strings.ToUpper(line), sev) {
+				severity = sev
+				break
+			}
+		}
+
+		vulnType := ""
+		if idx := strings.Index(line, "[VULN_TYPE:"); idx >= 0 {
+			end := strings.Index(line[idx:], "]")
+			if end > 0 {
+				vulnType = strings.TrimSpace(line[idx+11 : idx+end])
+			}
+		}
+
+		findings = append(findings, FindingEvent{
+			ID:       fmt.Sprintf("finding-%d", *idCounter),
+			Severity: severity,
+			Title:    truncate(line, 120),
+			Target:   "",
+			VulnType: vulnType,
+		})
+	}
+
+	return findings
+}
+
+// countFindingMarkers counts finding-related markers in text.
+func countFindingMarkers(text string) int {
+	if text == "" {
+		return 0
+	}
+	count := strings.Count(text, "[FINDING")
+	count += strings.Count(text, "[finding")
+	return count
 }
 
 // writeSSE writes an SSE-formatted event to the response writer.
@@ -390,6 +655,30 @@ func inferPhaseFromFlow(ctx context.Context, dbc database.Querier, flowID int64)
 				if json.Unmarshal([]byte(subtasks[j].Context), &state) == nil && state.Phase != "" {
 					return state.Phase
 				}
+			}
+		}
+	}
+
+	// Check agentlog content for phase hints (iterate from latest to oldest)
+	agentLogs, err := dbc.GetFlowAgentLogs(ctx, flowID)
+	if err == nil {
+		for i := len(agentLogs) - 1; i >= 0; i-- {
+			log := agentLogs[i]
+			combined := strings.ToLower(log.Task + " " + log.Result)
+			if strings.Contains(combined, "report") || strings.Contains(combined, "summary") || strings.Contains(combined, "final") {
+				return "report"
+			}
+			if strings.Contains(combined, "exploit") || strings.Contains(combined, "chain") || strings.Contains(combined, "attack chain") {
+				return "chains"
+			}
+			if strings.Contains(combined, "deep dive") || strings.Contains(combined, "injection") || strings.Contains(combined, "xss") || strings.Contains(combined, "sqli") {
+				return "deep_dive"
+			}
+			if strings.Contains(combined, "triage") || strings.Contains(combined, "priorit") || strings.Contains(combined, "classif") {
+				return "triage"
+			}
+			if strings.Contains(combined, "auth") || strings.Contains(combined, "login") || strings.Contains(combined, "session") || strings.Contains(combined, "cookie") {
+				return "auth"
 			}
 		}
 	}

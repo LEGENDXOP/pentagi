@@ -1,4 +1,4 @@
-import { ArrowLeft, Radio, WifiOff } from 'lucide-react';
+import { AlertCircle, ArrowLeft, Radio, WifiOff } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 
 import { Badge } from '@/components/ui/badge';
@@ -63,6 +63,14 @@ const FlowDashboard = () => {
 
             {/* Dashboard content */}
             <div className="mx-auto flex max-w-7xl flex-col gap-6 p-6">
+                {/* Error banner */}
+                {state.error && (
+                    <div className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-600 dark:text-amber-400">
+                        <AlertCircle className="size-4 shrink-0" />
+                        {state.error}
+                    </div>
+                )}
+
                 {/* Phase Timeline */}
                 <Card>
                     <CardHeader className="pb-2">
