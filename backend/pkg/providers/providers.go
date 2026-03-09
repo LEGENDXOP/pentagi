@@ -273,10 +273,18 @@ func NewProviderController(
 		KeepQASections: cfg.AssistantSummarizerKeepQASections,
 	})
 
-	graphitiClient, err := graphiti.NewClient(
+	cbConfig := graphiti.CircuitBreakerConfig{
+		Enabled:          cfg.GraphitiCBEnabled,
+		FailureThreshold: cfg.GraphitiCBThreshold,
+		FailureWindow:    60 * time.Second,
+		OpenTimeout:      time.Duration(cfg.GraphitiCBTimeout) * time.Second,
+		MaxRetries:       cfg.GraphitiCBMaxRetries,
+	}
+	graphitiClient, err := graphiti.NewClientWithCircuitBreaker(
 		cfg.GraphitiURL,
 		time.Duration(cfg.GraphitiTimeout)*time.Second,
 		cfg.GraphitiEnabled && cfg.GraphitiURL != "",
+		cbConfig,
 	)
 	if err != nil {
 		logrus.WithError(err).Warn("failed to initialize graphiti client, continuing without it")

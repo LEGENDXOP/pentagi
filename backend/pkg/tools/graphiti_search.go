@@ -24,6 +24,13 @@ type graphitiSearcher interface {
 	EntityByLabelSearch(ctx context.Context, req graphiti.EntityByLabelSearchRequest) (*graphiti.EntityByLabelSearchResponse, error)
 }
 
+// graphitiFallbackSearcher is an optional interface for circuit breaker fallback.
+// Clients that support fallback (e.g., *graphiti.Client with a configured pgvector store) implement this.
+type graphitiFallbackSearcher interface {
+	FallbackSearch(ctx context.Context, query string, groupID string) (string, error)
+}
+
+
 const (
 	// Default values for search parameters
 	DefaultTemporalMaxResults     = 15
@@ -145,6 +152,22 @@ func (t *GraphitiSearchTool) Handle(ctx context.Context, name string, args json.
 	}
 
 	if err != nil {
+		// Check if this is a circuit breaker open error — attempt fallback
+		if coe, ok := graphiti.IsCircuitOpenError(err); ok {
+			logger.WithField("circuit_state", "OPEN").
+				Warn("graphiti circuit breaker is open, attempting pgvector fallback")
+			if fb, ok := t.graphitiClient.(graphitiFallbackSearcher); ok {
+				fallbackResult, fbErr := fb.FallbackSearch(ctx, coe.Query, coe.GroupID)
+				if fbErr != nil {
+					logger.WithError(fbErr).Error("pgvector fallback search also failed")
+					return "", fmt.Errorf("graphiti unavailable and fallback failed: %w", fbErr)
+				}
+				return fallbackResult, nil
+			}
+			// No fallback searcher available — return a helpful message instead of error
+			return "Graphiti knowledge graph is temporarily unavailable (circuit breaker open). Please try again later.", nil
+		}
+
 		logger.WithError(err).Errorf("failed to perform graphiti search '%s'", searchArgs.SearchType)
 		return "", err
 	}

@@ -187,6 +187,11 @@ type Config struct {
 	GraphitiCBThreshold  int  `env:"GRAPHITI_CB_THRESHOLD" envDefault:"3"`
 	GraphitiCBTimeout    int  `env:"GRAPHITI_CB_TIMEOUT" envDefault:"120"`
 	GraphitiCBMaxRetries int  `env:"GRAPHITI_CB_MAX_RETRIES" envDefault:"3"`
+
+	// Interactsh OOB (Out-of-Band) detection for blind vulnerability testing
+	InteractshEnabled      bool   `env:"INTERACTSH_ENABLED" envDefault:"false"`
+	InteractshServer       string `env:"INTERACTSH_SERVER" envDefault:"oast.fun"`
+	InteractshPollInterval int    `env:"INTERACTSH_POLL_INTERVAL" envDefault:"10"`
 }
 
 func NewConfig() (*Config, error) {

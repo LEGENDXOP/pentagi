@@ -1144,6 +1144,30 @@ func (fte *flowToolsExecutor) GetPentesterExecutor(cfg PentesterExecutorConfig) 
 		ce.handlers[NucleiToolName] = nucleiTool.Handle
 	}
 
+	// Interactsh OOB detection tools
+	if fte.cfg.InteractshEnabled {
+		interactsh := NewInteractshTool(
+			fte.flowID,
+			cfg.TaskID,
+			cfg.SubtaskID,
+			container.ID,
+			container.LocalID.String,
+			fte.docker,
+			fte.tlp,
+			fte.cfg.InteractshServer,
+		)
+		if interactsh.IsAvailable() {
+			ce.definitions = append(ce.definitions,
+				registryDefinitions[InteractshGetURLToolName],
+				registryDefinitions[InteractshPollToolName],
+				registryDefinitions[InteractshStatusToolName],
+			)
+			ce.handlers[InteractshGetURLToolName] = interactsh.Handle
+			ce.handlers[InteractshPollToolName] = interactsh.Handle
+			ce.handlers[InteractshStatusToolName] = interactsh.Handle
+		}
+	}
+
 	return ce, nil
 }
 
