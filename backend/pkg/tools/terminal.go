@@ -17,6 +17,7 @@ import (
 	"pentagi/pkg/docker"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/observability/langfuse"
+	"pentagi/pkg/providers"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/sirupsen/logrus"
@@ -56,14 +57,15 @@ type execResult struct {
 }
 
 type terminal struct {
-	mu           sync.Mutex // enforce serial command execution (Fix 13)
-	flowID       int64
-	taskID       *int64
-	subtaskID    *int64
-	containerID  int64
-	containerLID string
-	dockerClient docker.DockerClient
-	tlp          TermLogProvider
+	mu            sync.Mutex // enforce serial command execution (Fix 13)
+	flowID        int64
+	taskID        *int64
+	subtaskID     *int64
+	containerID   int64
+	containerLID  string
+	dockerClient  docker.DockerClient
+	tlp           TermLogProvider
+	evidenceStore *providers.EvidenceStore // Feature 3.5: transparent evidence capture
 }
 
 func NewTerminalTool(flowID int64, taskID, subtaskID *int64,
@@ -71,14 +73,43 @@ func NewTerminalTool(flowID int64, taskID, subtaskID *int64,
 	dockerClient docker.DockerClient, tlp TermLogProvider,
 ) Tool {
 	return &terminal{
-		flowID:       flowID,
-		taskID:       taskID,
-		subtaskID:    subtaskID,
-		containerID:  containerID,
-		containerLID: containerLID,
-		dockerClient: dockerClient,
-		tlp:          tlp,
+		flowID:        flowID,
+		taskID:        taskID,
+		subtaskID:     subtaskID,
+		containerID:   containerID,
+		containerLID:  containerLID,
+		dockerClient:  dockerClient,
+		tlp:           tlp,
+		evidenceStore: providers.NewEvidenceStore(),
 	}
+}
+
+// NewTerminalToolWithEvidence creates a terminal tool with an external EvidenceStore,
+// allowing evidence to be shared across tools or retrieved for reporting.
+func NewTerminalToolWithEvidence(flowID int64, taskID, subtaskID *int64,
+	containerID int64, containerLID string,
+	dockerClient docker.DockerClient, tlp TermLogProvider,
+	es *providers.EvidenceStore,
+) Tool {
+	if es == nil {
+		es = providers.NewEvidenceStore()
+	}
+	return &terminal{
+		flowID:        flowID,
+		taskID:        taskID,
+		subtaskID:     subtaskID,
+		containerID:   containerID,
+		containerLID:  containerLID,
+		dockerClient:  dockerClient,
+		tlp:           tlp,
+		evidenceStore: es,
+	}
+}
+
+// GetEvidenceStore returns the evidence store for this terminal tool,
+// allowing callers to retrieve captured evidence for reporting.
+func (t *terminal) GetEvidenceStore() *providers.EvidenceStore {
+	return t.evidenceStore
 }
 
 func (t *terminal) wrapCommandResult(ctx context.Context, args json.RawMessage, name, result string, err error) (string, error) {
@@ -230,6 +261,8 @@ func (t *terminal) ExecCommand(
 			if result.err != nil {
 				return "", fmt.Errorf("command failed: %w: %s", result.err, result.output)
 			}
+			// Feature 3.5: capture evidence transparently for detached commands
+			t.captureEvidence(command, result.output)
 			if result.output == "" {
 				return "Command completed in background with exit code 0", nil
 			}
@@ -239,7 +272,37 @@ func (t *terminal) ExecCommand(
 		}
 	}
 
-	return t.getExecResult(ctx, createResp.ID, timeout)
+	output, err := t.getExecResult(ctx, createResp.ID, timeout)
+	if err == nil {
+		// Feature 3.5: capture evidence transparently — don't modify the returned output
+		t.captureEvidence(command, output)
+	}
+	return output, err
+}
+
+// captureEvidence attempts to parse HTTP evidence from a command's output
+// and stores it in the evidence store. This is completely transparent —
+// it never modifies the output or causes errors visible to the agent.
+func (t *terminal) captureEvidence(command, output string) {
+	if t.evidenceStore == nil || output == "" {
+		return
+	}
+
+	// Attempt to detect and parse HTTP evidence from the command/output
+	evidence := providers.DetectAndParseHTTP(command, output)
+	if evidence == nil {
+		return
+	}
+
+	// Store the evidence — the finding ID will be "_unassigned" initially
+	// and can be associated with a finding later during reporting
+	t.evidenceStore.Add(*evidence)
+
+	logrus.WithFields(logrus.Fields{
+		"flow_id": t.flowID,
+		"command": command[:min(len(command), 100)],
+		"type":    evidence.Type,
+	}).Debug("evidence captured from terminal output")
 }
 
 func (t *terminal) getExecResult(ctx context.Context, id string, timeout time.Duration) (string, error) {

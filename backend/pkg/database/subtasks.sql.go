@@ -446,6 +446,59 @@ func (q *Queries) GetUserFlowTaskSubtasks(ctx context.Context, arg GetUserFlowTa
 	return items, nil
 }
 
+const getRecentCrossFlowFindings = `-- name: GetRecentCrossFlowFindings :many
+SELECT s.id, s.title, s.result, s.task_id, t.input as task_input, f.id as flow_id
+FROM subtasks s
+INNER JOIN tasks t ON s.task_id = t.id
+INNER JOIN flows f ON t.flow_id = f.id
+WHERE f.id != $1
+AND f.deleted_at IS NULL
+AND s.status = 'finished'
+AND s.result LIKE '%FINDING%'
+AND s.updated_at > NOW() - INTERVAL '24 hours'
+ORDER BY s.updated_at DESC
+LIMIT 10
+`
+
+type GetRecentCrossFlowFindingsRow struct {
+	ID        int64  `json:"id"`
+	Title     string `json:"title"`
+	Result    string `json:"result"`
+	TaskID    int64  `json:"task_id"`
+	TaskInput string `json:"task_input"`
+	FlowID    int64  `json:"flow_id"`
+}
+
+func (q *Queries) GetRecentCrossFlowFindings(ctx context.Context, currentFlowID int64) ([]GetRecentCrossFlowFindingsRow, error) {
+	rows, err := q.db.QueryContext(ctx, getRecentCrossFlowFindings, currentFlowID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetRecentCrossFlowFindingsRow
+	for rows.Next() {
+		var i GetRecentCrossFlowFindingsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.Result,
+			&i.TaskID,
+			&i.TaskInput,
+			&i.FlowID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const updateSubtaskContext = `-- name: UpdateSubtaskContext :one
 UPDATE subtasks
 SET context = $1

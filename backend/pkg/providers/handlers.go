@@ -577,6 +577,16 @@ func (fp *flowProvider) GetPentesterHandler(ctx context.Context, taskID, subtask
 			}
 		}
 
+		// Query cross-flow findings to share intelligence between concurrent assessments.
+		var crossFlowInsights string
+		crossFlowRows, err := fp.db.GetRecentCrossFlowFindings(ctx, fp.flowID)
+		if err != nil {
+			logrus.WithContext(ctx).WithError(err).Warn("failed to query cross-flow findings, continuing without them")
+		} else if len(crossFlowRows) > 0 {
+			insights := ExtractCrossFlowInsights(crossFlowRows)
+			crossFlowInsights = FormatInsightsForPrompt(insights)
+		}
+
 		pentesterContext := map[string]map[string]any{
 			"user": {
 				"Question": action.Question,
@@ -600,6 +610,7 @@ func (fp *flowProvider) GetPentesterHandler(ctx context.Context, taskID, subtask
 				"ContainerPorts":          fp.getContainerPortsDescription(),
 				"ExecutionContext":        executionContext,
 				"SubtaskContext":          subtaskContext,
+				"CrossFlowInsights":      crossFlowInsights,
 				"Lang":                    fp.language,
 				"CurrentTime":             getCurrentTime(),
 				"ToolPlaceholder":         ToolPlaceholder,
@@ -871,14 +882,26 @@ func (fp *flowProvider) GetSummarizeResultHandler(taskID, subtaskID *int64) tool
 			return "", wrapErrorEndAgentSpan(ctx, summarizerAgent, "failed to get summarizer template", err)
 		}
 
+		// Context-aware content preservation: extract findings/critical content
+		// before applying size-based truncation. Findings must NEVER be lost.
+		findingsBlock := ExtractFindings(result)
+
 		// Preserve beginning, middle samples, and end to avoid silently dropping important content
 		if len(result) > 2*msgSummarizerLimit {
 			chunkSize := msgSummarizerLimit / 2
 			totalBudget := 2 * msgSummarizerLimit
 
+			// Reserve space for findings block if present
+			findingsOverhead := len(findingsBlock)
+			if findingsOverhead > 0 {
+				// Reduce available budget for head/middle/tail to make room for findings
+				totalBudget = max(totalBudget-findingsOverhead, msgSummarizerLimit)
+				chunkSize = totalBudget / 4
+			}
+
 			// Always keep the first and last chunk
-			head := result[:chunkSize]
-			tail := result[len(result)-chunkSize:]
+			head := result[:min(chunkSize, len(result))]
+			tail := result[max(len(result)-chunkSize, 0):]
 
 			// Sample from the middle to fill remaining budget
 			middleBudget := totalBudget - 2*chunkSize
@@ -907,13 +930,18 @@ func (fp *flowProvider) GetSummarizeResultHandler(taskID, subtaskID *int64) tool
 				}
 			}
 
-			result = database.SanitizeUTF8(
-				head +
-					"\n\n{SAMPLED_MIDDLE}...\n\n" +
-					middle +
-					"\n\n{...END_SECTION}...\n\n" +
-					tail,
-			)
+			truncated := head +
+				"\n\n{SAMPLED_MIDDLE}...\n\n" +
+				middle +
+				"\n\n{...END_SECTION}...\n\n" +
+				tail
+
+			// Prepend preserved findings so the LLM summarizer always sees them
+			if findingsBlock != "" {
+				truncated = "{PRESERVED_FINDINGS}\n" + findingsBlock + "\n{END_PRESERVED_FINDINGS}\n\n" + truncated
+			}
+
+			result = database.SanitizeUTF8(truncated)
 		}
 
 		opt := pconfig.OptionsTypeSimple

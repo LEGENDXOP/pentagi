@@ -212,6 +212,40 @@ Example per-finding remediation format:
 - For vulnerability types without a direct code fix (e.g., `vulnerable_component`, `insufficient_logging`), provide process/configuration guidance instead of code examples
 - Remediation data is available via `GetRemediation(vulnType)` from the remediation database — use it to populate findings
 
+### Evidence Snapshots Per Finding
+
+For each vulnerability finding, include a structured **Evidence** section that shows the exact HTTP request/response pair used to confirm the vulnerability. This evidence is captured automatically by the system when the pentester uses `curl -v` or HTTPie commands.
+
+**Evidence format per finding:**
+```
+[EVIDENCE for <finding_id>]
+── Request ──
+<METHOD> <URL> HTTP/1.1
+<Header>: <Value>
+...
+
+<request body if any>
+
+── Response ──
+HTTP <status_code>
+<Header>: <Value>
+...
+
+<response body (truncated to 4KB)>
+
+── Reproduction Steps ──
+1. <step 1>
+2. <step 2>
+...
+```
+
+**Evidence inclusion rules:**
+- Include evidence for EVERY finding that has captured HTTP request/response data
+- If a finding has multiple evidence snapshots, include the most representative one
+- Truncated response bodies should show the `[TRUNCATED]` marker
+- For findings without HTTP evidence (e.g., configuration issues), reference the terminal command and output instead
+- Evidence snapshots are available in the `<execution_logs>` section — extract and format them
+
 ### Executive Compliance Posture
 
 At the end of the compliance section, provide a 2-3 sentence executive summary of the target's compliance posture. Include:

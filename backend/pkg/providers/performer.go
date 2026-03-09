@@ -65,6 +65,7 @@ func (fp *flowProvider) performAgentChain(
 		metricsStartTime     = time.Now()
 		toolHistory          = NewToolHistory(defaultToolHistorySize)
 		execState            = NewExecutionState()
+		ctxManager           = NewContextManager(defaultMaxContextTokens)
 	)
 
 	// Async state writer — batches DB writes so the agent loop isn't blocked.
@@ -143,6 +144,21 @@ func (fp *flowProvider) performAgentChain(
 					updated := injectMetricsIntoSystemPrompt(text.Text, metrics.Snapshot(metricsStartTime))
 					chain[0].Parts[0] = llms.TextContent{Text: updated}
 				}
+			}
+		}
+
+		// Context-aware pruning: before each LLM call, check if context
+		// manager tracks enough items to warrant pruning old tool results.
+		// This applies content-aware intelligence on top of the existing
+		// chain summarizer — findings are always preserved, noise is dropped.
+		if ctxManager.GetItemCount() > recentToolWindowSize {
+			ctxManager.ReclassifyByAge()
+			stats := ctxManager.Stats()
+			if stats.OverBudget {
+				prunedItems := ctxManager.Prune()
+				logger.WithField("context_stats", stats.FormatStats()).
+					WithField("pruned_items", len(prunedItems)).
+					Debug("context manager pruned items before LLM call")
 			}
 		}
 
@@ -260,6 +276,17 @@ func (fp *flowProvider) performAgentChain(
 			if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
 				logger.WithError(err).Error("failed to update msg chain")
 				return err
+			}
+
+			// Track tool result in context manager for intelligent pruning.
+			// The context manager classifies the result by content keywords
+			// and tracks it for priority-based pruning decisions.
+			ctxManager.Add(response, funcName)
+
+			// If the tool call arguments reference content from previous results,
+			// mark those results as referenced (bumps their priority).
+			if toolCall.FunctionCall != nil {
+				ctxManager.MarkReferenced(toolCall.FunctionCall.Arguments)
 			}
 
 			if executor.IsBarrierFunction(funcName) {
