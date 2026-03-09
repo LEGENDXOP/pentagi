@@ -127,8 +127,9 @@ type flowProvider struct {
 	db database.Querier
 	mx *sync.RWMutex
 
-	embedder       embeddings.Embedder
-	graphitiClient *graphiti.Client
+	embedder          embeddings.Embedder
+	graphitiClient    *graphiti.Client
+	interactshEnabled bool
 
 	flowID   int64
 	publicIP string
