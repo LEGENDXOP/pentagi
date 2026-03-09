@@ -15,9 +15,9 @@ import (
 
 	"pentagi/pkg/database"
 	"pentagi/pkg/docker"
+	"pentagi/pkg/evidence"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/observability/langfuse"
-	"pentagi/pkg/providers"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/sirupsen/logrus"
@@ -65,7 +65,7 @@ type terminal struct {
 	containerLID  string
 	dockerClient  docker.DockerClient
 	tlp           TermLogProvider
-	evidenceStore *providers.EvidenceStore // Feature 3.5: transparent evidence capture
+	evidenceStore *evidence.EvidenceStore // Feature 3.5: transparent evidence capture
 }
 
 func NewTerminalTool(flowID int64, taskID, subtaskID *int64,
@@ -80,7 +80,7 @@ func NewTerminalTool(flowID int64, taskID, subtaskID *int64,
 		containerLID:  containerLID,
 		dockerClient:  dockerClient,
 		tlp:           tlp,
-		evidenceStore: providers.NewEvidenceStore(),
+		evidenceStore: evidence.NewEvidenceStore(),
 	}
 }
 
@@ -89,10 +89,10 @@ func NewTerminalTool(flowID int64, taskID, subtaskID *int64,
 func NewTerminalToolWithEvidence(flowID int64, taskID, subtaskID *int64,
 	containerID int64, containerLID string,
 	dockerClient docker.DockerClient, tlp TermLogProvider,
-	es *providers.EvidenceStore,
+	es *evidence.EvidenceStore,
 ) Tool {
 	if es == nil {
-		es = providers.NewEvidenceStore()
+		es = evidence.NewEvidenceStore()
 	}
 	return &terminal{
 		flowID:        flowID,
@@ -108,7 +108,7 @@ func NewTerminalToolWithEvidence(flowID int64, taskID, subtaskID *int64,
 
 // GetEvidenceStore returns the evidence store for this terminal tool,
 // allowing callers to retrieve captured evidence for reporting.
-func (t *terminal) GetEvidenceStore() *providers.EvidenceStore {
+func (t *terminal) GetEvidenceStore() *evidence.EvidenceStore {
 	return t.evidenceStore
 }
 
@@ -289,19 +289,19 @@ func (t *terminal) captureEvidence(command, output string) {
 	}
 
 	// Attempt to detect and parse HTTP evidence from the command/output
-	evidence := providers.DetectAndParseHTTP(command, output)
-	if evidence == nil {
+	ev := evidence.DetectAndParseHTTP(command, output)
+	if ev == nil {
 		return
 	}
 
 	// Store the evidence — the finding ID will be "_unassigned" initially
 	// and can be associated with a finding later during reporting
-	t.evidenceStore.Add(*evidence)
+	t.evidenceStore.Add(*ev)
 
 	logrus.WithFields(logrus.Fields{
 		"flow_id": t.flowID,
 		"command": command[:min(len(command), 100)],
-		"type":    evidence.Type,
+		"type":    ev.Type,
 	}).Debug("evidence captured from terminal output")
 }
 

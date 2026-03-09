@@ -140,14 +140,14 @@ func NewAttackBudgetManager(cfg AttackBudgetConfig) *AttackBudgetManager {
 	}
 }
 
-// budgetKey returns the map key for a phase+vector combination.
-func budgetKey(phase AttackPhase, vector string) string {
+// vectorBudgetKey returns the map key for a phase+vector combination.
+func vectorBudgetKey(phase AttackPhase, vector string) string {
 	return string(phase) + ":" + vector
 }
 
 // getOrCreateBudget returns the existing budget for a phase+vector, or creates a new one.
 func (m *AttackBudgetManager) getOrCreateBudget(phase AttackPhase, vector string) *VectorBudget {
-	key := budgetKey(phase, vector)
+	key := vectorBudgetKey(phase, vector)
 	if vb, ok := m.budgets[key]; ok {
 		return vb
 	}
@@ -203,7 +203,7 @@ func (m *AttackBudgetManager) CheckBudget(phase AttackPhase, vector string) Budg
 			phase, vector, elapsed, vb.TimeLimit, vb.Attempts, vb.Successes, vb.ConsecutiveFailures)
 		vb.Exhausted = true
 		vb.ExhaustReason = reason
-		m.history = append(m.history, budgetKey(phase, vector))
+		m.history = append(m.history, vectorBudgetKey(phase, vector))
 		return BudgetCheckResult{
 			OK:     false,
 			Reason: reason,
@@ -219,7 +219,7 @@ func (m *AttackBudgetManager) CheckBudget(phase AttackPhase, vector string) Budg
 			phase, vector, vb.ConsecutiveFailures, vb.FailureLimit, elapsed, vb.Attempts)
 		vb.Exhausted = true
 		vb.ExhaustReason = reason
-		m.history = append(m.history, budgetKey(phase, vector))
+		m.history = append(m.history, vectorBudgetKey(phase, vector))
 		return BudgetCheckResult{
 			OK:     false,
 			Reason: reason,

@@ -78,7 +78,7 @@ func TestAttackBudgetManager_TimeBudgetExhausted(t *testing.T) {
 
 	// Force the budget to have started in the past
 	mgr.mu.Lock()
-	key := budgetKey(AttackPhaseRecon, "port_scan")
+	key := vectorBudgetKey(AttackPhaseRecon, "port_scan")
 	mgr.budgets[key] = &VectorBudget{
 		Phase:        AttackPhaseRecon,
 		Vector:       "port_scan",

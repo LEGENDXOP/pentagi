@@ -324,9 +324,4 @@ func executeCustomFlow(ctx context.Context, action *AuthLoginAction) (*AuthState
 }
 
 // truncate a string to maxLen characters
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
-}
+// truncate is defined in graphiti_search.go
