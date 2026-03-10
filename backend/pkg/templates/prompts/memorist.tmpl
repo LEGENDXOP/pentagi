@@ -202,6 +202,14 @@ Vector database provides the "library" of reusable solutions.
 {{.ExecutionContext}}
 </execution_context>
 
+## FALLBACK BEHAVIOR
+
+<fallback_rules>
+- If both Graphiti and vector DB return no results, explicitly state: "No historical context found for this query" rather than fabricating context.
+- If Graphiti search fails or times out, fall back to vector DB search and note the Graphiti failure.
+- If vector DB also returns no results, report honestly — absence of data is useful information for the requesting agent.
+</fallback_rules>
+
 ## COMPLETION REQUIREMENTS
 
 1. Split user questions into optimized vector database queries
