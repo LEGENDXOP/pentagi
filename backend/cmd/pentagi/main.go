@@ -22,7 +22,6 @@ import (
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/providers"
 	router "pentagi/pkg/server"
-	"pentagi/pkg/server/services"
 	"pentagi/pkg/version"
 
 	_ "github.com/lib/pq"
@@ -114,40 +113,7 @@ func main() {
 	if cfg.TelegramNotify && cfg.TelegramBotToken != "" && cfg.TelegramChatID != "" {
 		tg := notifications.NewTelegramNotifier(cfg.TelegramBotToken, cfg.TelegramChatID)
 		notifier = notifications.NewNotificationManager(tg, true, cfg.TelegramQuietTZOffset)
-
-		// Bridge SSE events (findings, phase changes) to Telegram notifications
-		lastPhases := make(map[int64]string)
-		services.RegisterFlowEventHook(func(flowID int64, event services.FlowEvent) {
-			switch event.EventType {
-			case services.SSEEventFinding:
-				if finding, ok := event.Data.(services.FindingEvent); ok {
-					notifier.Notify(notifications.NotificationEvent{
-						Type:            notifications.EventFindingDiscovered,
-						FlowID:          flowID,
-						FindingID:       finding.ID,
-						Title:           finding.Title,
-						FindingSeverity: notifications.MapSeverity(finding.Severity),
-						FindingTarget:   finding.Target,
-						FindingVulnType: finding.VulnType,
-					})
-				}
-			case services.SSEEventPhaseChange:
-				if phase, ok := event.Data.(services.PhaseChangeEvent); ok {
-					oldPhase := lastPhases[flowID]
-					if oldPhase != phase.Phase && phase.Phase != "" && oldPhase != "" {
-						notifier.Notify(notifications.NotificationEvent{
-							Type:     notifications.EventPhaseChange,
-							FlowID:   flowID,
-							OldPhase: oldPhase,
-							NewPhase: phase.Phase,
-						})
-					}
-					lastPhases[flowID] = phase.Phase
-				}
-			}
-		})
-
-		logrus.Info("Telegram notifications enabled")
+		logrus.Info("Telegram notifications enabled (via FlowPublisher hooks)")
 	} else {
 		notifier = notifications.NewNotificationManager(nil, false, 0)
 		logrus.Debug("Telegram notifications disabled")

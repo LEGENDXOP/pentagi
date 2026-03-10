@@ -2,6 +2,9 @@ package notifications
 
 import (
 	"context"
+	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"pentagi/pkg/database"
@@ -18,6 +21,15 @@ type NotifyingPublisher struct {
 	inner     subscriptions.FlowPublisher
 	notifier  *NotificationManager
 	flowStart time.Time
+
+	// Phase tracking for detecting phase changes
+	lastPhase   string
+	lastPhaseMu sync.Mutex
+
+	// Finding dedup: track finding IDs already emitted from this publisher
+	emittedFindings sync.Map // findingKey -> bool
+	findingCounter  int
+	findingMu       sync.Mutex
 }
 
 // WrapPublisher creates a NotifyingPublisher if the notifier is active.
@@ -117,6 +129,9 @@ func (p *NotifyingPublisher) TaskUpdated(ctx context.Context, task database.Task
 			Error:  task.Result,
 		})
 	}
+
+	// Scan subtask results for findings
+	p.scanSubtasksForFindings(subtasks)
 }
 
 // ==================== All other events (pass-through) ====================
@@ -151,6 +166,9 @@ func (p *NotifyingPublisher) MessageLogUpdated(ctx context.Context, messageLog d
 
 func (p *NotifyingPublisher) AgentLogAdded(ctx context.Context, agentLog database.Agentlog) {
 	p.inner.AgentLogAdded(ctx, agentLog)
+
+	// Scan agent log result for findings
+	p.scanTextForFindings(agentLog.Result)
 }
 
 func (p *NotifyingPublisher) SearchLogAdded(ctx context.Context, searchLog database.Searchlog) {
@@ -195,4 +213,155 @@ func (p *NotifyingPublisher) APITokenDeleted(ctx context.Context, apiToken datab
 
 func (p *NotifyingPublisher) SettingsUserUpdated(ctx context.Context, userPreferences database.UserPreference) {
 	p.inner.SettingsUserUpdated(ctx, userPreferences)
+}
+
+// ==================== Finding extraction ====================
+
+// scanSubtasksForFindings checks subtask results for vulnerability findings.
+func (p *NotifyingPublisher) scanSubtasksForFindings(subtasks []database.Subtask) {
+	for _, st := range subtasks {
+		// Only scan completed subtasks with results
+		if st.Result == "" {
+			continue
+		}
+		p.scanTextForFindings(st.Result)
+
+		// Also check subtask context for phase info
+		p.checkPhaseFromContext(st.Context)
+	}
+}
+
+// scanTextForFindings extracts finding events from text and notifies.
+func (p *NotifyingPublisher) scanTextForFindings(text string) {
+	if text == "" {
+		return
+	}
+
+	// Quick check: skip if no finding-related keywords
+	if !strings.Contains(text, "FINDING") && !strings.Contains(text, "finding") &&
+		!strings.Contains(text, "vulnerability") && !strings.Contains(text, "Vulnerability") {
+		return
+	}
+
+	flowID := p.inner.GetFlowID()
+	lines := strings.Split(text, "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		isFinding := false
+		if strings.Contains(line, "[FINDING") || strings.Contains(line, "[finding") {
+			isFinding = true
+		} else if (strings.Contains(line, "CRITICAL") || strings.Contains(line, "HIGH") ||
+			strings.Contains(line, "MEDIUM") || strings.Contains(line, "LOW")) &&
+			(strings.Contains(strings.ToLower(line), "vuln") ||
+				strings.Contains(strings.ToLower(line), "finding") ||
+				strings.Contains(strings.ToLower(line), "exploit")) {
+			isFinding = true
+		}
+
+		if !isFinding {
+			continue
+		}
+
+		// Dedup by line content hash
+		dedupKey := fmt.Sprintf("%d:%s", flowID, line)
+		if _, already := p.emittedFindings.LoadOrStore(dedupKey, true); already {
+			continue
+		}
+
+		p.findingMu.Lock()
+		p.findingCounter++
+		findingID := fmt.Sprintf("finding-%d", p.findingCounter)
+		p.findingMu.Unlock()
+
+		severity := "MEDIUM"
+		for _, sev := range []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"} {
+			if strings.Contains(strings.ToUpper(line), sev) {
+				severity = sev
+				break
+			}
+		}
+
+		vulnType := ""
+		if idx := strings.Index(line, "[VULN_TYPE:"); idx >= 0 {
+			end := strings.Index(line[idx:], "]")
+			if end > 0 {
+				vulnType = strings.TrimSpace(line[idx+11 : idx+end])
+			}
+		}
+
+		title := line
+		if len(title) > 120 {
+			title = title[:117] + "..."
+		}
+
+		p.notifier.Notify(NotificationEvent{
+			Type:            EventFindingDiscovered,
+			FlowID:          flowID,
+			FindingID:       findingID,
+			Title:           title,
+			FindingSeverity: MapSeverity(severity),
+			FindingVulnType: vulnType,
+		})
+	}
+}
+
+// checkPhaseFromContext checks subtask context JSON for phase information
+// and emits a phase change notification when the phase changes.
+func (p *NotifyingPublisher) checkPhaseFromContext(contextJSON string) {
+	if contextJSON == "" {
+		return
+	}
+
+	// Quick check for "phase" key
+	if !strings.Contains(contextJSON, `"phase"`) {
+		return
+	}
+
+	// Simple JSON extraction — avoid importing encoding/json just for this
+	// Look for "phase":"value" pattern
+	idx := strings.Index(contextJSON, `"phase"`)
+	if idx < 0 {
+		return
+	}
+	rest := contextJSON[idx+7:]
+	// Skip whitespace and colon
+	rest = strings.TrimLeft(rest, " \t\n\r:")
+	if len(rest) == 0 || rest[0] != '"' {
+		return
+	}
+	rest = rest[1:]
+	end := strings.Index(rest, `"`)
+	if end <= 0 {
+		return
+	}
+	phase := rest[:end]
+	if phase == "" {
+		return
+	}
+
+	p.lastPhaseMu.Lock()
+	oldPhase := p.lastPhase
+	if phase == oldPhase {
+		p.lastPhaseMu.Unlock()
+		return
+	}
+	p.lastPhase = phase
+	p.lastPhaseMu.Unlock()
+
+	if oldPhase == "" {
+		// First phase seen — don't notify transition, just track
+		return
+	}
+
+	p.notifier.Notify(NotificationEvent{
+		Type:     EventPhaseChange,
+		FlowID:   p.inner.GetFlowID(),
+		OldPhase: oldPhase,
+		NewPhase: phase,
+	})
 }
