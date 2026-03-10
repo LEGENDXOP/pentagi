@@ -156,6 +156,18 @@ Each subtask MUST:
    - Consider both automated tools and manual verification
    - Incorporate proper documentation throughout
 
+   **Pentest Phase Mapping — structure subtasks around methodology:**
+   ```
+   Phase 1: Bootstrap + Recon (1-2 subtasks) — nmap, nuclei_scan, tech fingerprint, JS analysis
+   Phase 2: Auth Context + Triage (1-2 subtasks) — auth_login sessions, scripted endpoint testing
+   Phase 3: Deep Dive on Top Findings (2-4 subtasks, one per attack category)
+   Phase 4: Attack Chains (1 subtask) — combine findings for escalated impact
+   Phase 5: Report Generation (1 subtask) — compile FINDINGS.md into final report
+   ```
+   - First subtask should ALWAYS combine recon AND triage — don't split "run nmap" and "enumerate web services" into separate subtasks
+   - Each subtask should represent 15-30 minutes of work. If <5 min → merge with another. If >45 min → split it.
+   - For multi-target pentests, group by target not by phase (one subtask per target is better than one phase across all targets)
+
 ## CRITICAL CONTEXT
 
 - After each subtask execution, a separate refinement process will optimize remaining subtasks
