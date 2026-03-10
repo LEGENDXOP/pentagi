@@ -815,3 +815,96 @@ func TestEnsureChainConsistency(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateAndRepairChain(t *testing.T) {
+	tests := []struct {
+		name          string
+		chain         []llms.MessageContent
+		expectedCount int // number of synthetic tool_results inserted
+	}{
+		{
+			name:          "Empty chain",
+			chain:         []llms.MessageContent{},
+			expectedCount: 0,
+		},
+		{
+			name:          "Already consistent chain",
+			chain:         cloneChain(chainWithToolResponse),
+			expectedCount: 0,
+		},
+		{
+			name:          "Chain with single orphaned tool_use",
+			chain:         cloneChain(chainWithToolCall),
+			expectedCount: 1,
+		},
+		{
+			name:          "Chain with two orphaned tool_uses",
+			chain:         cloneChain(chainWithMultipleToolCalls),
+			expectedCount: 2,
+		},
+		{
+			name:          "Chain with one orphaned tool_use (partial batch)",
+			chain:         cloneChain(incompleteChainWithMultipleToolCalls),
+			expectedCount: 1,
+		},
+		{
+			name:          "Basic chain without tool calls",
+			chain:         cloneChain(basicChain),
+			expectedCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, count := validateAndRepairChain(tt.chain)
+			assert.Equal(t, tt.expectedCount, count)
+
+			if count > 0 {
+				// Verify all tool_use blocks now have matching tool_result
+				orphans := countOrphanedToolUses(result)
+				assert.Equal(t, 0, orphans, "There should be no orphaned tool_use blocks after repair")
+			}
+		})
+	}
+}
+
+func TestCountOrphanedToolUses(t *testing.T) {
+	tests := []struct {
+		name     string
+		chain    []llms.MessageContent
+		expected int
+	}{
+		{
+			name:     "No orphans in complete chain",
+			chain:    cloneChain(chainWithToolResponse),
+			expected: 0,
+		},
+		{
+			name:     "One orphan",
+			chain:    cloneChain(chainWithToolCall),
+			expected: 1,
+		},
+		{
+			name:     "Two orphans",
+			chain:    cloneChain(chainWithMultipleToolCalls),
+			expected: 2,
+		},
+		{
+			name:     "One orphan out of two",
+			chain:    cloneChain(incompleteChainWithMultipleToolCalls),
+			expected: 1,
+		},
+		{
+			name:     "Empty chain",
+			chain:    []llms.MessageContent{},
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			count := countOrphanedToolUses(tt.chain)
+			assert.Equal(t, tt.expected, count)
+		})
+	}
+}

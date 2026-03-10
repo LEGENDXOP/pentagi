@@ -351,6 +351,19 @@ func (fp *flowProvider) performAgentChain(
 			}
 		}
 
+		// Safety net: validate chain integrity before sending to the LLM.
+		// If orphaned tool_use blocks exist (from a previous interrupted execution),
+		// insert synthetic tool_result blocks to prevent Anthropic 400 errors.
+		if repairedChain, repairCount := validateAndRepairChain(chain); repairCount > 0 {
+			chain = repairedChain
+			logger.WithField("repaired_tool_results", repairCount).
+				Warn("repaired orphaned tool_use blocks in message chain before LLM call")
+			if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+				logger.WithError(err).Error("failed to update msg chain after repair")
+				return err
+			}
+		}
+
 		result, err := fp.callWithRetries(ctx, chain, optAgentType, executor)
 		if err != nil {
 			logger.WithError(err).Error("failed to call agent chain")
@@ -457,6 +470,46 @@ func (fp *flowProvider) performAgentChain(
 					"func_name": funcName,
 					"func_args": toolCall.FunctionCall.Arguments,
 				}).Error("failed to exec tool call")
+
+				// CRITICAL: Before returning, insert synthetic tool_result for the
+				// current failed tool call AND all remaining tool calls in the batch.
+				// Without this, the chain in DB would have orphaned tool_use blocks
+				// that cause Anthropic 400 errors on resume/retry.
+				errMsg := fmt.Sprintf("Error: tool execution failed: %s", err.Error())
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeTool,
+					Parts: []llms.ContentPart{
+						llms.ToolCallResponse{
+							ToolCallID: toolCall.ID,
+							Name:       funcName,
+							Content:    errMsg,
+						},
+					},
+				})
+				// Add synthetic results for remaining tool calls in this batch
+				for remainIdx := idx + 1; remainIdx < len(result.funcCalls); remainIdx++ {
+					remainTC := result.funcCalls[remainIdx]
+					if remainTC.FunctionCall == nil {
+						continue
+					}
+					chain = append(chain, llms.MessageContent{
+						Role: llms.ChatMessageTypeTool,
+						Parts: []llms.ContentPart{
+							llms.ToolCallResponse{
+								ToolCallID: remainTC.ID,
+								Name:       remainTC.FunctionCall.Name,
+								Content:    "Error: tool execution was interrupted. Result unavailable.",
+							},
+						},
+					})
+				}
+				// Best-effort save of the repaired chain to DB.
+				// Use a fresh context since the original may be cancelled.
+				saveCtx := context.WithoutCancel(ctx)
+				if updateErr := fp.updateMsgChain(saveCtx, chainID, chain, rollLastUpdateTime()); updateErr != nil {
+					logger.WithError(updateErr).Error("failed to save repaired chain after tool execution error")
+				}
+
 				return err
 			}
 

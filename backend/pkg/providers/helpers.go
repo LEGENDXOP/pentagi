@@ -507,6 +507,80 @@ func (fp *flowProvider) ensureChainConsistency(chain []llms.MessageContent) ([]l
 	return ast.Messages(), nil
 }
 
+// validateAndRepairChain scans the message chain for orphaned tool_use blocks
+// (tool_use without a matching tool_result) and inserts synthetic tool_result
+// messages to satisfy provider requirements (e.g. Anthropic requires every
+// tool_use to have a corresponding tool_result immediately after).
+//
+// This is a critical safety net that prevents 400 errors from the Anthropic API.
+// The corruption typically happens when:
+// 1. An AI message with multiple tool_use blocks is saved to DB
+// 2. Tool execution fails partway through the batch
+// 3. The function returns before all tool_results are added
+// 4. On resume/retry, the chain has orphaned tool_use blocks
+//
+// Uses NewChainAST with force=true which handles all edge cases including
+// orphaned tool_use, unmatched tool_result, and incomplete request-response pairs.
+// Returns the repaired chain and the number of synthetic tool_results inserted.
+func validateAndRepairChain(chain []llms.MessageContent) ([]llms.MessageContent, int) {
+	if len(chain) == 0 {
+		return chain, 0
+	}
+
+	// Count orphaned tool_use blocks before repair
+	orphanCount := countOrphanedToolUses(chain)
+	if orphanCount == 0 {
+		return chain, 0
+	}
+
+	// Use NewChainAST with force=true to repair the chain.
+	// This handles all consistency issues including:
+	// - tool_use without tool_result → adds FallbackResponseContent
+	// - tool_result without tool_use → adds fallback tool_use
+	// - incomplete request-response pairs
+	ast, err := cast.NewChainAST(chain, true)
+	if err != nil {
+		// If even forced AST creation fails, return original chain unchanged.
+		// This shouldn't happen in practice since force=true is very permissive.
+		return chain, 0
+	}
+
+	return ast.Messages(), orphanCount
+}
+
+// countOrphanedToolUses counts tool_use blocks that don't have matching tool_result blocks.
+// This is a lightweight check that avoids full AST parsing.
+func countOrphanedToolUses(chain []llms.MessageContent) int {
+	// Collect all tool_use IDs from AI messages
+	toolUseIDs := make(map[string]bool)
+	for _, msg := range chain {
+		if msg.Role == llms.ChatMessageTypeAI {
+			for _, part := range msg.Parts {
+				if tc, ok := part.(llms.ToolCall); ok && tc.FunctionCall != nil && tc.ID != "" {
+					toolUseIDs[tc.ID] = true
+				}
+			}
+		}
+	}
+
+	if len(toolUseIDs) == 0 {
+		return 0
+	}
+
+	// Remove IDs that have matching tool_result
+	for _, msg := range chain {
+		if msg.Role == llms.ChatMessageTypeTool {
+			for _, part := range msg.Parts {
+				if resp, ok := part.(llms.ToolCallResponse); ok {
+					delete(toolUseIDs, resp.ToolCallID)
+				}
+			}
+		}
+	}
+
+	return len(toolUseIDs)
+}
+
 func (fp *flowProvider) getTaskPrimaryAgentChainSummary(
 	ctx context.Context,
 	taskID int64,

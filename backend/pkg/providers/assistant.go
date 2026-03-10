@@ -142,6 +142,21 @@ func (ap *assistantProvider) PerformAgentChain(ctx context.Context) error {
 		return fmt.Errorf("failed to unmarshal primary agent msg chain %d: %w", ap.msgChainID, err)
 	}
 
+	// Validate chain integrity on load (same safety net as PerformAgentChain)
+	if repairedChain, repairCount := validateAndRepairChain(chain); repairCount > 0 {
+		chain = repairedChain
+		logger.WithField("repaired_tool_results", repairCount).
+			Warn("repaired orphaned tool_use blocks on assistant chain load")
+		if chainBlob, err := json.Marshal(chain); err == nil {
+			if _, err := ap.fp.DB().UpdateMsgChain(ctx, database.UpdateMsgChainParams{
+				Chain: chainBlob,
+				ID:    ap.msgChainID,
+			}); err != nil {
+				logger.WithError(err).Error("failed to persist repaired assistant chain to DB")
+			}
+		}
+	}
+
 	adviser, err := ap.fp.GetAskAdviceHandler(ctx, nil, nil)
 	if err != nil {
 		logger.WithError(err).Error("failed to get ask advice handler")

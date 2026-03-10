@@ -693,6 +693,24 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 		return PerformResultError, fmt.Errorf("failed to unmarshal primary agent msg chain %d: %w", msgChainID, err)
 	}
 
+	// Validate chain integrity on load. Even though PrepareAgentChain uses
+	// restoreChain (which parses via NewChainAST with force=true), there could
+	// be corruption from race conditions or interrupted DB writes.
+	if repairedChain, repairCount := validateAndRepairChain(chain); repairCount > 0 {
+		chain = repairedChain
+		logger.WithField("repaired_tool_results", repairCount).
+			Warn("repaired orphaned tool_use blocks on chain load in PerformAgentChain")
+		// Persist the repaired chain back to DB
+		if chainBlob, err := json.Marshal(chain); err == nil {
+			if _, err := fp.db.UpdateMsgChain(ctx, database.UpdateMsgChainParams{
+				Chain: chainBlob,
+				ID:    msgChainID,
+			}); err != nil {
+				logger.WithError(err).Error("failed to persist repaired chain to DB")
+			}
+		}
+	}
+
 	adviser, err := fp.GetAskAdviceHandler(ctx, &taskID, &subtaskID)
 	if err != nil {
 		logger.WithError(err).Error("failed to get ask advice handler")
