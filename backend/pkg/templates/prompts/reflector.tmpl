@@ -135,29 +135,38 @@ Before redirecting the agent, evaluate whether it is making meaningful progress:
 
 {{- if .LoopDetection.IsLoopLikely}}
 
-⚠ **LOOP DETECTED** — The agent appears to be stuck in a behavioral loop.
+⚠ **POSSIBLE LOOP DETECTED** — The agent may be stuck in a behavioral loop. Review carefully before intervening.
 
-**Loop Detection Criteria Met:**
+**Loop Detection Signals:**
 {{- if gt .LoopDetection.MostFrequentCount 3}}
-- ❌ Same tool '{{.LoopDetection.MostFrequentTool}}' called {{.LoopDetection.MostFrequentCount}} times in last 10 (threshold: >3)
+- ⚠ Same tool '{{.LoopDetection.MostFrequentTool}}' called {{.LoopDetection.MostFrequentCount}} times in last 10 (threshold: >3)
 {{- end}}
-- Pattern Score: {{.LoopDetection.PatternScore}} (threshold: >0.70 = repetitive)
+- Pattern Score: {{.LoopDetection.PatternScore}} (threshold: >0.85 = truly repetitive)
 - Error Rate (last 5): {{.LoopDetection.ErrorRate}} (threshold: >50%)
+
+**IMPORTANT — False Positive Check:**
+Before concluding this is a loop, verify these conditions:
+- **Are the arguments identical?** Repeated use of the same tool with DIFFERENT arguments (different URLs, different ports, different payloads) is NOT a loop — it is legitimate methodical testing.
+- **Terminal/curl commands:** Running curl, wget, nmap, or other CLI tools against different endpoints or with different flags is normal penetration testing behavior. Different targets = different work.
+- **Enumeration patterns:** Testing multiple paths, ports, subdomains, or credentials in sequence is expected workflow, not a loop.
+
+**Only flag as a true loop if:** The same tool is called with the SAME (or near-identical) arguments producing the SAME results or errors repeatedly.
 
 **Your Decision Options (choose ONE):**
 
-1. **CONTINUE** — The agent IS making meaningful progress despite the pattern. Different inputs/contexts each time. Let it proceed.
-2. **CHANGE_APPROACH** — The agent is repeating similar actions without progress. Tell it to:
+1. **CONTINUE** — The agent IS making meaningful progress despite the pattern. Different inputs/contexts each time. Let it proceed. **This should be your default when arguments differ between calls.**
+2. **CHANGE_APPROACH** — The agent is repeating truly identical actions without progress. Tell it to:
    - Try a fundamentally different tool or strategy
    - Skip the current failing step and work around it
    - Break the problem down differently
-3. **STOP** — The agent has been looping too long with no progress. Tell it to:
+3. **STOP** — The agent has been looping too long with no progress on truly identical calls. Tell it to:
    - Report the subtask as BLOCKED with a summary of what was tried
    - Use the appropriate barrier tool to finalize with partial results
    - Do NOT keep trying the same approach
 
 **When choosing, consider:**
-- Are the repeated calls actually producing NEW information each time?
+- Are the repeated calls actually using DIFFERENT arguments or targets each time? If yes → CONTINUE.
+- Are the calls truly identical (same args, same results)? If yes → CHANGE_APPROACH or STOP.
 - Is the error rate climbing or stable?
 - Has more than 50% of the time budget been consumed with little progress?
 - Would a human engineer try a different approach at this point?
@@ -165,15 +174,23 @@ Before redirecting the agent, evaluate whether it is making meaningful progress:
 {{- end}}
 
 <loop_detection_criteria>
-1. Has the agent produced NEW information in its last few actions?
-2. Are the recent actions semantically different from each other, or is it repeating similar patterns?
-3. Has the agent been searching the same knowledge base or running the same commands repeatedly?
+**Proactive loop assessment (ADVISORY — use your judgment, these are guidelines not hard rules):**
+
+1. Has the agent produced NEW information or tested NEW targets in its last few actions?
+2. Are the recent calls using DIFFERENT arguments (different URLs, IPs, ports, payloads, paths)? If so, this is likely legitimate methodical work, NOT a loop.
+3. Are the calls truly IDENTICAL — same tool, same arguments, same results/errors? Only this constitutes a real loop.
 4. Is the agent making progress toward the subtask objective?
 
-If you detect signs of a loop (repetitive actions, no new information, same errors recurring):
+**Key distinction:** Similar tool usage ≠ repetitive loop. A pentester running curl against 10 different endpoints, or nmap against different port ranges, is doing their job. Only intervene when the agent is genuinely stuck repeating the exact same action expecting different results.
+
+If you detect a TRUE loop (identical actions, no new information, same errors recurring):
 - DO NOT simply redirect the agent to make more tool calls — this deepens the loop
 - Instead, tell the agent to STOP the current approach and try a fundamentally different strategy
 - If the agent has been looping for many iterations, suggest it report the subtask as BLOCKED with details of what was tried
+
+If the pattern looks like legitimate enumeration or testing:
+- Choose CONTINUE and let the agent proceed
+- A high pattern_score alone is NOT sufficient reason to intervene — check the actual arguments
 </loop_detection_criteria>
 
 ## AGENT'S INCORRECT RESPONSE
