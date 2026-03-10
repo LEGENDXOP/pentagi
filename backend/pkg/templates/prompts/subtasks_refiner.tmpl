@@ -76,6 +76,18 @@
   - When checking for overlap, compare the semantic intent, not just the title — a completed "port scan" covers a planned "network reconnaissance" if ports were already scanned
   </deduplication_guidance>
 
+  <subtask_scope_enforcement>
+  CRITICAL: Review each planned subtask for scope. REJECT and SPLIT any subtask that:
+  - Lists more than 3 attack categories or techniques (e.g., "Test XSS, SQLi, SSRF, IDOR, and path traversal" = 5 categories → MUST be split)
+  - Would require more than 15 tool calls to complete
+  - Combines recon + auth + triage into one subtask
+
+  When replanning a FAILED subtask:
+  - INCLUDE any partial findings mentioned in its result in the new subtask's description
+  - Example: "Continue from partial findings: F-001 (XSS on /api/users), F-002 (IDOR on /api/orders). Focus on: remaining untested categories."
+  - Split the failed subtask into smaller, focused subtasks if it was too broad
+  </subtask_scope_enforcement>
+
   <attack_chain_reasoning>
   CRITICAL: When reviewing completed subtask results, look for DISCOVERED VULNERABILITIES (tagged with [VULN_TYPE: ...]).
   Each finding unlocks follow-up attacks that should be prioritized in the refined plan.

@@ -168,6 +168,15 @@ Each subtask MUST:
    - Each subtask should represent 15-30 minutes of work. If <5 min → merge with another. If >45 min → split it.
    - For multi-target pentests, group by target not by phase (one subtask per target is better than one phase across all targets)
 
+   **CRITICAL SCOPE LIMITS for pentest subtasks:**
+   - Each subtask MUST target ≤3 attack categories or techniques. More than 3 = SPLIT IT.
+   - Each subtask MUST be completable in ≤15 tool calls. If it needs more, it's too broad.
+   - Minimum 6 subtasks for any penetration testing task.
+   - NEVER combine recon + auth + triage in one subtask — these are separate phases.
+   - Split by: 1 subtask per target for recon, 1 subtask per attack category for deep dive.
+   - BAD: "Test JS secrets, S3 buckets, origin IP, debug logs, payment gateways, and alt ports" (6 categories!)
+   - GOOD: "Test for JS secrets and exposed API endpoints" + "Test S3 bucket permissions and cloud misconfigs" (2 separate subtasks)
+
 ## CRITICAL CONTEXT
 
 - After each subtask execution, a separate refinement process will optimize remaining subtasks
@@ -179,6 +188,8 @@ Each subtask MUST:
 
 You MUST complete your analysis by using the "{{.SubtaskListToolName}}" tool with:
 - A complete, ordered list of subtasks meeting the above requirements
+- For penetration testing tasks: generate at LEAST 6 subtasks (each focused and completable in <15 tool calls)
+- VERIFY: no single subtask lists more than 3 attack categories. If it does, split it.
 - Brief explanation of how the plan follows the optimal task distribution structure
 - Confirmation that all aspects of the user's request will be addressed
 
