@@ -140,6 +140,44 @@ func (r *mutationResolver) FinishFlow(ctx context.Context, flowID int64) (model.
 	return model.ResultTypeSuccess, nil
 }
 
+// ResumeFlow is the resolver for the resumeFlow field.
+func (r *mutationResolver) ResumeFlow(ctx context.Context, flowID int64, input *string) (*model.Flow, error) {
+	uid, err := validatePermissionWithFlowID(ctx, "flows.edit", flowID, r.DB)
+	if err != nil {
+		return nil, err
+	}
+
+	r.Logger.WithFields(logrus.Fields{
+		"uid":  uid,
+		"flow": flowID,
+	}).Debug("resume flow")
+
+	userInput := ""
+	if input != nil {
+		userInput = *input
+	}
+
+	fw, err := r.Controller.ResumeFlow(ctx, flowID, userInput)
+	if err != nil {
+		return nil, err
+	}
+
+	flow, err := r.DB.GetFlow(ctx, fw.GetFlowID())
+	if err != nil {
+		return nil, err
+	}
+
+	var containers []database.Container
+	if _, _, err = validatePermission(ctx, "containers.view"); err == nil {
+		containers, err = r.DB.GetFlowContainers(ctx, fw.GetFlowID())
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return converter.ConvertFlow(flow, containers), nil
+}
+
 // DeleteFlow is the resolver for the deleteFlow field.
 func (r *mutationResolver) DeleteFlow(ctx context.Context, flowID int64) (model.ResultType, error) {
 	uid, err := validatePermissionWithFlowID(ctx, "flows.delete", flowID, r.DB)

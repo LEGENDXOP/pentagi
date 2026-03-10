@@ -15,6 +15,7 @@ import {
     useFlowDeletedSubscription,
     useFlowsQuery,
     useFlowUpdatedSubscription,
+    useResumeFlowMutation,
 } from '@/graphql/types';
 import { Log } from '@/lib/log';
 
@@ -25,6 +26,7 @@ interface FlowsContextValue {
     createFlowWithAssistant: (values: FlowFormValues) => Promise<null | string>;
     deleteFlow: (flow: Flow) => Promise<boolean>;
     finishFlow: (flow: Flow) => Promise<boolean>;
+    resumeFlow: (flow: Flow, input?: string) => Promise<boolean>;
     flows: Array<Flow>;
     flowsData: FlowsQuery | undefined;
     flowsError: Error | undefined;
@@ -70,6 +72,7 @@ export const FlowsProvider = ({ children }: FlowsProviderProps) => {
     const [createAssistantMutation] = useCreateAssistantMutation();
     const [deleteFlowMutation] = useDeleteFlowMutation();
     const [finishFlowMutation] = useFinishFlowMutation();
+    const [resumeFlowMutation] = useResumeFlowMutation();
 
     const createFlow = useCallback(
         async (values: FlowFormValues) => {
@@ -230,18 +233,58 @@ export const FlowsProvider = ({ children }: FlowsProviderProps) => {
         [finishFlowMutation],
     );
 
+    const resumeFlow = useCallback(
+        async (flow: Flow, input?: string) => {
+            const { id: flowId, title } = flow;
+
+            if (!flowId) {
+                return false;
+            }
+
+            const flowDescription = `${title || 'Unknown'} (ID: ${flowId})`;
+
+            const loadingToastId = toast.loading('Resuming flow...', {
+                description: flowDescription,
+            });
+
+            try {
+                await resumeFlowMutation({
+                    variables: { flowId, input },
+                });
+
+                toast.success('Flow resumed successfully', {
+                    description: flowDescription,
+                    id: loadingToastId,
+                });
+
+                return true;
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : 'An error occurred while resuming flow';
+                toast.error(errorMessage, {
+                    description: flowDescription,
+                    id: loadingToastId,
+                });
+                Log.error('Error resuming flow:', error);
+
+                return false;
+            }
+        },
+        [resumeFlowMutation],
+    );
+
     const value = useMemo(
         () => ({
             createFlow,
             createFlowWithAssistant,
             deleteFlow,
             finishFlow,
+            resumeFlow,
             flows,
             flowsData,
             flowsError,
             isLoading,
         }),
-        [createFlow, createFlowWithAssistant, deleteFlow, finishFlow, flows, flowsData, flowsError, isLoading],
+        [createFlow, createFlowWithAssistant, deleteFlow, finishFlow, resumeFlow, flows, flowsData, flowsError, isLoading],
     );
 
     return <FlowsContext.Provider value={value}>{children}</FlowsContext.Provider>;

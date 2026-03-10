@@ -895,6 +895,12 @@ mutation renameFlow($flowId: ID!, $title: String!) {
     renameFlow(flowId: $flowId, title: $title)
 }
 
+mutation resumeFlow($flowId: ID!, $input: String) {
+    resumeFlow(flowId: $flowId, input: $input) {
+        ...flowFragment
+    }
+}
+
 mutation createAssistant($flowId: ID!, $modelProvider: String!, $input: String!, $useAgents: Boolean!) {
     createAssistant(flowId: $flowId, modelProvider: $modelProvider, input: $input, useAgents: $useAgents) {
         flow {

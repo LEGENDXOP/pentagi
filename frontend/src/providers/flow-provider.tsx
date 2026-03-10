@@ -24,6 +24,7 @@ import {
     useMessageLogAddedSubscription,
     useMessageLogUpdatedSubscription,
     usePutUserInputMutation,
+    useResumeFlowMutation,
     useScreenshotAddedSubscription,
     useSearchLogAddedSubscription,
     useStopAssistantMutation,
@@ -47,6 +48,7 @@ interface FlowContextValue {
     initiateAssistantCreation: () => void;
     isAssistantsLoading: boolean;
     isLoading: boolean;
+    resumeFlow: (input?: string) => Promise<void>;
     selectAssistant: (assistantId: null | string) => void;
     selectedAssistantId: null | string;
     stopAssistant: (assistantId: string) => Promise<void>;
@@ -169,6 +171,7 @@ export const FlowProvider = ({ children }: FlowProviderProps) => {
     // Mutations
     const [putUserInput] = usePutUserInputMutation();
     const [stopFlowMutation] = useStopFlowMutation();
+    const [resumeFlowMutation] = useResumeFlowMutation();
     const [createAssistantMutation] = useCreateAssistantMutation();
     const [submitAssistantMessageMutation] = useCallAssistantMutation();
     const [stopAssistantMutation] = useStopAssistantMutation();
@@ -186,6 +189,31 @@ export const FlowProvider = ({ children }: FlowProviderProps) => {
             Log.error('Error loading flow:', flowError);
         }
     }, [flowError]);
+
+    const resumeFlow = useCallback(
+        async (input?: string) => {
+            if (!flowId) {
+                return;
+            }
+
+            try {
+                await resumeFlowMutation({
+                    variables: {
+                        flowId,
+                        input: input || undefined,
+                    },
+                });
+            } catch (error) {
+                const description =
+                    error instanceof Error ? error.message : 'An error occurred while resuming flow';
+                toast.error('Failed to resume flow', {
+                    description,
+                });
+                Log.error('Error resuming flow:', error);
+            }
+        },
+        [flowId, resumeFlowMutation],
+    );
 
     const submitAutomationMessage = useCallback(
         async (values: FlowFormValues) => {
@@ -379,6 +407,7 @@ export const FlowProvider = ({ children }: FlowProviderProps) => {
             initiateAssistantCreation,
             isAssistantsLoading,
             isLoading,
+            resumeFlow,
             selectAssistant,
             selectedAssistantId,
             stopAssistant,
@@ -398,6 +427,7 @@ export const FlowProvider = ({ children }: FlowProviderProps) => {
             initiateAssistantCreation,
             isAssistantsLoading,
             isLoading,
+            resumeFlow,
             selectAssistant,
             selectedAssistantId,
             stopAssistant,

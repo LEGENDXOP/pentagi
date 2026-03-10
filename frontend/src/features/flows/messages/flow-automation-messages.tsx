@@ -33,7 +33,7 @@ const searchFormSchema = z.object({
 });
 
 const FlowAutomationMessages = ({ className }: FlowAutomationMessagesProps) => {
-    const { flowData, flowId, flowStatus, stopAutomation, submitAutomationMessage } = useFlow();
+    const { flowData, flowId, flowStatus, resumeFlow, stopAutomation, submitAutomationMessage } = useFlow();
 
     const logs = useMemo(() => flowData?.messageLogs ?? [], [flowData?.messageLogs]);
 
@@ -41,6 +41,7 @@ const FlowAutomationMessages = ({ className }: FlowAutomationMessagesProps) => {
     const [debouncedSearchValue, setDebouncedSearchValue] = useState('');
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [isCanceling, setIsCanceling] = useState(false);
+    const [isResuming, setIsResuming] = useState(false);
 
     const { containerRef, endRef, hasNewMessages, isScrolledToBottom, scrollToEnd } = useChatScroll(logs, flowId);
 
@@ -154,7 +155,7 @@ const FlowAutomationMessages = ({ className }: FlowAutomationMessagesProps) => {
 
             case StatusType.Failed:
             case StatusType.Finished: {
-                return 'This flow has ended. Create a new one to continue.';
+                return 'This flow has ended. Type a message and click Resume to continue, or leave empty for default resume.';
             }
 
             case StatusType.Running: {
@@ -182,6 +183,18 @@ const FlowAutomationMessages = ({ className }: FlowAutomationMessagesProps) => {
         }
     };
 
+    // Resume flow handler
+    const handleResumeFlow = async (values?: FlowFormValues) => {
+        setIsResuming(true);
+
+        try {
+            const input = values?.message?.trim() || undefined;
+            await resumeFlow(input);
+        } finally {
+            setIsResuming(false);
+        }
+    };
+
     // Stop automation handler
     const handleStopAutomation = async () => {
         setIsCanceling(true);
@@ -206,7 +219,8 @@ const FlowAutomationMessages = ({ className }: FlowAutomationMessagesProps) => {
         debouncedUpdateSearch.cancel();
     };
 
-    const isFormDisabled = flowStatus === StatusType.Finished || flowStatus === StatusType.Failed;
+    const isFlowEnded = flowStatus === StatusType.Finished || flowStatus === StatusType.Failed;
+    const isFormDisabled = false;
     const isFormLoading = flowStatus === StatusType.Created || flowStatus === StatusType.Running;
 
     return (
@@ -331,11 +345,13 @@ const FlowAutomationMessages = ({ className }: FlowAutomationMessagesProps) => {
                     }}
                     isCanceling={isCanceling}
                     isDisabled={isFormDisabled}
-                    isLoading={isFormLoading}
+                    isLoading={isFormLoading || isResuming}
                     isProviderDisabled={true}
+                    isResuming={isResuming}
                     isSubmitting={isSubmitting}
-                    onCancel={handleStopAutomation}
-                    onSubmit={handleSubmitMessage}
+                    onCancel={isFlowEnded ? undefined : handleStopAutomation}
+                    onResume={isFlowEnded ? handleResumeFlow : undefined}
+                    onSubmit={isFlowEnded ? handleResumeFlow : handleSubmitMessage}
                     placeholder={placeholder}
                     type={'automation'}
                 />

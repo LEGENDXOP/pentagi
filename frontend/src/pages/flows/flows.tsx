@@ -14,6 +14,7 @@ import {
     MoreHorizontal,
     Pause,
     Pencil,
+    Play,
     Plus,
     Star,
     Trash,
@@ -94,11 +95,12 @@ const formatFullDateTime = (dateString: string) => {
 const Flows = () => {
     const navigate = useNavigate();
     const [searchParams, setSearchParams] = useSearchParams();
-    const { deleteFlow, finishFlow, flows, isLoading } = useFlows();
+    const { deleteFlow, finishFlow, resumeFlow, flows, isLoading } = useFlows();
     const { isFavoriteFlow, toggleFavoriteFlow } = useFavorites();
     const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
     const [deletingFlow, setDeletingFlow] = useState<Flow | null>(null);
     const [finishingFlowIds, setFinishingFlowIds] = useState<Set<string>>(new Set());
+    const [resumingFlowIds, setResumingFlowIds] = useState<Set<string>>(new Set());
     const [deletingFlowIds, setDeletingFlowIds] = useState<Set<string>>(new Set());
     const [editingFlowId, setEditingFlowId] = useState<null | string>(null);
     const [editingFlowTitle, setEditingFlowTitle] = useState('');
@@ -246,6 +248,28 @@ const Flows = () => {
             }
         },
         [finishFlow],
+    );
+
+    const handleFlowResume = useCallback(
+        async (flow: Flow) => {
+            setResumingFlowIds((previousIds) => new Set(previousIds).add(flow.id));
+
+            try {
+                const success = await resumeFlow(flow);
+
+                if (success) {
+                    navigate(`/flows/${flow.id}`);
+                }
+            } finally {
+                setResumingFlowIds((previousIds) => {
+                    const newIds = new Set(previousIds);
+                    newIds.delete(flow.id);
+
+                    return newIds;
+                });
+            }
+        },
+        [resumeFlow, navigate],
     );
 
     const columns: ColumnDef<Flow>[] = useMemo(
@@ -661,6 +685,24 @@ const Flows = () => {
                                             )}
                                         </DropdownMenuItem>
                                     )}
+                                    {!isRunning && (
+                                        <DropdownMenuItem
+                                            disabled={resumingFlowIds.has(flow.id)}
+                                            onClick={() => handleFlowResume(flow)}
+                                        >
+                                            {resumingFlowIds.has(flow.id) ? (
+                                                <>
+                                                    <Loader2 className="animate-spin" />
+                                                    Resuming...
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <Play />
+                                                    Resume
+                                                </>
+                                            )}
+                                        </DropdownMenuItem>
+                                    )}
                                     <DropdownMenuSeparator />
                                     <DropdownMenuItem
                                         disabled={deletingFlowIds.has(flow.id)}
@@ -696,9 +738,11 @@ const Flows = () => {
             editingFlowId,
             editingFlowTitle,
             finishingFlowIds,
+            resumingFlowIds,
             handleColumnSort,
             handleFlowDeleteDialogOpen,
             handleFlowFinish,
+            handleFlowResume,
             handleFlowOpen,
             handleFlowRenameCancel,
             handleFlowRenameSave,

@@ -43,6 +43,7 @@ type FlowController interface {
 		prvtype provider.ProviderType,
 		functions *tools.Functions,
 	) (AssistantWorker, error)
+	ResumeFlow(ctx context.Context, flowID int64, input string) (FlowWorker, error)
 	LoadFlows(ctx context.Context) error
 	ListFlows(ctx context.Context) []FlowWorker
 	GetFlow(ctx context.Context, flowID int64) (FlowWorker, error)
@@ -322,6 +323,102 @@ func (fc *flowController) CreateAssistant(
 	}
 
 	return aw, nil
+}
+
+const defaultResumeMessage = "Continue the security audit from where you left off. Review your previous findings and message history to understand current state, then proceed with the next phase."
+
+func (fc *flowController) ResumeFlow(ctx context.Context, flowID int64, input string) (FlowWorker, error) {
+	fc.mx.Lock()
+	defer fc.mx.Unlock()
+
+	flowWorkerCtx := flowWorkerCtx{
+		db:          fc.db,
+		cfg:         fc.cfg,
+		docker:      fc.docker,
+		provs:       fc.provs,
+		subs:        fc.subs,
+		flowControl: fc.flowControl,
+		notifier:    fc.notifier,
+		flowProviderControllers: flowProviderControllers{
+			mlc:  fc.mlc,
+			aslc: fc.aslc,
+			alc:  fc.alc,
+			slc:  fc.slc,
+			tlc:  fc.tlc,
+			vslc: fc.vslc,
+			sc:   fc.sc,
+		},
+	}
+
+	// Check if flow is already active in memory
+	if fw, ok := fc.flows[flowID]; ok {
+		status, err := fw.GetStatus(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get flow %d status: %w", flowID, err)
+		}
+
+		switch status {
+		case database.FlowStatusRunning, database.FlowStatusWaiting:
+			// Already alive — just send input if provided
+			resumeInput := input
+			if resumeInput == "" {
+				resumeInput = defaultResumeMessage
+			}
+			if err := fw.PutInput(ctx, resumeInput); err != nil {
+				return nil, fmt.Errorf("failed to put input: %w", err)
+			}
+			return fw, nil
+		case database.FlowStatusFinished, database.FlowStatusFailed:
+			// Worker exists in map but flow ended — need to reload below
+			break
+		default:
+			return nil, fmt.Errorf("flow %d is in status %s, cannot resume", flowID, status)
+		}
+	}
+
+	// Verify flow exists in DB and is in a resumable state
+	flow, err := fc.db.GetFlow(ctx, flowID)
+	if err != nil {
+		return nil, fmt.Errorf("flow %d not found: %w", flowID, err)
+	}
+
+	if flow.Status != database.FlowStatusFinished && flow.Status != database.FlowStatusFailed {
+		return nil, fmt.Errorf("flow %d is in status %s, only finished or failed flows can be resumed",
+			flowID, flow.Status)
+	}
+
+	// Update status to Waiting (required by LoadFlowWorker)
+	flow, err = fc.db.UpdateFlowStatus(ctx, database.UpdateFlowStatusParams{
+		ID:     flowID,
+		Status: database.FlowStatusWaiting,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to update flow %d status: %w", flowID, err)
+	}
+
+	// Load (resurrect) the flow worker — spawns a new container, restores provider
+	fw, err := LoadFlowWorker(ctx, flow, flowWorkerCtx)
+	if err != nil {
+		// Revert status on failure
+		_, _ = fc.db.UpdateFlowStatus(ctx, database.UpdateFlowStatusParams{
+			ID:     flowID,
+			Status: database.FlowStatusFailed,
+		})
+		return nil, fmt.Errorf("failed to resume flow %d: %w", flowID, err)
+	}
+
+	fc.flows[flowID] = fw
+
+	// Send user input (or default resume message)
+	resumeInput := input
+	if resumeInput == "" {
+		resumeInput = defaultResumeMessage
+	}
+	if err := fw.PutInput(ctx, resumeInput); err != nil {
+		return nil, fmt.Errorf("failed to put input to resumed flow: %w", err)
+	}
+
+	return fw, nil
 }
 
 func (fc *flowController) ListFlows(ctx context.Context) []FlowWorker {

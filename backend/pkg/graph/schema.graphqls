@@ -813,6 +813,7 @@ type Mutation {
   putUserInput(flowId: ID!, input: String!): ResultType!
   stopFlow(flowId: ID!): ResultType!
   finishFlow(flowId: ID!): ResultType!
+  resumeFlow(flowId: ID!, input: String): Flow!
   deleteFlow(flowId: ID!): ResultType!
   renameFlow(flowId: ID!, title: String!): ResultType!
 
