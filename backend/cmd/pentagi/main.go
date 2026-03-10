@@ -18,9 +18,11 @@ import (
 	"pentagi/pkg/database"
 	"pentagi/pkg/docker"
 	"pentagi/pkg/graph/subscriptions"
+	"pentagi/pkg/notifications"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/providers"
 	router "pentagi/pkg/server"
+	"pentagi/pkg/server/services"
 	"pentagi/pkg/version"
 
 	_ "github.com/lib/pq"
@@ -106,8 +108,53 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize providers: %v", err)
 	}
+
+	// Initialize optional Telegram notifications
+	var notifier *notifications.NotificationManager
+	if cfg.TelegramNotify && cfg.TelegramBotToken != "" && cfg.TelegramChatID != "" {
+		tg := notifications.NewTelegramNotifier(cfg.TelegramBotToken, cfg.TelegramChatID)
+		notifier = notifications.NewNotificationManager(tg, true, cfg.TelegramQuietTZOffset)
+
+		// Bridge SSE events (findings, phase changes) to Telegram notifications
+		lastPhases := make(map[int64]string)
+		services.RegisterFlowEventHook(func(flowID int64, event services.FlowEvent) {
+			switch event.EventType {
+			case services.SSEEventFinding:
+				if finding, ok := event.Data.(services.FindingEvent); ok {
+					notifier.Notify(notifications.NotificationEvent{
+						Type:            notifications.EventFindingDiscovered,
+						FlowID:          flowID,
+						FindingID:       finding.ID,
+						Title:           finding.Title,
+						FindingSeverity: notifications.MapSeverity(finding.Severity),
+						FindingTarget:   finding.Target,
+						FindingVulnType: finding.VulnType,
+					})
+				}
+			case services.SSEEventPhaseChange:
+				if phase, ok := event.Data.(services.PhaseChangeEvent); ok {
+					oldPhase := lastPhases[flowID]
+					if oldPhase != phase.Phase && phase.Phase != "" && oldPhase != "" {
+						notifier.Notify(notifications.NotificationEvent{
+							Type:     notifications.EventPhaseChange,
+							FlowID:   flowID,
+							OldPhase: oldPhase,
+							NewPhase: phase.Phase,
+						})
+					}
+					lastPhases[flowID] = phase.Phase
+				}
+			}
+		})
+
+		logrus.Info("Telegram notifications enabled")
+	} else {
+		notifier = notifications.NewNotificationManager(nil, false, 0)
+		logrus.Debug("Telegram notifications disabled")
+	}
+
 	subscriptions := subscriptions.NewSubscriptionsController()
-	controller := controller.NewFlowController(queries, cfg, client, providers, subscriptions)
+	controller := controller.NewFlowController(queries, cfg, client, providers, subscriptions, notifier)
 
 	if err := controller.LoadFlows(ctx); err != nil {
 		log.Fatalf("failed to load flows: %v", err)
@@ -131,6 +178,10 @@ func main() {
 	// Wait for termination signal
 	<-sigChan
 	log.Println("Shutting down...")
+
+	if notifier != nil {
+		notifier.Close()
+	}
 
 	log.Println("Shutdown complete")
 }

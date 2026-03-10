@@ -205,6 +205,12 @@ type Config struct {
 	BudgetAttackMinutes      int `env:"BUDGET_ATTACK_MINUTES" envDefault:"45"`
 	BudgetPostExploitMinutes int `env:"BUDGET_POST_EXPLOIT_MINUTES" envDefault:"20"`
 	BudgetFailureLimit       int `env:"BUDGET_FAILURE_LIMIT" envDefault:"5"`
+
+	// Telegram notifications (optional)
+	TelegramBotToken      string `env:"TELEGRAM_BOT_TOKEN"`
+	TelegramChatID        string `env:"TELEGRAM_CHAT_ID"`
+	TelegramNotify        bool   `env:"TELEGRAM_NOTIFY" envDefault:"false"`
+	TelegramQuietTZOffset int    `env:"TELEGRAM_QUIET_TZ_OFFSET" envDefault:"0"` // hours offset from UTC for quiet hours
 }
 
 func NewConfig() (*Config, error) {

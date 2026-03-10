@@ -11,6 +11,7 @@ import (
 	"pentagi/pkg/database"
 	"pentagi/pkg/docker"
 	"pentagi/pkg/graph/subscriptions"
+	"pentagi/pkg/notifications"
 	"pentagi/pkg/providers"
 	"pentagi/pkg/providers/provider"
 	"pentagi/pkg/tools"
@@ -49,6 +50,7 @@ type FlowController interface {
 	FinishFlow(ctx context.Context, flowID int64) error
 	RenameFlow(ctx context.Context, flowID int64, title string) error
 	GetFlowControlManager() FlowControlManager
+	GetNotificationManager() *notifications.NotificationManager
 }
 
 type flowController struct {
@@ -60,6 +62,7 @@ type flowController struct {
 	provs       providers.ProviderController
 	subs        subscriptions.SubscriptionsController
 	flowControl FlowControlManager
+	notifier    *notifications.NotificationManager
 	alc         AgentLogController
 	mlc         MsgLogController
 	aslc        AssistantLogController
@@ -75,6 +78,7 @@ func NewFlowController(
 	docker docker.DockerClient,
 	provs providers.ProviderController,
 	subs subscriptions.SubscriptionsController,
+	notifier *notifications.NotificationManager,
 ) FlowController {
 	return &flowController{
 		db:          db,
@@ -85,6 +89,7 @@ func NewFlowController(
 		provs:       provs,
 		subs:        subs,
 		flowControl: NewFlowControlManager(),
+		notifier:    notifier,
 		alc:         NewAgentLogController(db),
 		mlc:         NewMsgLogController(db),
 		aslc:        NewAssistantLogController(db),
@@ -97,6 +102,10 @@ func NewFlowController(
 
 func (fc *flowController) GetFlowControlManager() FlowControlManager {
 	return fc.flowControl
+}
+
+func (fc *flowController) GetNotificationManager() *notifications.NotificationManager {
+	return fc.notifier
 }
 
 func (fc *flowController) LoadFlows(ctx context.Context) error {
@@ -113,6 +122,7 @@ func (fc *flowController) LoadFlows(ctx context.Context) error {
 			provs:       fc.provs,
 			subs:        fc.subs,
 			flowControl: fc.flowControl,
+			notifier:    fc.notifier,
 			flowProviderControllers: flowProviderControllers{
 				mlc:  fc.mlc,
 				aslc: fc.aslc,
@@ -162,6 +172,7 @@ func (fc *flowController) CreateFlow(
 			provs:       fc.provs,
 			subs:        fc.subs,
 			flowControl: fc.flowControl,
+			notifier:    fc.notifier,
 			flowProviderControllers: flowProviderControllers{
 				mlc:  fc.mlc,
 				aslc: fc.aslc,
@@ -208,6 +219,7 @@ func (fc *flowController) CreateAssistant(
 		provs:       fc.provs,
 		subs:        fc.subs,
 		flowControl: fc.flowControl,
+		notifier:    fc.notifier,
 		flowProviderControllers: flowProviderControllers{
 			mlc:  fc.mlc,
 			aslc: fc.aslc,

@@ -14,6 +14,7 @@ import (
 	"pentagi/pkg/database"
 	"pentagi/pkg/docker"
 	"pentagi/pkg/graph/subscriptions"
+	"pentagi/pkg/notifications"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/observability/langfuse"
 	"pentagi/pkg/providers"
@@ -79,6 +80,7 @@ type flowWorkerCtx struct {
 	provs       providers.ProviderController
 	subs        subscriptions.SubscriptionsController
 	flowControl FlowControlManager
+	notifier    *notifications.NotificationManager
 
 	flowProviderControllers
 }
@@ -198,7 +200,10 @@ func NewFlowWorker(
 		return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to update flow in DB", err)
 	}
 
-	pub := fwc.subs.NewFlowPublisher(fwc.userID, flow.ID)
+	pub := notifications.WrapPublisher(
+		fwc.subs.NewFlowPublisher(fwc.userID, flow.ID),
+		fwc.notifier,
+	)
 	workers, err := newFlowProviderWorkers(ctx, flow.ID, &fwc.flowProviderControllers, pub)
 	if err != nil {
 		return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to create flow provider workers", err)
@@ -353,7 +358,10 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 		return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to get flow provider", err)
 	}
 
-	pub := fwc.subs.NewFlowPublisher(flow.UserID, flow.ID)
+	pub := notifications.WrapPublisher(
+		fwc.subs.NewFlowPublisher(flow.UserID, flow.ID),
+		fwc.notifier,
+	)
 	workers, err := newFlowProviderWorkers(ctx, flow.ID, &fwc.flowProviderControllers, pub)
 	if err != nil {
 		return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to create flow provider workers", err)

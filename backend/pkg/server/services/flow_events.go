@@ -134,12 +134,41 @@ func (b *flowEventBus) publish(flowID int64, event FlowEvent) {
 	}
 }
 
+// FlowEventHook is a callback invoked on every emitted flow event.
+// Hooks must be non-blocking and safe to call from any goroutine.
+type FlowEventHook func(flowID int64, event FlowEvent)
+
+var (
+	globalHooksMu sync.Mutex
+	globalHooks   []FlowEventHook
+)
+
+// RegisterFlowEventHook registers a hook that will be called for every emitted flow event.
+// Hooks are called synchronously; keep them fast or dispatch to a goroutine internally.
+func RegisterFlowEventHook(hook FlowEventHook) {
+	globalHooksMu.Lock()
+	defer globalHooksMu.Unlock()
+	globalHooks = append(globalHooks, hook)
+}
+
 // EmitFlowEvent is the global function for backend code to emit events to the SSE bus.
 func EmitFlowEvent(flowID int64, eventType string, data interface{}) {
-	globalEventBus.publish(flowID, FlowEvent{
+	event := FlowEvent{
 		EventType: eventType,
 		Data:      data,
-	})
+	}
+
+	globalEventBus.publish(flowID, event)
+
+	// Call registered hooks
+	globalHooksMu.Lock()
+	hooks := make([]FlowEventHook, len(globalHooks))
+	copy(hooks, globalHooks)
+	globalHooksMu.Unlock()
+
+	for _, hook := range hooks {
+		hook(flowID, event)
+	}
 }
 
 // ==================== Flow Events Service ====================
