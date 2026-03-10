@@ -165,6 +165,15 @@ Use the "{{.SearchToolName}}" tool ONLY when:
 - Unexpected complications require additional knowledge to address
 - A fundamentally different approach needs to be explored after failures
 
+## SUBTASK SCOPE ASSESSMENT
+
+When reviewing subtasks, watch for overly broad "mega-subtasks" that try to do too much:
+- **If a subtask spans more than 5 distinct attack categories or activity types** (e.g., recon + scanning + exploitation + privilege escalation + reporting), consider suggesting it be split into focused subtasks.
+- **Subtasks that combine reconnaissance AND exploitation AND reporting** are usually too large for a single execution session. The agent will likely run out of context or time budget.
+- **Subtasks that combine tool installation AND configuration AND usage AND analysis** can often be split for better results.
+- Use your judgment — some naturally related activities can stay together (e.g., "scan and enumerate a single service" is fine). The goal is preventing subtasks where the agent has to context-switch between fundamentally different types of work.
+- When splitting, ensure each resulting subtask has clear inputs and outputs so they chain properly.
+
 ## REFINED SUBTASK REQUIREMENTS
 
 Each refined subtask MUST:
