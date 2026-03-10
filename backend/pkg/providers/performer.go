@@ -34,11 +34,15 @@ const (
 	maxRetriesToCallFunction    = 3
 	maxReflectorCallsPerChain   = 3
 	delayBetweenRetries         = 5 * time.Second
-	maxToolCallsPerSubtask      = 50               // hard cap per subtask
-	defaultSubtaskDuration      = 15 * time.Minute  // default hard time limit per subtask
-	defaultMaxNestingDepth      = 2                  // primary_agent(0) → pentester(1) → terminal OK, pentester→coder blocked at depth 2
-	nestedTimeoutDepth1         = 15 * time.Minute   // timeout for depth-1 nested agents
-	nestedTimeoutDepth2         = 10 * time.Minute   // timeout for depth-2 nested agents (if ever reached)
+	defaultMaxToolCallsPerSubtask = 50               // hard cap per subtask (configurable via MAX_TOOL_CALLS_PER_SUBTASK)
+	defaultSubtaskDuration      = 15 * time.Minute   // default hard time limit per subtask
+	defaultMaxNestingDepth      = 2                   // primary_agent(0) → pentester(1) → terminal OK, pentester→coder blocked at depth 2
+	nestedTimeoutDepth1         = 15 * time.Minute    // timeout for depth-1 nested agents
+	nestedTimeoutDepth2         = 10 * time.Minute    // timeout for depth-2 nested agents (if ever reached)
+
+	// toolCallLimitWarningBuffer is how many calls before the limit we inject
+	// a "wrap up" warning into the chain, giving the agent a chance to save findings.
+	toolCallLimitWarningBuffer  = 5
 )
 
 // getSubtaskMaxDuration returns the subtask timeout, configurable via
@@ -50,6 +54,17 @@ func getSubtaskMaxDuration() time.Duration {
 		}
 	}
 	return defaultSubtaskDuration
+}
+
+// getMaxToolCallsPerSubtask returns the maximum tool calls per subtask,
+// configurable via MAX_TOOL_CALLS_PER_SUBTASK env var. Defaults to 50.
+func getMaxToolCallsPerSubtask() int {
+	if v := os.Getenv("MAX_TOOL_CALLS_PER_SUBTASK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxToolCallsPerSubtask
 }
 
 // getMaxNestingDepth returns the maximum allowed agent delegation depth,
@@ -484,9 +499,43 @@ func (fp *flowProvider) performAgentChain(
 			}
 		}
 
-		if toolCallCount >= maxToolCallsPerSubtask {
+		maxToolCalls := getMaxToolCallsPerSubtask()
+		if toolCallCount >= maxToolCalls {
 			logger.WithField("tool_call_count", toolCallCount).
 				Warn("reached max tool calls per subtask, forcing stop")
+
+			// Save partial results before failing so findings are not lost.
+			if subtaskID != nil {
+				partialResult := fmt.Sprintf("[PARTIAL — tool call limit reached at %d/%d calls]\n", toolCallCount, maxToolCalls)
+				if execState != nil {
+					partialResult += fmt.Sprintf("Phase: %s\nAttacks done: %v\nError count: %d\n",
+						execState.Phase, execState.AttacksDone, execState.ErrorCount)
+				}
+				// Collect last few tool results from chain as evidence of work done
+				partialResult += "\nTool call summary (last 10):\n"
+				toolResultCount := 0
+				for i := len(chain) - 1; i >= 0 && toolResultCount < 10; i-- {
+					if chain[i].Role == llms.ChatMessageTypeTool {
+						for _, part := range chain[i].Parts {
+							if resp, ok := part.(llms.ToolCallResponse); ok {
+								snippet := resp.Content
+								if len(snippet) > 200 {
+									snippet = snippet[:200] + "..."
+								}
+								partialResult += fmt.Sprintf("- %s: %s\n", resp.Name, snippet)
+								toolResultCount++
+							}
+						}
+					}
+				}
+				if _, err := fp.db.UpdateSubtaskResult(ctx, database.UpdateSubtaskResultParams{
+					Result: partialResult,
+					ID:     *subtaskID,
+				}); err != nil {
+					logger.WithError(err).Error("failed to save partial results on tool call limit")
+				}
+			}
+
 			return fmt.Errorf("subtask tool call limit reached (%d calls)", toolCallCount)
 		}
 

@@ -212,6 +212,9 @@ type Config struct {
 	// Subtask retry configuration — automatic retry on transient failures
 	SubtaskMaxRetries int `env:"SUBTASK_MAX_RETRIES" envDefault:"2"`
 
+	// Maximum tool calls per subtask before forced stop (default 50)
+	MaxToolCallsPerSubtask int `env:"MAX_TOOL_CALLS_PER_SUBTASK" envDefault:"50"`
+
 	// Flow watchdog — auto-resumes stalled flows
 	FlowWatchdogEnabled    bool `env:"FLOW_WATCHDOG_ENABLED" envDefault:"true"`
 	FlowWatchdogInterval   int  `env:"FLOW_WATCHDOG_INTERVAL" envDefault:"300"`    // seconds

@@ -203,6 +203,12 @@ func (stw *subtaskWorker) SetStatus(ctx context.Context, status database.Subtask
 		// Reset for retry — subtask goes back to initial state
 		stw.completed = false
 		stw.waiting = false
+		// Clear persisted execution state on retry so agent gets a fresh tool call budget.
+		// Without this, the restored ToolCallCount would immediately hit the limit again.
+		_ = stw.subtaskCtx.DB.UpdateSubtaskContextWithTimestamp(ctx, database.UpdateSubtaskContextWithTimestampParams{
+			ID:      stw.subtaskCtx.SubtaskID,
+			Context: "",
+		})
 		// Don't propagate to parent — task is managing the retry
 	case database.SubtaskStatusRunning:
 		stw.completed = false
