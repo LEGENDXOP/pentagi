@@ -447,6 +447,29 @@ func (tw *taskWorker) runSubtaskWithRetry(
 				logger.WithError(err).Error("failed to reset subtask status for retry")
 				return err
 			}
+
+			// Reset execution state (including tool_call_count) so the retry
+			// starts fresh instead of immediately hitting limits again.
+			if subtaskDB, getErr := tw.taskCtx.DB.GetSubtask(ctx, st.GetSubtaskID()); getErr == nil && subtaskDB.Context != "" {
+				if parsed := providers.ParseExecutionState(subtaskDB.Context); parsed != nil {
+					oldCount := parsed.ToolCallCount
+					parsed.ToolCallCount = 0
+					parsed.ErrorCount = 0
+					parsed.Phase = "retry"
+					parsed.AttacksDone = nil
+					parsed.CurrentAttack = ""
+					if stateJSON, jsonErr := parsed.ToJSON(); jsonErr == nil {
+						tw.taskCtx.DB.UpdateSubtaskContextWithTimestamp(ctx, database.UpdateSubtaskContextWithTimestampParams{
+							ID:      st.GetSubtaskID(),
+							Context: stateJSON,
+						})
+					}
+					logger.WithFields(logrus.Fields{
+						"subtask_id":     st.GetSubtaskID(),
+						"old_tool_count": oldCount,
+					}).Info("retrying subtask, resetting tool call count from old value to 0")
+				}
+			}
 		}
 
 		lastErr = st.Run(ctx)

@@ -34,15 +34,16 @@ const (
 	maxRetriesToCallFunction    = 3
 	maxReflectorCallsPerChain   = 3
 	delayBetweenRetries         = 5 * time.Second
-	defaultMaxToolCallsPerSubtask = 50               // hard cap per subtask (configurable via MAX_TOOL_CALLS_PER_SUBTASK)
-	defaultSubtaskDuration      = 15 * time.Minute   // default hard time limit per subtask
-	defaultMaxNestingDepth      = 2                   // primary_agent(0) → pentester(1) → terminal OK, pentester→coder blocked at depth 2
+	defaultMaxToolCallsPerSubtask = 100              // hard cap per subtask (configurable via MAX_TOOL_CALLS_PER_SUBTASK)
+	defaultSubtaskDuration      = 20 * time.Minute   // default hard time limit per subtask
+	defaultMaxNestingDepth      = 4                   // primary_agent(0) → pentester(1) → coder(2) → installer(3) all allowed
 	nestedTimeoutDepth1         = 15 * time.Minute    // timeout for depth-1 nested agents
-	nestedTimeoutDepth2         = 10 * time.Minute    // timeout for depth-2 nested agents (if ever reached)
+	nestedTimeoutDepth2         = 12 * time.Minute    // timeout for depth-2 nested agents
+	nestedTimeoutDepth3         = 10 * time.Minute    // timeout for depth-3 nested agents
 
 	// toolCallLimitWarningBuffer is how many calls before the limit we inject
 	// a "wrap up" warning into the chain, giving the agent a chance to save findings.
-	toolCallLimitWarningBuffer  = 5
+	toolCallLimitWarningBuffer  = 10
 )
 
 // getSubtaskMaxDuration returns the subtask timeout, configurable via
@@ -57,7 +58,7 @@ func getSubtaskMaxDuration() time.Duration {
 }
 
 // getMaxToolCallsPerSubtask returns the maximum tool calls per subtask,
-// configurable via MAX_TOOL_CALLS_PER_SUBTASK env var. Defaults to 50.
+// configurable via MAX_TOOL_CALLS_PER_SUBTASK env var. Defaults to 100.
 func getMaxToolCallsPerSubtask() int {
 	if v := os.Getenv("MAX_TOOL_CALLS_PER_SUBTASK"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -68,7 +69,7 @@ func getMaxToolCallsPerSubtask() int {
 }
 
 // getMaxNestingDepth returns the maximum allowed agent delegation depth,
-// configurable via MAX_NESTING_DEPTH env var. Defaults to 2.
+// configurable via MAX_NESTING_DEPTH env var. Defaults to 4.
 func getMaxNestingDepth() int {
 	if v := os.Getenv("MAX_NESTING_DEPTH"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -96,14 +97,20 @@ func withIncrementedDepth(ctx context.Context) context.Context {
 
 // getNestedTimeout returns the appropriate timeout for a given nesting depth.
 // Nested agents get their own FRESH timeout to prevent parent deadline starvation.
+// Each level gets a generous timeout (minimum 10 minutes) to allow real work.
 func getNestedTimeout(depth int) time.Duration {
 	switch {
 	case depth <= 0:
 		return getSubtaskMaxDuration()
 	case depth == 1:
 		return nestedTimeoutDepth1
-	default:
+	case depth == 2:
 		return nestedTimeoutDepth2
+	case depth == 3:
+		return nestedTimeoutDepth3
+	default:
+		// Even deeper nesting still gets minimum 10 minutes
+		return 10 * time.Minute
 	}
 }
 
@@ -500,6 +507,32 @@ func (fp *flowProvider) performAgentChain(
 		}
 
 		maxToolCalls := getMaxToolCallsPerSubtask()
+
+		// Inject approaching-limit warning to give the agent time for graceful completion
+		if toolCallCount >= maxToolCalls-toolCallLimitWarningBuffer && toolCallCount < maxToolCalls {
+			warningMsg := fmt.Sprintf(
+				"[URGENT — APPROACHING TOOL CALL LIMIT: %d/%d calls used, only %d remaining]\n"+
+					"You are about to reach the maximum tool call limit. "+
+					"Please IMMEDIATELY save your findings using the result/report tool. "+
+					"Summarize all discoveries, evidence, and recommendations NOW before the limit is reached.",
+				toolCallCount, maxToolCalls, maxToolCalls-toolCallCount,
+			)
+			chain = append(chain, llms.MessageContent{
+				Role: llms.ChatMessageTypeHuman,
+				Parts: []llms.ContentPart{
+					llms.TextContent{Text: warningMsg},
+				},
+			})
+			if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+				logger.WithError(err).Error("failed to update msg chain after limit warning")
+			}
+			logger.WithFields(logrus.Fields{
+				"tool_call_count": toolCallCount,
+				"max_tool_calls":  maxToolCalls,
+				"remaining":       maxToolCalls - toolCallCount,
+			}).Warn("approaching tool call limit, injected warning to agent")
+		}
+
 		if toolCallCount >= maxToolCalls {
 			logger.WithField("tool_call_count", toolCallCount).
 				Warn("reached max tool calls per subtask, forcing stop")

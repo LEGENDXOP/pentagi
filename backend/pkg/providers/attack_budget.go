@@ -21,15 +21,15 @@ const (
 
 // Default budget configuration values. These can be overridden via environment variables:
 //
-//	BUDGET_RECON_MINUTES      — time budget for reconnaissance (default: 30)
-//	BUDGET_ATTACK_MINUTES     — time budget per attack vector (default: 45)
-//	BUDGET_POST_EXPLOIT_MINUTES — time budget for post-exploitation (default: 20)
-//	BUDGET_FAILURE_LIMIT      — consecutive failures before auto-pivot (default: 5)
+//	BUDGET_RECON_MINUTES        — time budget for reconnaissance (default: 45)
+//	BUDGET_ATTACK_MINUTES       — time budget per attack vector (default: 60)
+//	BUDGET_POST_EXPLOIT_MINUTES — time budget for post-exploitation (default: 30)
+//	BUDGET_FAILURE_LIMIT        — consecutive failures before auto-pivot (default: 8)
 const (
-	DefaultReconMinutes       = 30
-	DefaultAttackMinutes      = 45
-	DefaultPostExploitMinutes = 20
-	DefaultFailureLimit       = 5
+	DefaultReconMinutes       = 45
+	DefaultAttackMinutes      = 60
+	DefaultPostExploitMinutes = 30
+	DefaultFailureLimit       = 8
 )
 
 // AttackBudgetConfig holds the configurable budget limits.

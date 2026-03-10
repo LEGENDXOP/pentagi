@@ -40,21 +40,22 @@ func checkDelegationAllowed(ctx context.Context, agentName string) string {
 	if depth >= maxDepth {
 		return fmt.Sprintf(
 			"Maximum agent delegation depth reached (%d/%d). "+
-				"Cannot delegate to %s. Use terminal and file tools directly "+
-				"instead of delegating to another agent. "+
-				"Write scripts directly, use 'apt-get install' in terminal, etc.",
+				"Consider using terminal directly for faster execution instead of "+
+				"delegating to %s. Write scripts directly, use 'apt-get install' in terminal, etc.",
 			depth, maxDepth, agentName,
 		)
 	}
 
-	// Deadline gating: block delegation if <30% of timeout remains
+	// Deadline gating: block delegation if <20% of timeout remains.
+	// Use 20% threshold (not 30%) to give nested agents more opportunity to work.
+	// Nested agents get their own fresh timeout anyway, so this is mainly a safety net.
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
-		threshold := getSubtaskMaxDuration() * 3 / 10
+		threshold := getSubtaskMaxDuration() / 5 // 20%
 		if remaining < threshold {
 			return fmt.Sprintf(
-				"Insufficient time remaining (%v) for delegation to %s. "+
-					"Use terminal tool directly to complete the task.",
+				"Low time remaining (%v) for delegation to %s. "+
+					"Consider using terminal directly for faster execution.",
 				remaining.Round(time.Second), agentName,
 			)
 		}

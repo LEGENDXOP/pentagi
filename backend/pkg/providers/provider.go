@@ -878,7 +878,7 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 	// Create a global execution budget if one doesn't exist yet (top-level entry).
 	// Sub-agents inherit the budget from their parent via context.
 	if GetBudget(ctx) == nil {
-		ctx = WithBudget(ctx, NewExecutionBudget(defaultGlobalMaxToolCalls, defaultGlobalMaxDuration))
+		ctx = WithBudget(ctx, NewExecutionBudget(getGlobalMaxToolCalls(), getGlobalMaxDuration()))
 	}
 
 	// Create a CostTracker for this flow if one doesn't exist yet.

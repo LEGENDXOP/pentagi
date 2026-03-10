@@ -3,14 +3,38 @@ package providers
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 )
 
 const (
-	defaultGlobalMaxToolCalls = 200
-	defaultGlobalMaxDuration  = 45 * time.Minute
+	defaultGlobalMaxToolCalls = 500
+	defaultGlobalMaxDuration  = 60 * time.Minute
 )
+
+// getGlobalMaxToolCalls returns the global tool call budget, configurable via
+// GLOBAL_MAX_TOOL_CALLS env var. Defaults to 500.
+func getGlobalMaxToolCalls() int {
+	if v := os.Getenv("GLOBAL_MAX_TOOL_CALLS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultGlobalMaxToolCalls
+}
+
+// getGlobalMaxDuration returns the global time budget, configurable via
+// GLOBAL_MAX_DURATION_MINUTES env var. Defaults to 60 minutes.
+func getGlobalMaxDuration() time.Duration {
+	if v := os.Getenv("GLOBAL_MAX_DURATION_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Minute
+		}
+	}
+	return defaultGlobalMaxDuration
+}
 
 // ExecutionBudget tracks global resource consumption across the entire
 // delegation tree (primary agent → pentester → coder → installer, etc.).
