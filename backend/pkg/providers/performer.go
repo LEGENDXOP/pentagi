@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,9 +34,20 @@ const (
 	maxRetriesToCallFunction    = 3
 	maxReflectorCallsPerChain   = 3
 	delayBetweenRetries         = 5 * time.Second
-	maxToolCallsPerSubtask      = 50                // hard cap per subtask
-	maxSubtaskDuration          = 15 * time.Minute   // hard time limit per subtask
+	maxToolCallsPerSubtask      = 50               // hard cap per subtask
+	defaultSubtaskDuration      = 15 * time.Minute  // default hard time limit per subtask
 )
+
+// getSubtaskMaxDuration returns the subtask timeout, configurable via
+// SUBTASK_MAX_DURATION env var (value in minutes). Defaults to 15 min.
+func getSubtaskMaxDuration() time.Duration {
+	if v := os.Getenv("SUBTASK_MAX_DURATION"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Minute
+		}
+	}
+	return defaultSubtaskDuration
+}
 
 type callResult struct {
 	streamID  int64
@@ -131,7 +145,7 @@ func (fp *flowProvider) performAgentChain(
 	attackBudget := GetAttackBudget(ctx)
 
 	// Hard time limit per subtask to prevent infinite execution
-	ctx, timeoutCancel := context.WithTimeout(ctx, maxSubtaskDuration)
+	ctx, timeoutCancel := context.WithTimeout(ctx, getSubtaskMaxDuration())
 	defer timeoutCancel()
 
 	for {
@@ -526,6 +540,16 @@ func (fp *flowProvider) execToolCall(
 				return "", err
 			}
 
+			// Short-circuit: if context deadline is >80% expired, skip the fix attempt
+			// (which would make another LLM call that will also likely timeout)
+			if deadline, ok := ctx.Deadline(); ok {
+				remaining := time.Until(deadline)
+				if remaining < getSubtaskMaxDuration()/5 {
+					logger.WithError(err).Warn("skipping fixToolCallArgs: context nearly expired")
+					return "", fmt.Errorf("tool execution failed (timeout imminent): %w", err)
+				}
+			}
+
 			logger.WithError(err).Warn("failed to exec function")
 
 			funcExecErr := err
@@ -676,7 +700,18 @@ func (fp *flowProvider) callWithRetries(
 			errs = append(errs, err)
 		}
 
-		ticker.Reset(delayBetweenRetries)
+		// Exponential backoff: 5s → 15s → 45s with ±20% jitter
+		backoff := delayBetweenRetries
+		for i := 0; i < idx; i++ {
+			backoff *= 3
+		}
+		jitter := time.Duration(rand.Int63n(int64(backoff) / 5)) //nolint:gosec
+		if rand.Intn(2) == 0 {                                   //nolint:gosec
+			backoff += jitter
+		} else {
+			backoff -= jitter
+		}
+		ticker.Reset(backoff)
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
