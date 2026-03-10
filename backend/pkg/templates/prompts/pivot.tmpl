@@ -30,7 +30,17 @@ The following attack vectors are recommended based on attack chain analysis:
 1. Do NOT continue with the exhausted vector — the budget system has determined it is unproductive
 2. Choose a DIFFERENT attack technique or target surface
 3. If suggested alternatives are provided, prioritize them in order
-4. Document what was tried and why it failed before moving on
+4. Before pivoting, update STATE.json with attacks_done and attacks_blocked for the exhausted vector:
+   `jq --arg a "VECTOR:reason" '.attacks_blocked+=[$a]' /work/STATE.json > /tmp/s.json && mv /tmp/s.json /work/STATE.json`
 5. Apply lessons learned from the failed vector to inform your next approach
-6. Report your pivot decision and reasoning using the appropriate result tool
+6. If this is the 3rd consecutive pivot, consider whether the target has limited attack surface — report partial results rather than continuing to burn budget
+7. Report your pivot decision and reasoning using the appropriate result tool
 </pivot_rules>
+
+<tactical_pivot_patterns>
+- Exhausted on injection attacks → pivot to auth/access control testing (IDOR, privilege escalation)
+- Exhausted on web app attacks → pivot to infrastructure (SSH, FTP, SMB, exposed services)
+- Exhausted on automated scanning → pivot to manual business logic testing
+- Exhausted on unauthenticated attacks → pivot to auth setup (register/login) then authenticated testing
+- Exhausted on one target → pivot to a different target in scope
+</tactical_pivot_patterns>
