@@ -528,7 +528,8 @@ func (fp *flowProvider) GetMemoristHandler(ctx context.Context, taskID, subtaskI
 
 		memoristResult, err := fp.performMemorist(ctx, taskID, subtaskID, systemMemoristTmpl, userMemoristTmpl, action.Question)
 		if err != nil {
-			return "", wrapError(ctx, "failed to get memorist result", err)
+			logrus.WithContext(ctx).WithError(err).Warn("memorist failed, returning degraded result")
+			return "Memory lookup is temporarily unavailable. Please proceed without historical context.", nil
 		}
 
 		return memoristResult, nil
