@@ -41,31 +41,31 @@ type AuthLoginAction struct {
 	FormFields  map[string]string `json:"form_fields,omitempty" jsonschema_description:"Additional form fields for form-login (e.g., CSRF tokens, remember-me flags). Username and password fields default to 'username' and 'password' but can be overridden here."`
 	UsernameField string `json:"username_field,omitempty" jsonschema_description:"Form field name for username (default: 'username'). Set this if the login form uses a different name like 'email' or 'login'."`
 	PasswordField string `json:"password_field,omitempty" jsonschema_description:"Form field name for password (default: 'password'). Set this if the login form uses a different name like 'passwd' or 'pass'."`
-	Message     string `json:"message" jsonschema:"required,title=Auth login message" jsonschema_description:"Short message explaining the authentication action to send to the user in user's language only"`
+	Message     string `json:"message" jsonschema:"required,title=Auth login message" jsonschema_description:"Short message explaining the authentication action to send to the user in English"`
 }
 
 // AuthStatusAction is the argument schema for the auth_status tool
 type AuthStatusAction struct {
 	FlowID  string `json:"flow_id,omitempty" jsonschema_description:"Specific flow ID to check status for. Leave empty to see all active sessions."`
-	Message string `json:"message" jsonschema:"required,title=Auth status message" jsonschema_description:"Short message explaining why you're checking auth status, to send to the user in user's language only"`
+	Message string `json:"message" jsonschema:"required,title=Auth status message" jsonschema_description:"Short message explaining why you're checking auth status, to send to the user in English"`
 }
 
 // AuthInjectAction is the argument schema for the auth_inject tool
 type AuthInjectAction struct {
 	FlowID  string `json:"flow_id" jsonschema:"required" jsonschema_description:"Flow ID to get authentication context for"`
-	Message string `json:"message" jsonschema:"required,title=Auth inject message" jsonschema_description:"Short message explaining what authenticated request you want to make, to send to the user in user's language only"`
+	Message string `json:"message" jsonschema:"required,title=Auth inject message" jsonschema_description:"Short message explaining what authenticated request you want to make, to send to the user in English"`
 }
 
 // AuthRefreshAction is the argument schema for the auth_refresh tool
 type AuthRefreshAction struct {
 	FlowID  string `json:"flow_id" jsonschema:"required" jsonschema_description:"Flow ID to force token refresh for"`
-	Message string `json:"message" jsonschema:"required,title=Auth refresh message" jsonschema_description:"Short message explaining why you need to refresh the token, to send to the user in user's language only"`
+	Message string `json:"message" jsonschema:"required,title=Auth refresh message" jsonschema_description:"Short message explaining why you need to refresh the token, to send to the user in English"`
 }
 
 // AuthLogoutAction is the argument schema for the auth_logout tool
 type AuthLogoutAction struct {
 	FlowID  string `json:"flow_id" jsonschema:"required" jsonschema_description:"Flow ID to clear. All cookies, tokens, and session state for this flow will be removed."`
-	Message string `json:"message" jsonschema:"required,title=Auth logout message" jsonschema_description:"Short message explaining why you're clearing this session, to send to the user in user's language only"`
+	Message string `json:"message" jsonschema:"required,title=Auth logout message" jsonschema_description:"Short message explaining why you're clearing this session, to send to the user in English"`
 }
 
 // ──────────────────── Auth State ────────────────────

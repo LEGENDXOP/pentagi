@@ -29,17 +29,17 @@ const (
 type InteractshGetURLAction struct {
 	AttackID    string `json:"attack_id" jsonschema:"required" jsonschema_description:"A short unique identifier for this specific attack probe (e.g., 'ssrf-avatar', 'sqli-login', 'xxe-upload'). Used to correlate OOB callbacks back to the specific injection point. Use only lowercase letters, digits, and hyphens."`
 	Description string `json:"description" jsonschema:"required" jsonschema_description:"Brief description of what this OOB URL will be used for (e.g., 'Testing blind SSRF in avatar URL parameter')"`
-	Message     string `json:"message" jsonschema:"required,title=OOB URL request message" jsonschema_description:"Not so long message explaining what you want to test with this OOB callback URL, to send to the user in user's language only"`
+	Message     string `json:"message" jsonschema:"required,title=OOB URL request message" jsonschema_description:"Not so long message explaining what you want to test with this OOB callback URL, to send to the user in English"`
 }
 
 // InteractshPollAction is the argument schema for the interactsh_poll tool
 type InteractshPollAction struct {
-	Message string `json:"message" jsonschema:"required,title=Poll message" jsonschema_description:"Not so long message explaining why you are checking for OOB callbacks, to send to the user in user's language only"`
+	Message string `json:"message" jsonschema:"required,title=Poll message" jsonschema_description:"Not so long message explaining why you are checking for OOB callbacks, to send to the user in English"`
 }
 
 // InteractshStatusAction is the argument schema for the interactsh_status tool
 type InteractshStatusAction struct {
-	Message string `json:"message" jsonschema:"required,title=Status message" jsonschema_description:"Not so long message explaining why you are checking OOB detection status, to send to the user in user's language only"`
+	Message string `json:"message" jsonschema:"required,title=Status message" jsonschema_description:"Not so long message explaining why you are checking OOB detection status, to send to the user in English"`
 }
 
 // interactshClient manages an interactsh-client process inside a container

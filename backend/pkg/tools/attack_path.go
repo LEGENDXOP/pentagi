@@ -24,7 +24,7 @@ import (
 type AttackPathAnalyzeAction struct {
 	Target  string `json:"target,omitempty" jsonschema_description:"Optional target filter (IP, hostname, or URL prefix). When empty all findings for the current flow are analysed."`
 	MaxHops Int64  `json:"max_hops" jsonschema:"type=integer" jsonschema_description:"Maximum number of hops (edges) in any single attack path (minimum 2; maximum 10; default 6)"`
-	Message string `json:"message" jsonschema:"required,title=Analysis request message" jsonschema_description:"Short description of what you want to analyse and why, in the user's language"`
+	Message string `json:"message" jsonschema:"required,title=Analysis request message" jsonschema_description:"Short description of what you want to analyse and why, in English"`
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
