@@ -4,12 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
+	"time"
 
 	"pentagi/pkg/database"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/providers"
 	"pentagi/pkg/tools"
+
+	"github.com/sirupsen/logrus"
 )
 
 type FlowUpdater interface {
@@ -290,6 +295,12 @@ func (tw *taskWorker) PutInput(ctx context.Context, input string) error {
 func (tw *taskWorker) Run(ctx context.Context) error {
 	ctx = tools.PutAgentContext(ctx, database.MsgchainTypePrimaryAgent)
 
+	maxRetries := getSubtaskMaxRetries()
+	logger := logrus.WithContext(ctx).WithFields(logrus.Fields{
+		"task_id": tw.taskCtx.TaskID,
+		"flow_id": tw.taskCtx.FlowID,
+	})
+
 	for len(tw.stc.ListSubtasks(ctx)) < providers.TasksNumberLimit+3 {
 		st, err := tw.stc.PopSubtask(ctx, tw)
 		if err != nil {
@@ -301,8 +312,28 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 			break
 		}
 
-		if err := st.Run(ctx); err != nil {
-			return err
+		// Subtask execution with retry logic
+		subtaskErr := tw.runSubtaskWithRetry(ctx, st, maxRetries, logger)
+		if subtaskErr != nil {
+			// Context cancellation is always fatal — propagate immediately
+			if errors.Is(subtaskErr, context.Canceled) {
+				return subtaskErr
+			}
+
+			// If subtask is waiting for user input, propagate
+			if tw.IsWaiting() {
+				return nil
+			}
+
+			// After exhausting retries, skip this subtask and continue to next
+			logger.WithError(subtaskErr).WithFields(logrus.Fields{
+				"subtask_id":    st.GetSubtaskID(),
+				"subtask_title": st.GetTitle(),
+			}).Warn("subtask failed after all retries, skipping to next subtask")
+
+			// Mark as failed and continue
+			_ = st.SetStatus(ctx, database.SubtaskStatusFailed)
+			continue
 		}
 
 		// pass through if task is waiting from back status propagation
@@ -374,4 +405,75 @@ func (tw *taskWorker) Finish(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// runSubtaskWithRetry executes a subtask with exponential backoff retry.
+// Returns nil on success, context.Canceled if cancelled, or the last error
+// after exhausting all retries.
+func (tw *taskWorker) runSubtaskWithRetry(
+	ctx context.Context,
+	st SubtaskWorker,
+	maxRetries int,
+	logger *logrus.Entry,
+) error {
+	var lastErr error
+	backoffs := []time.Duration{30 * time.Second, 90 * time.Second, 270 * time.Second}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Wait with exponential backoff before retry
+			backoffIdx := attempt - 1
+			if backoffIdx >= len(backoffs) {
+				backoffIdx = len(backoffs) - 1
+			}
+			delay := backoffs[backoffIdx]
+
+			logger.WithFields(logrus.Fields{
+				"subtask_id":    st.GetSubtaskID(),
+				"subtask_title": st.GetTitle(),
+				"attempt":       attempt,
+				"max_retries":   maxRetries,
+				"backoff":       delay.String(),
+			}).Warn("subtask failed, retrying after backoff")
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+
+			// Reset subtask status to created for re-run
+			if err := st.SetStatus(ctx, database.SubtaskStatusCreated); err != nil {
+				logger.WithError(err).Error("failed to reset subtask status for retry")
+				return err
+			}
+		}
+
+		lastErr = st.Run(ctx)
+		if lastErr == nil {
+			return nil // success
+		}
+
+		// Context cancellation is not retryable
+		if errors.Is(lastErr, context.Canceled) {
+			return lastErr
+		}
+
+		// If subtask went to waiting state (user input needed), not retryable
+		if tw.IsWaiting() || st.IsWaiting() {
+			return lastErr
+		}
+	}
+
+	return lastErr
+}
+
+// getSubtaskMaxRetries returns the max retry count from env var or default.
+func getSubtaskMaxRetries() int {
+	if v := os.Getenv("SUBTASK_MAX_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 2 // default
 }

@@ -275,6 +275,16 @@ func NewFlowWorker(
 	fw.wg.Add(1)
 	go fw.worker()
 
+	// Start flow watchdog for auto-recovery of stalled flows
+	if isWatchdogEnabled() {
+		fw.wg.Add(1)
+		go func() {
+			defer fw.wg.Done()
+			wd := newFlowWatchdog(fw)
+			wd.run(fw.ctx)
+		}()
+	}
+
 	if !fwc.dryRun {
 		if err := fw.PutInput(ctx, fwc.input); err != nil {
 			return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to run flow worker", err)
@@ -459,6 +469,16 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 
 	fw.wg.Add(1)
 	go fw.worker()
+
+	// Start flow watchdog for auto-recovery of stalled flows
+	if isWatchdogEnabled() {
+		fw.wg.Add(1)
+		go func() {
+			defer fw.wg.Done()
+			wd := newFlowWatchdog(fw)
+			wd.run(fw.ctx)
+		}()
+	}
 
 	flowSpan.End(langfuse.WithSpanStatus("flow worker restored"))
 

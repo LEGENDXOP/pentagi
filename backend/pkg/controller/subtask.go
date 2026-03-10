@@ -199,6 +199,11 @@ func (stw *subtaskWorker) SetStatus(ctx context.Context, status database.Subtask
 	var parentStatus database.TaskStatus
 	var propagate bool
 	switch status {
+	case database.SubtaskStatusCreated:
+		// Reset for retry — subtask goes back to initial state
+		stw.completed = false
+		stw.waiting = false
+		// Don't propagate to parent — task is managing the retry
 	case database.SubtaskStatusRunning:
 		stw.completed = false
 		stw.waiting = false
@@ -215,7 +220,6 @@ func (stw *subtaskWorker) SetStatus(ctx context.Context, status database.Subtask
 		// statuses Finished and Failed will be produced by stack from Run function call
 	default:
 		stw.mx.Unlock()
-		// status Created is not possible to set by this call
 		return fmt.Errorf("unsupported subtask status: %s", status)
 	}
 
