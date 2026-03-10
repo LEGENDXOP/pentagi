@@ -206,6 +206,17 @@ type Config struct {
 	BudgetPostExploitMinutes int `env:"BUDGET_POST_EXPLOIT_MINUTES" envDefault:"20"`
 	BudgetFailureLimit       int `env:"BUDGET_FAILURE_LIMIT" envDefault:"5"`
 
+	// Nesting depth limit — prevents nested agent chains from exhausting shared timeout
+	MaxNestingDepth int `env:"MAX_NESTING_DEPTH" envDefault:"2"`
+
+	// Subtask retry configuration — automatic retry on transient failures
+	SubtaskMaxRetries int `env:"SUBTASK_MAX_RETRIES" envDefault:"2"`
+
+	// Flow watchdog — auto-resumes stalled flows
+	FlowWatchdogEnabled    bool `env:"FLOW_WATCHDOG_ENABLED" envDefault:"true"`
+	FlowWatchdogInterval   int  `env:"FLOW_WATCHDOG_INTERVAL" envDefault:"300"`    // seconds
+	FlowWatchdogMaxResumes int  `env:"FLOW_WATCHDOG_MAX_RESUMES" envDefault:"5"`
+
 	// Telegram notifications (optional)
 	TelegramBotToken      string `env:"TELEGRAM_BOT_TOKEN"`
 	TelegramChatID        string `env:"TELEGRAM_CHAT_ID"`

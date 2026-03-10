@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"pentagi/pkg/cast"
 	"pentagi/pkg/csum"
@@ -28,6 +29,38 @@ func wrapError(ctx context.Context, msg string, err error) error {
 	}
 	logrus.WithContext(ctx).WithError(err).Error(msg)
 	return fmt.Errorf("%s: %w", msg, err)
+}
+
+// checkDelegationAllowed verifies that nesting depth and remaining time
+// permit spawning another nested agent chain. Returns a user-friendly error
+// message string (empty if delegation is allowed).
+func checkDelegationAllowed(ctx context.Context, agentName string) string {
+	maxDepth := getMaxNestingDepth()
+	depth := getNestingDepth(ctx)
+	if depth >= maxDepth {
+		return fmt.Sprintf(
+			"Maximum agent delegation depth reached (%d/%d). "+
+				"Cannot delegate to %s. Use terminal and file tools directly "+
+				"instead of delegating to another agent. "+
+				"Write scripts directly, use 'apt-get install' in terminal, etc.",
+			depth, maxDepth, agentName,
+		)
+	}
+
+	// Deadline gating: block delegation if <30% of timeout remains
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		threshold := getSubtaskMaxDuration() * 3 / 10
+		if remaining < threshold {
+			return fmt.Sprintf(
+				"Insufficient time remaining (%v) for delegation to %s. "+
+					"Use terminal tool directly to complete the task.",
+				remaining.Round(time.Second), agentName,
+			)
+		}
+	}
+
+	return ""
 }
 
 func wrapErrorEndAgentSpan(ctx context.Context, span langfuse.Agent, msg string, err error) error {
@@ -235,6 +268,11 @@ func (fp *flowProvider) GetCoderHandler(ctx context.Context, taskID, subtaskID *
 	}
 
 	coderHandler := func(ctx context.Context, action tools.CoderAction) (string, error) {
+		if msg := checkDelegationAllowed(ctx, "coder"); msg != "" {
+			logrus.WithContext(ctx).WithField("depth", getNestingDepth(ctx)).Warn("coder delegation blocked: " + msg)
+			return "", fmt.Errorf("%s", msg)
+		}
+
 		coderContext := map[string]map[string]any{
 			"user": {
 				"Question": action.Question,
@@ -332,6 +370,11 @@ func (fp *flowProvider) GetInstallerHandler(ctx context.Context, taskID, subtask
 	}
 
 	installerHandler := func(ctx context.Context, action tools.MaintenanceAction) (string, error) {
+		if msg := checkDelegationAllowed(ctx, "installer"); msg != "" {
+			logrus.WithContext(ctx).WithField("depth", getNestingDepth(ctx)).Warn("installer delegation blocked: " + msg)
+			return "", fmt.Errorf("%s", msg)
+		}
+
 		installerContext := map[string]map[string]any{
 			"user": {
 				"Question": action.Question,
@@ -566,6 +609,11 @@ func (fp *flowProvider) GetPentesterHandler(ctx context.Context, taskID, subtask
 	}
 
 	pentesterHandler := func(ctx context.Context, action tools.PentesterAction) (string, error) {
+		if msg := checkDelegationAllowed(ctx, "pentester"); msg != "" {
+			logrus.WithContext(ctx).WithField("depth", getNestingDepth(ctx)).Warn("pentester delegation blocked: " + msg)
+			return "", fmt.Errorf("%s", msg)
+		}
+
 		// Load persisted execution state for this subtask (if any).
 		var subtaskContext string
 		if subtaskID != nil {

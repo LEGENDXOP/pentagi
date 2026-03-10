@@ -36,6 +36,9 @@ const (
 	delayBetweenRetries         = 5 * time.Second
 	maxToolCallsPerSubtask      = 50               // hard cap per subtask
 	defaultSubtaskDuration      = 15 * time.Minute  // default hard time limit per subtask
+	defaultMaxNestingDepth      = 2                  // primary_agent(0) → pentester(1) → terminal OK, pentester→coder blocked at depth 2
+	nestedTimeoutDepth1         = 15 * time.Minute   // timeout for depth-1 nested agents
+	nestedTimeoutDepth2         = 10 * time.Minute   // timeout for depth-2 nested agents (if ever reached)
 )
 
 // getSubtaskMaxDuration returns the subtask timeout, configurable via
@@ -47,6 +50,94 @@ func getSubtaskMaxDuration() time.Duration {
 		}
 	}
 	return defaultSubtaskDuration
+}
+
+// getMaxNestingDepth returns the maximum allowed agent delegation depth,
+// configurable via MAX_NESTING_DEPTH env var. Defaults to 2.
+func getMaxNestingDepth() int {
+	if v := os.Getenv("MAX_NESTING_DEPTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxNestingDepth
+}
+
+// nestingDepthKey is a context key for tracking agent delegation depth.
+type nestingDepthKey struct{}
+
+// getNestingDepth extracts the current nesting depth from context. Returns 0 if unset.
+func getNestingDepth(ctx context.Context) int {
+	if v, ok := ctx.Value(nestingDepthKey{}).(int); ok {
+		return v
+	}
+	return 0
+}
+
+// withIncrementedDepth returns a new context with the nesting depth incremented by 1.
+func withIncrementedDepth(ctx context.Context) context.Context {
+	return context.WithValue(ctx, nestingDepthKey{}, getNestingDepth(ctx)+1)
+}
+
+// getNestedTimeout returns the appropriate timeout for a given nesting depth.
+// Nested agents get their own FRESH timeout to prevent parent deadline starvation.
+func getNestedTimeout(depth int) time.Duration {
+	switch {
+	case depth <= 0:
+		return getSubtaskMaxDuration()
+	case depth == 1:
+		return nestedTimeoutDepth1
+	default:
+		return nestedTimeoutDepth2
+	}
+}
+
+// mergedContext creates a context that inherits values from valueCtx but
+// cancels when EITHER the parent cancel context OR the timeout expires.
+// This ensures abort signals from the user still propagate to nested agents
+// while giving them a fresh deadline.
+type mergedContext struct {
+	context.Context // carries values + deadline from timeout context
+	parentCancel    context.Context
+}
+
+func (mc *mergedContext) Done() <-chan struct{} {
+	// We need a merged done channel. Use a goroutine to select on both.
+	// This is created lazily and cached — but for simplicity we use a goroutine approach.
+	// In practice, the timeout context's Done() is sufficient because we also
+	// check parentCancel in the Err() method.
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-mc.Context.Done():
+			close(done)
+		case <-mc.parentCancel.Done():
+			close(done)
+		}
+	}()
+	return done
+}
+
+func (mc *mergedContext) Err() error {
+	if err := mc.Context.Err(); err != nil {
+		return err
+	}
+	return mc.parentCancel.Err()
+}
+
+// newNestedContext creates a fresh timeout context for nested agent chains
+// that still respects parent cancellation (e.g., user abort).
+func newNestedContext(parentCtx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	// Detach from parent's deadline but keep all context values
+	freshCtx := context.WithoutCancel(parentCtx)
+	timeoutCtx, cancel := context.WithTimeout(freshCtx, timeout)
+
+	// Wrap so that parent cancellation also cancels us
+	merged := &mergedContext{
+		Context:      timeoutCtx,
+		parentCancel: parentCtx,
+	}
+	return merged, cancel
 }
 
 type callResult struct {
@@ -144,8 +235,23 @@ func (fp *flowProvider) performAgentChain(
 	// Retrieve the attack budget manager from context (if attached by the flow).
 	attackBudget := GetAttackBudget(ctx)
 
-	// Hard time limit per subtask to prevent infinite execution
-	ctx, timeoutCancel := context.WithTimeout(ctx, getSubtaskMaxDuration())
+	// Track nesting depth: increment for this level of delegation.
+	depth := getNestingDepth(ctx)
+	ctx = withIncrementedDepth(ctx)
+
+	// Hard time limit per subtask to prevent infinite execution.
+	// For nested agents (depth > 0), use a FRESH timeout detached from the parent's
+	// deadline to prevent the shared-deadline starvation problem where each nesting
+	// level eats into a single 45-minute budget.
+	var timeoutCancel context.CancelFunc
+	if depth == 0 {
+		// Top-level: standard timeout inheriting parent context
+		ctx, timeoutCancel = context.WithTimeout(ctx, getSubtaskMaxDuration())
+	} else {
+		// Nested: fresh timeout that still respects parent cancellation
+		nestedTimeout := getNestedTimeout(depth)
+		ctx, timeoutCancel = newNestedContext(ctx, nestedTimeout)
+	}
 	defer timeoutCancel()
 
 	for {
