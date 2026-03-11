@@ -248,7 +248,8 @@ func (em *ExecutionMetrics) Snapshot(startTime time.Time) ExecutionMetrics {
 
 // injectMetricsIntoSystemPrompt replaces or inserts the <execution_metrics> block
 // in a rendered system prompt. This avoids full template re-rendering.
-func injectMetricsIntoSystemPrompt(systemPrompt string, metrics ExecutionMetrics) string {
+// timeRemainingMinutes is injected when >= 0 (pass -1 to omit).
+func injectMetricsIntoSystemPrompt(systemPrompt string, metrics ExecutionMetrics, timeRemainingMinutes int) string {
 	metricsBlock := fmt.Sprintf(
 		"<execution_metrics>\n"+
 			"  <tool_calls_made>%d</tool_calls_made>\n"+
@@ -266,17 +267,56 @@ func injectMetricsIntoSystemPrompt(systemPrompt string, metrics ExecutionMetrics
 	startIdx := strings.Index(systemPrompt, startTag)
 	endIdx := strings.Index(systemPrompt, endTag)
 	if startIdx >= 0 && endIdx > startIdx {
-		return systemPrompt[:startIdx] + metricsBlock + systemPrompt[endIdx+len(endTag):]
+		systemPrompt = systemPrompt[:startIdx] + metricsBlock + systemPrompt[endIdx+len(endTag):]
+	} else {
+		// Insert before </anti_loop_protocol> if present
+		insertPoint := strings.Index(systemPrompt, "</anti_loop_protocol>")
+		if insertPoint >= 0 {
+			systemPrompt = systemPrompt[:insertPoint] + metricsBlock + "\n" + systemPrompt[insertPoint:]
+		} else {
+			// Fallback: append to end
+			systemPrompt = systemPrompt + "\n" + metricsBlock
+		}
 	}
 
-	// Insert before </anti_loop_protocol> if present
-	insertPoint := strings.Index(systemPrompt, "</anti_loop_protocol>")
-	if insertPoint >= 0 {
-		return systemPrompt[:insertPoint] + metricsBlock + "\n" + systemPrompt[insertPoint:]
+	// Inject or replace the <time_remaining> block so agents can prioritize graceful completion.
+	if timeRemainingMinutes >= 0 {
+		urgency := "normal"
+		switch {
+		case timeRemainingMinutes < 5:
+			urgency = "CRITICAL"
+		case timeRemainingMinutes < 10:
+			urgency = "LOW"
+		}
+
+		timeBlock := fmt.Sprintf(
+			"<time_remaining>\n"+
+				"  <minutes>%d</minutes>\n"+
+				"  <urgency>%s</urgency>\n"+
+				"</time_remaining>",
+			timeRemainingMinutes,
+			urgency,
+		)
+
+		trStartTag := "<time_remaining>"
+		trEndTag := "</time_remaining>"
+		trStartIdx := strings.Index(systemPrompt, trStartTag)
+		trEndIdx := strings.Index(systemPrompt, trEndTag)
+		if trStartIdx >= 0 && trEndIdx > trStartIdx {
+			systemPrompt = systemPrompt[:trStartIdx] + timeBlock + systemPrompt[trEndIdx+len(trEndTag):]
+		} else {
+			// Insert after </execution_metrics> if present
+			metricsEndIdx := strings.Index(systemPrompt, endTag)
+			if metricsEndIdx >= 0 {
+				insertAt := metricsEndIdx + len(endTag)
+				systemPrompt = systemPrompt[:insertAt] + "\n" + timeBlock + systemPrompt[insertAt:]
+			} else {
+				systemPrompt = systemPrompt + "\n" + timeBlock
+			}
+		}
 	}
 
-	// Fallback: append to end
-	return systemPrompt + "\n" + metricsBlock
+	return systemPrompt
 }
 
 // ToolHistoryEntry records a single tool invocation with truncated payload.

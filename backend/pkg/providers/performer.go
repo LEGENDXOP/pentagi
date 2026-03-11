@@ -35,11 +35,11 @@ const (
 	maxReflectorCallsPerChain   = 3
 	delayBetweenRetries         = 5 * time.Second
 	defaultMaxToolCallsPerSubtask = 100              // hard cap per subtask (configurable via MAX_TOOL_CALLS_PER_SUBTASK)
-	defaultSubtaskDuration      = 20 * time.Minute   // default hard time limit per subtask
+	defaultSubtaskDuration      = 30 * time.Minute   // default hard time limit per subtask
 	defaultMaxNestingDepth      = 4                   // primary_agent(0) → pentester(1) → coder(2) → installer(3) all allowed
-	nestedTimeoutDepth1         = 15 * time.Minute    // timeout for depth-1 nested agents
-	nestedTimeoutDepth2         = 12 * time.Minute    // timeout for depth-2 nested agents
-	nestedTimeoutDepth3         = 10 * time.Minute    // timeout for depth-3 nested agents
+	nestedTimeoutDepth1         = 25 * time.Minute    // timeout for depth-1 nested agents
+	nestedTimeoutDepth2         = 20 * time.Minute    // timeout for depth-2 nested agents
+	nestedTimeoutDepth3         = 15 * time.Minute    // timeout for depth-3 nested agents
 
 	// toolCallLimitWarningBuffer is how many calls before the limit we inject
 	// a "wrap up" warning into the chain, giving the agent a chance to save findings.
@@ -327,11 +327,21 @@ func (fp *flowProvider) performAgentChain(
 			}
 		}
 
-		// Refresh system prompt with current execution metrics
+		// Refresh system prompt with current execution metrics and time remaining.
 		if metrics.ToolCallCount > 0 && len(chain) > 0 {
 			if chain[0].Role == llms.ChatMessageTypeSystem && len(chain[0].Parts) > 0 {
 				if text, ok := chain[0].Parts[0].(llms.TextContent); ok {
-					updated := injectMetricsIntoSystemPrompt(text.Text, metrics.Snapshot(metricsStartTime))
+					// Compute time remaining from context deadline.
+					timeRemainingMinutes := -1 // -1 = omit from prompt
+					if deadline, ok := ctx.Deadline(); ok {
+						remaining := time.Until(deadline)
+						if remaining > 0 {
+							timeRemainingMinutes = int(remaining.Minutes())
+						} else {
+							timeRemainingMinutes = 0
+						}
+					}
+					updated := injectMetricsIntoSystemPrompt(text.Text, metrics.Snapshot(metricsStartTime), timeRemainingMinutes)
 					chain[0].Parts[0] = llms.TextContent{Text: updated}
 				}
 			}
