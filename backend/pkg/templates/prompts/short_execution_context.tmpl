@@ -27,6 +27,7 @@
 <id>{{.ID}}</id>
 <title>{{.Title}}</title>
 <status>{{.Status}}</status>
+{{if .Result}}<result_summary>{{truncate .Result 500}}</result_summary>{{end}}
 </subtask>
 {{end}}
 {{else}}

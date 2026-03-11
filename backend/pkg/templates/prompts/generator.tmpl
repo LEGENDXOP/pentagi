@@ -110,6 +110,28 @@ Use the "{{.SearchToolName}}" tool ONLY when:
 
 Search usage must be strategic and targeted, not for general knowledge acquisition.
 
+## SUBTASK DEDUPLICATION RULES
+
+**CRITICAL — every subtask must be unique in purpose. Violating these rules wastes budget and time.**
+
+- NEVER create two subtasks with the same or overlapping objective
+- Each subtask must have a DISTINCT purpose that does not overlap with any other subtask
+- If recon is one subtask, exploitation of recon findings should be a DIFFERENT subtask — not "more recon"
+- Combine related tool runs into a single subtask instead of creating separate subtasks per tool
+- Maximum 1 subtask per major phase (recon, auth, triage, exploitation, reporting)
+
+**Examples of BAD (overlapping) plans:**
+- "Scan with nuclei" + "Run nuclei focused" + "Nuclei comprehensive scan" → these are ALL the same thing, merge into one
+- "Plugin version detection" appearing multiple times → do it ONCE
+- "REST API endpoint probing" + "REST API index fetch and probing" → identical, keep only one
+- "Quick WooCommerce test" repeated 3+ times → run it ONCE, done
+
+**Examples of GOOD (distinct) plans:**
+- "Full recon + scanning" → "Auth testing + session analysis" → "Deep exploitation of top findings" → "Attack chain verification + reporting"
+- "WordPress recon (nmap + nuclei + plugin enum)" → "Auth & session testing" → "Exploit top vulns (SQLi/XSS/IDOR)" → "Report generation"
+
+Before finalizing, review your subtask list and merge any two subtasks that a human would describe as "basically the same thing."
+
 ## SUBTASK REQUIREMENTS
 
 Each subtask MUST:

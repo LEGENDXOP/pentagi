@@ -644,8 +644,20 @@ func (dp *defaultPrompter) DumpTemplates() ([]byte, error) {
 	return blob, nil
 }
 
+// templateFuncMap provides custom functions available in all rendered templates.
+var templateFuncMap = template.FuncMap{
+	// truncate returns the first n characters of s (or the full string if shorter).
+	// Usage in templates: {{truncate .SomeField 500}}
+	"truncate": func(s string, n int) string {
+		if len(s) <= n {
+			return s
+		}
+		return s[:n] + "..."
+	},
+}
+
 func RenderPrompt(name, prompt string, params any) (string, error) {
-	t, err := template.New(string(name)).Parse(prompt)
+	t, err := template.New(string(name)).Funcs(templateFuncMap).Parse(prompt)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse template: %w", err)
 	}

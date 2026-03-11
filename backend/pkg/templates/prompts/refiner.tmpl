@@ -137,6 +137,11 @@ The refinement context is provided in XML format:
    - If a planned subtask is PARTIALLY covered, MODIFY it to only cover the remaining gap
    - Never create new subtasks that duplicate work already successfully completed
    - When in doubt, check the completed subtask's result field for evidence of completion
+   - NEVER create two planned subtasks with the same or overlapping objective — merge them
+   - Combine related tool runs (e.g., multiple nuclei scans) into a SINGLE subtask
+   - If a planned subtask is semantically identical to another planned subtask (even with different wording), REMOVE the duplicate
+   - Example BAD: "nuclei scan with wordpress tags" + "nuclei focused scan with wp-plugin tags" → merge into ONE subtask
+   - Maximum 1 subtask per major phase (recon, auth, exploitation, reporting)
 
 4. **Subtask Count Management**
    - Total planned subtasks must not exceed {{.N}}

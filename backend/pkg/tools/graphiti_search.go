@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"pentagi/pkg/graphiti"
@@ -67,6 +68,11 @@ type GraphitiSearchTool struct {
 	taskID         *int64
 	subtaskID      *int64
 	graphitiClient graphitiSearcher
+
+	// queryCache deduplicates identical searches within the same subtask.
+	// Key: normalized "searchType:query" string. Value: cached result.
+	queryCache map[string]string
+	cacheMu    sync.Mutex
 }
 
 // NewGraphitiSearchTool creates a new Graphiti search tool
@@ -80,6 +86,7 @@ func NewGraphitiSearchTool(
 		taskID:         taskID,
 		subtaskID:      subtaskID,
 		graphitiClient: graphitiClient,
+		queryCache:     make(map[string]string),
 	}
 }
 
@@ -116,6 +123,18 @@ func (t *GraphitiSearchTool) Handle(ctx context.Context, name string, args json.
 		logger.Error("search_type parameter is required")
 		return "", fmt.Errorf("search_type parameter is required")
 	}
+
+	// Dedup: check if the same search was already executed in this subtask.
+	// Cache key is normalized (lowercase, trimmed) "searchType:query".
+	cacheKey := strings.ToLower(strings.TrimSpace(searchArgs.SearchType)) + ":" +
+		strings.ToLower(strings.TrimSpace(searchArgs.Query))
+	t.cacheMu.Lock()
+	if cached, ok := t.queryCache[cacheKey]; ok {
+		t.cacheMu.Unlock()
+		logger.WithField("cache_key", cacheKey).Warn("duplicate search skipped — returning cached result")
+		return "[CACHED RESULT — identical query already executed this subtask. Use the results you have.]\n\n" + cached, nil
+	}
+	t.cacheMu.Unlock()
 
 	ctx, observation := obs.Observer.NewObservation(ctx)
 	observationObject := &graphiti.Observation{

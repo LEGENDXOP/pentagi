@@ -1,0 +1,34 @@
+[36mINFO[0m[0000] [Nav] NEW:                                   
+[36mINFO[0m[0000] [Nav] NEW:                                   
+[36mINFO[0m[0000] [Nav] PUSH: welcome -> main_menu             
+[36mINFO[0m[0000] [Nav] NEW:                                   
+[36mINFO[0m[0000] [Nav] PUSH: welcome -> main_menu             
+[36mINFO[0m[0000] [Nav] PUSH: main_menu -> llm_providers       
+[36mINFO[0m[0000] [Nav] PUSH: llm_providers -> llm_provider_form§openai 
+[36mINFO[0m[0000] [Nav] NEW:                                   
+[36mINFO[0m[0000] [Nav] PUSH: welcome -> main_menu             
+[36mINFO[0m[0000] [Nav] PUSH: main_menu -> llm_providers       
+[36mINFO[0m[0000] [Nav] NEW:                                   
+[36mINFO[0m[0000] [Nav] PUSH: welcome -> main_menu             
+[36mINFO[0m[0000] [Nav] PUSH: main_menu -> llm_providers       
+[36mINFO[0m[0000] [Nav] PUSH: llm_providers -> llm_provider_form§openai 
+[36mINFO[0m[0000] [Nav] POP: llm_provider_form§openai -> llm_providers 
+[36mINFO[0m[0000] [Nav] NEW:                                   
+[36mINFO[0m[0000] [Nav] NEW:                                   
+[36mINFO[0m[0000] [Nav] PUSH: welcome -> main_menu             
+[36mINFO[0m[0000] [Nav] NEW:                                   
+[36mINFO[0m[0000] [Nav] NEW:                                   
+[36mINFO[0m[0000] [Nav] PUSH: welcome -> main_menu             
+[36mINFO[0m[0000] [Nav] PUSH: main_menu -> tools               
+[36mINFO[0m[0000] [Nav] PUSH: tools -> docker_form             
+[36mINFO[0m[0000] [Nav] NEW:                                   
+[36mINFO[0m[0000] [Nav] PUSH: welcome -> main_menu             
+[36mINFO[0m[0000] [Nav] PUSH: main_menu -> tools               
+[36mINFO[0m[0000] [Nav] NEW:                                   
+[36mINFO[0m[0000] [Nav] PUSH: welcome -> main_menu             
+[36mINFO[0m[0000] [Nav] PUSH: main_menu -> llm_providers       
+[36mINFO[0m[0000] [Nav] PUSH: llm_providers -> llm_provider_form§openai 
+[36mINFO[0m[0000] [Nav] POP: llm_provider_form§openai -> llm_providers 
+[36mINFO[0m[0000] [Nav] PUSH: llm_providers -> tools           
+[36mINFO[0m[0000] [Nav] PUSH: tools -> docker_form             
+[36mINFO[0m[0000] [Nav] NEW: main_menu -> tools                
