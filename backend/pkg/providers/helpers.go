@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -39,12 +41,16 @@ const (
 const repeatingWindowSize = 10
 
 type repeatingDetector struct {
-	history   []llms.FunctionCall
-	threshold int
+	history    []llms.FunctionCall
+	threshold  int
+	readCounts map[string]int // per-file path → read count this subtask
 }
 
 func newRepeatingDetector() *repeatingDetector {
-	return &repeatingDetector{threshold: RepeatingToolCallThreshold}
+	return &repeatingDetector{
+		threshold:  RepeatingToolCallThreshold,
+		readCounts: make(map[string]int),
+	}
 }
 
 func (rd *repeatingDetector) detect(toolCall llms.ToolCall) bool {
@@ -104,6 +110,93 @@ func (rd *repeatingDetector) isReadOnlyCall(fc llms.FunctionCall) bool {
 		}
 	}
 	return false
+}
+
+// readOnlyCmdPattern matches read-only shell commands (cat, head, tail) followed by a file path.
+// It captures the first non-option argument as the file path.
+var readOnlyCmdPattern = regexp.MustCompile(`(?:^|\s)(cat|head|tail)\s+(?:-[^\s]*\s+)*([^\s|;&>]+)`)
+
+// checkReadCap enforces a soft cap on per-file read operations. Read-only calls
+// are exempt from the repeat detector's detect() method to let agents bootstrap,
+// but without a cap they can read the same file 20+ times in infinite loops.
+//
+// Returns (blocked, message):
+//   - ≤2 reads:  (false, "")         — free, no warning
+//   - 3-5 reads: (false, "⚠️ ...")   — warning prepended to tool result
+//   - >5 reads:  (true, "BLOCKED...") — synthetic response, tool NOT executed
+func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, string) {
+	if !rd.isReadOnlyCall(funcCall) {
+		return false, ""
+	}
+
+	filePath := extractReadFilePath(funcCall)
+	if filePath == "" {
+		return false, ""
+	}
+
+	// Normalize to base name so /work/STATE.json and STATE.json count together.
+	key := filepath.Base(filePath)
+
+	if rd.readCounts == nil {
+		rd.readCounts = make(map[string]int)
+	}
+	rd.readCounts[key]++
+	count := rd.readCounts[key]
+
+	switch {
+	case count <= 2:
+		return false, ""
+	case count <= 5:
+		return false, fmt.Sprintf(
+			"⚠️ WARNING: You've read '%s' %d times. Content unchanged. Move to actual testing.",
+			key, count,
+		)
+	default:
+		return true, fmt.Sprintf(
+			"BLOCKED: Read of '%s' denied — already read %d times this subtask. "+
+				"The file content has not changed. Proceed with testing using the information you already have.",
+			key, count,
+		)
+	}
+}
+
+// resetReadCounts clears the per-file read counter, intended for subtask boundaries.
+func (rd *repeatingDetector) resetReadCounts() {
+	rd.readCounts = make(map[string]int)
+}
+
+// extractReadFilePath extracts the file path from a read-only tool call.
+// Handles both "file" tool with read_file action and "terminal" tool with cat/head/tail.
+func extractReadFilePath(fc llms.FunctionCall) string {
+	switch fc.Name {
+	case "file":
+		// Parse {"action":"read_file","path":"/work/STATE.json",...}
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(fc.Arguments), &args); err != nil {
+			return ""
+		}
+		if action, ok := args["action"].(string); ok && action == "read_file" {
+			if p, ok := args["path"].(string); ok {
+				return p
+			}
+		}
+	case "terminal":
+		// Parse {"input":"cat /work/STATE.json 2>/dev/null || echo NO",...}
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(fc.Arguments), &args); err != nil {
+			return ""
+		}
+		input, ok := args["input"].(string)
+		if !ok {
+			return ""
+		}
+		// Match cat/head/tail commands and extract the file path argument.
+		matches := readOnlyCmdPattern.FindStringSubmatch(input)
+		if len(matches) >= 3 {
+			return matches[2]
+		}
+	}
+	return ""
 }
 
 func (rd *repeatingDetector) clearCallArguments(toolCall *llms.FunctionCall) llms.FunctionCall {
@@ -499,6 +592,85 @@ func (th *ToolHistory) ShouldTriggerProactiveReflector(totalCalls int) (bool, st
 	}
 
 	return false, ""
+}
+
+// filterReflectorSuggestions removes read-only state file checks from reflector
+// corrective tool calls. This prevents the reflector from suggesting "check STATE.json"
+// or "review FINDINGS.md" which causes the agent to enter an infinite read loop.
+func filterReflectorSuggestions(suggestions []llms.ToolCall) []llms.ToolCall {
+	filtered := make([]llms.ToolCall, 0, len(suggestions))
+	for _, tc := range suggestions {
+		if isStateReadCall(tc) {
+			continue // skip read-only state checks from reflector
+		}
+		filtered = append(filtered, tc)
+	}
+	if len(filtered) == 0 && len(suggestions) > 0 {
+		// All suggestions were filtered out — this means reflector only suggested reads.
+		// Don't inject anything; the agent will continue on its own.
+		return nil
+	}
+	return filtered
+}
+
+// isStateReadCall returns true if the tool call is a read-only operation targeting
+// state files (STATE.json, FINDINGS.md, HANDOFF.md, RESUME.md). These are the
+// files the reflector commonly (and incorrectly) suggests re-reading.
+func isStateReadCall(tc llms.ToolCall) bool {
+	if tc.FunctionCall == nil {
+		return false
+	}
+	args := strings.ToLower(tc.FunctionCall.Arguments)
+	stateFiles := []string{"state.json", "findings.md", "handoff.md", "resume.md"}
+	readPatterns := []string{`"cat `, `"read_file"`, `"head `, `"tail `, `"cat /work/`}
+
+	for _, f := range stateFiles {
+		if strings.Contains(args, f) {
+			for _, p := range readPatterns {
+				if strings.Contains(args, p) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// buildResumeContent generates the RESUME.md content string from tool history and metrics.
+func buildResumeContent(toolHistory *ToolHistory, metrics *ExecutionMetrics) string {
+	last10 := toolHistory.GetLast(10)
+	if len(last10) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# RESUME CONTEXT (auto-generated — do not modify)\n")
+	sb.WriteString(fmt.Sprintf("## Generated at: %s\n", time.Now().UTC().Format(time.RFC3339)))
+	sb.WriteString(fmt.Sprintf("## Tool calls completed: %d\n\n", metrics.ToolCallCount))
+
+	sb.WriteString("## Last 10 Actions Taken\n")
+	for i, entry := range last10 {
+		status := "OK"
+		if entry.IsError {
+			status = "ERROR"
+		}
+		argSnippet := entry.Arguments
+		if len(argSnippet) > 150 {
+			argSnippet = argSnippet[:150] + "..."
+		}
+		sb.WriteString(fmt.Sprintf("%d. [%s] %s — %s\n", i+1, status, entry.Name, argSnippet))
+	}
+
+	sb.WriteString("\n## FILES ALREADY READ (DO NOT re-read)\n")
+	sb.WriteString("STATE.json, FINDINGS.md, HANDOFF.md — all already verified.\n")
+	sb.WriteString("\n## INSTRUCTION ON RESUME\n")
+	sb.WriteString("If you are resuming after a timeout:\n")
+	sb.WriteString("1. Read THIS file (RESUME.md) ONCE\n")
+	sb.WriteString("2. DO NOT re-read STATE.json, FINDINGS.md, or HANDOFF.md\n")
+	sb.WriteString("3. DO NOT re-run bootstrap (jq install, mkdir evidence)\n")
+	sb.WriteString("4. Continue from where the last action left off\n")
+
+	return sb.String()
 }
 
 func (fp *flowProvider) getTasksInfo(ctx context.Context, taskID int64) (*tasksInfo, error) {

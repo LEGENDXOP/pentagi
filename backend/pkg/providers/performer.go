@@ -185,6 +185,7 @@ func (fp *flowProvider) performAgentChain(
 	var (
 		wantToStop           bool
 		detector             = newRepeatingDetector()
+		nTracker             = newNucleiTracker()
 		summarizerHandler    = fp.GetSummarizeResultHandler(taskID, subtaskID)
 		toolCallCount        int
 		summarizerFailures   int
@@ -402,6 +403,10 @@ func (fp *flowProvider) performAgentChain(
 					logger.WithError(err).WithFields(fields).Error("failed to perform reflector")
 					return err
 				}
+				// Filter out reflector suggestions that are just state-file reads
+				if result != nil && len(result.funcCalls) > 0 {
+					result.funcCalls = filterReflectorSuggestions(result.funcCalls)
+				}
 			}
 		}
 
@@ -431,7 +436,7 @@ func (fp *flowProvider) performAgentChain(
 			metrics.AddCommand(funcName)
 			metrics.LastToolName = funcName
 
-			response, err := fp.execToolCall(ctx, chainID, idx, result, detector, executor)
+			response, err := fp.execToolCall(ctx, chainID, idx, result, detector, executor, nTracker)
 
 			// Track repeated tool calls detected by the repeating detector
 			isRepeating := strings.HasPrefix(response, "tool call '") && strings.HasSuffix(response, "' is repeating, please try another tool")
@@ -670,11 +675,20 @@ func (fp *flowProvider) performAgentChain(
 				// Proactive reflector failure is non-fatal; log and continue
 				logger.WithError(proactiveErr).Warn("proactive reflector failed, continuing execution")
 			} else if proactiveResult != nil && len(proactiveResult.funcCalls) > 0 {
-				// Reflector provided a corrective tool call — inject it as the next result
-				result = proactiveResult
-				// Re-process the corrective tool calls by continuing the loop
-				// The next iteration will pick up result.funcCalls from the reflector
-				logger.Info("proactive reflector provided corrective tool calls")
+				// Filter out read-only state file checks from reflector suggestions.
+				// The reflector often suggests "check STATE.json" or "review FINDINGS.md"
+				// which causes the agent to enter an infinite read loop.
+				filtered := filterReflectorSuggestions(proactiveResult.funcCalls)
+				if len(filtered) > 0 {
+					proactiveResult.funcCalls = filtered
+					// Reflector provided a corrective tool call — inject it as the next result
+					result = proactiveResult
+					// Re-process the corrective tool calls by continuing the loop
+					// The next iteration will pick up result.funcCalls from the reflector
+					logger.Info("proactive reflector provided corrective tool calls")
+				} else {
+					logger.Info("proactive reflector suggestions were all state-reads, skipping injection")
+				}
 			}
 		}
 
@@ -720,6 +734,7 @@ func (fp *flowProvider) execToolCall(
 	result *callResult,
 	detector *repeatingDetector,
 	executor tools.ContextToolsExecutor,
+	nTracker *nucleiTracker,
 ) (string, error) {
 	var (
 		streamID int64
@@ -746,6 +761,44 @@ func (fp *flowProvider) execToolCall(
 		"tool_call_id": toolCall.ID,
 		"msg_chain_id": chainID,
 	})
+
+	// --- Read-Only Soft Cap: check BEFORE repeat detection ---
+	// The existing isReadOnlyCall() exemption in detect() remains untouched.
+	// This is an ADDITIONAL guard that caps how many times the same file can
+	// be read in a single subtask, preventing infinite STATE.json/HANDOFF.md loops.
+	var readCapWarning string
+	if toolCall.FunctionCall != nil {
+		blocked, readCapMsg := detector.checkReadCap(*toolCall.FunctionCall)
+		if blocked {
+			logger.WithField("read_cap_msg", readCapMsg).Warn("read-only soft cap blocked tool call")
+			return readCapMsg, nil
+		}
+		// If warning (not blocked), store it to prepend to the response after execution.
+		readCapWarning = readCapMsg
+	}
+
+	// --- Nuclei Dedup: block redundant nuclei scans ---
+	if nTracker != nil && toolCall.FunctionCall != nil {
+		var nucleiTarget string
+
+		if funcName == "nuclei_scan" {
+			nucleiTarget = extractNucleiTarget(string(funcArgs))
+		} else if funcName == "terminal" {
+			var termArgs map[string]interface{}
+			if err := json.Unmarshal(funcArgs, &termArgs); err == nil {
+				if input, ok := termArgs["input"].(string); ok && strings.Contains(input, "nuclei") {
+					nucleiTarget = extractNucleiTargetFromCmd(input)
+				}
+			}
+		}
+
+		if nucleiTarget != "" {
+			if blocked, msg := nTracker.Check(nucleiTarget); blocked {
+				logger.WithField("nuclei_target", nucleiTarget).Warn("nuclei dedup blocked scan")
+				return msg, nil
+			}
+		}
+	}
 
 	if detector.detect(toolCall) {
 		response := fmt.Sprintf("tool call '%s' is repeating, please try another tool", funcName)
@@ -813,6 +866,37 @@ func (fp *flowProvider) execToolCall(
 		} else {
 			break
 		}
+	}
+
+	// --- Post-execution: record nuclei scan results for dedup ---
+	if nTracker != nil && toolCall.FunctionCall != nil {
+		if funcName == "nuclei_scan" {
+			target := extractNucleiTarget(string(funcArgs))
+			tags, severity := extractNucleiScanDetails(string(funcArgs))
+			// Count findings: crude heuristic based on response lines containing "[" (nuclei output format).
+			findCount := 0
+			for _, line := range strings.Split(response, "\n") {
+				if strings.Contains(line, "[") && strings.Contains(line, "]") {
+					findCount++
+				}
+			}
+			nTracker.Record(target, tags, severity, findCount)
+		} else if funcName == "terminal" {
+			var termArgs map[string]interface{}
+			if err := json.Unmarshal(funcArgs, &termArgs); err == nil {
+				if input, ok := termArgs["input"].(string); ok && strings.Contains(input, "nuclei") {
+					target := extractNucleiTargetFromCmd(input)
+					if target != "" {
+						nTracker.Record(target, "", "", 0)
+					}
+				}
+			}
+		}
+	}
+
+	// --- Prepend read cap warning if present ---
+	if readCapWarning != "" {
+		response = readCapWarning + "\n\n" + response
 	}
 
 	return response, nil
