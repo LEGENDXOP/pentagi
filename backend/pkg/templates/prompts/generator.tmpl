@@ -132,6 +132,32 @@ Search usage must be strategic and targeted, not for general knowledge acquisiti
 
 Before finalizing, review your subtask list and merge any two subtasks that a human would describe as "basically the same thing."
 
+## SUBTASK SCOPE RULES — ONE OBJECTIVE PER SUBTASK
+
+**CRITICAL — overloaded subtasks cause timeouts and failures. Every subtask must be tightly scoped.**
+
+- Each subtask MUST have ONE primary objective, not multiple unrelated activities
+- Maximum estimated active testing time per subtask: 30 minutes
+- If a topic has multiple sub-areas, create SEPARATE subtasks for each
+- Generator should create MORE smaller subtasks rather than FEWER overloaded ones
+
+**Examples of BAD (overloaded) subtasks:**
+- "Ninja Forms Exploitation, REST API Deep Testing & Authentication Surface Probing" → THREE objectives crammed into one subtask = guaranteed timeout
+- "XSS + SQLi + IDOR + SSRF testing across all endpoints" → FOUR attack categories = too broad
+- "Full recon + auth setup + initial exploitation" → THREE phases in one = rushed, incomplete results
+
+**Examples of GOOD (focused) subtasks:**
+- "Ninja Forms plugin exploitation (CVE analysis + form injection testing)" → ONE focused objective
+- "REST API endpoint security testing (auth, IDOR, input validation)" → ONE coherent area
+- "Authentication mechanism analysis and session testing" → ONE clear goal
+- "SQLi testing on search and filter parameters" → ONE attack type, scoped parameters
+
+**Scope test:** If a subtask title contains "and" or "&" joining UNRELATED activities, split it.
+- Related activities joined by "and" are OK: "Recon and tech fingerprinting" (both are recon)
+- Unrelated activities joined by "and" are NOT OK: "Form exploitation and API testing and auth probing" (three different things)
+
+**When in doubt, split.** Two 20-minute subtasks will always outperform one 45-minute subtask that times out at 60% completion.
+
 ## SUBTASK REQUIREMENTS
 
 Each subtask MUST:
@@ -191,12 +217,18 @@ Each subtask MUST:
    - For multi-target pentests, group by target not by phase (one subtask per target is better than one phase across all targets)
 
    **Scope guidance for pentest subtasks:**
-   - Keep subtasks focused enough to be completable in a single session, but broad enough to make meaningful progress.
-   - If a subtask covers too many unrelated areas, consider splitting it. Use judgment — 2-4 related attack categories per subtask is usually a good balance.
-   - Recon + auth setup can be combined if the target is straightforward. For complex targets, separate them.
-   - Split by target when testing multiple domains/hosts. Group related attack vectors together.
+   - ONE primary objective per subtask — this is mandatory, not a suggestion
+   - Each subtask should be completable in ≤30 minutes of active testing
+   - Maximum 1-2 RELATED attack categories per subtask (e.g., "SQLi + command injection on database endpoints" is OK)
+   - NEVER combine 3+ unrelated categories (e.g., "XSS + IDOR + SSRF + auth bypass" = instant timeout)
+   - Recon + auth setup can be combined ONLY if the target is straightforward (single domain, simple stack)
+   - For complex targets: separate recon, auth, and each attack category into individual subtasks
+   - Split by target when testing multiple domains/hosts
+   - BAD: "Plugin exploitation + REST API testing + auth probing" (3 unrelated objectives)
    - BAD: One subtask that tries to do everything (recon + auth + 6 attack categories + reporting)
-   - GOOD: Logically grouped subtasks that each advance the assessment meaningfully
+   - GOOD: "Ninja Forms plugin exploitation" (single focused objective)
+   - GOOD: "REST API authentication and authorization testing" (one coherent area)
+   - When a subtask would take >30 min → SPLIT IT. Two focused subtasks > one that times out.
 
 ## CRITICAL CONTEXT
 

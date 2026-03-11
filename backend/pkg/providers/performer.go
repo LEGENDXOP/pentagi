@@ -813,6 +813,20 @@ func (fp *flowProvider) execToolCall(
 		}
 	}
 
+	// --- Browser Automation Install Blocker ---
+	// Prevent the agent from installing playwright, puppeteer, chromium, etc.
+	// These are unnecessary because browser tools (browser_navigate, browser_click, etc.)
+	// are already available as built-in agent tools backed by Playwright.
+	if funcName == "terminal" {
+		var termArgs map[string]interface{}
+		if err := json.Unmarshal(funcArgs, &termArgs); err == nil {
+			if input, ok := termArgs["input"].(string); ok && isBrowserAutomationInstall(input) {
+				logger.WithField("blocked_cmd", input).Warn("blocked browser automation package install attempt")
+				return blockedBrowserInstallMessage, nil
+			}
+		}
+	}
+
 	if detector.detect(toolCall) {
 		response := fmt.Sprintf("tool call '%s' is repeating, please try another tool", funcName)
 
