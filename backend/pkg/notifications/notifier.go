@@ -119,8 +119,20 @@ func NewNotificationManager(telegram *TelegramNotifier, enabled bool, quietTZOff
 // This method is safe to call from any goroutine and never blocks the caller.
 func (nm *NotificationManager) Notify(event NotificationEvent) {
 	if !nm.enabled || nm.telegram == nil {
+		nm.logger.WithFields(logrus.Fields{
+			"enabled":      nm.enabled,
+			"has_telegram": nm.telegram != nil,
+			"event_type":   event.Type,
+			"flow_id":      event.FlowID,
+		}).Debug("notification dropped: manager disabled or no telegram")
 		return
 	}
+
+	nm.logger.WithFields(logrus.Fields{
+		"event_type": event.Type,
+		"flow_id":    event.FlowID,
+		"status":     event.Status,
+	}).Debug("dispatching notification event")
 
 	// Fire-and-forget: never let notification failures affect the caller
 	go nm.processEvent(event)
@@ -172,7 +184,8 @@ func (nm *NotificationManager) handleFlowStatus(event NotificationEvent) {
 	case "running":
 		// Flow started — notify
 		if nm.isQuietHours() {
-			return // don't spam on flow starts during quiet hours
+			nm.logger.WithField("flow_id", event.FlowID).Info("flow start notification suppressed (quiet hours)")
+			return
 		}
 		msg := fmt.Sprintf("▶️ <b>Flow #%d Started</b>\n%s", event.FlowID, escapeHTML(event.Title))
 		nm.telegram.Send(msg)

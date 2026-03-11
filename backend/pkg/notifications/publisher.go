@@ -22,6 +22,11 @@ type NotifyingPublisher struct {
 	notifier  *NotificationManager
 	flowStart time.Time
 
+	// Flow status dedup: track the last notified status to avoid duplicate
+	// notifications when FlowUpdated fires multiple times for the same status
+	// (e.g. on rename, container changes, or repeated SetStatus calls).
+	notifiedStatus sync.Map // statusString -> bool (set once per status)
+
 	// Phase tracking for detecting phase changes
 	lastPhase   string
 	lastPhaseMu sync.Mutex
@@ -36,9 +41,14 @@ type NotifyingPublisher struct {
 // If notifier is nil or disabled, returns the original publisher unchanged.
 func WrapPublisher(pub subscriptions.FlowPublisher, notifier *NotificationManager) subscriptions.FlowPublisher {
 	if notifier == nil || !notifier.enabled {
+		logrus.WithFields(logrus.Fields{
+			"notifier_nil": notifier == nil,
+			"enabled":      notifier != nil && notifier.enabled,
+		}).Debug("WrapPublisher: notifier inactive, returning raw publisher")
 		return pub
 	}
 
+	logrus.WithField("flow_id", pub.GetFlowID()).Debug("WrapPublisher: wrapping publisher with notifications")
 	return &NotifyingPublisher{
 		inner:     pub,
 		notifier:  notifier,
@@ -72,6 +82,11 @@ func (p *NotifyingPublisher) FlowUpdated(ctx context.Context, flow database.Flow
 }
 
 // notifyFlowStatus emits a notification event based on flow status.
+// It deduplicates by tracking which statuses have already been notified:
+// each of "running", "finished", "failed" is sent at most once per flow.
+// This prevents duplicate Telegram messages when FlowUpdated fires multiple
+// times for the same status (e.g. on rename, container changes, or repeated
+// SetStatus calls during created→waiting→running transitions).
 func (p *NotifyingPublisher) notifyFlowStatus(flow database.Flow) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -79,9 +94,14 @@ func (p *NotifyingPublisher) notifyFlowStatus(flow database.Flow) {
 		}
 	}()
 
+	statusStr := string(flow.Status)
+
 	switch flow.Status {
 	case database.FlowStatusRunning:
-		// Only notify on first transition to running (flow start)
+		// Only notify ONCE on first transition to running
+		if _, already := p.notifiedStatus.LoadOrStore(statusStr, true); already {
+			return
+		}
 		p.notifier.Notify(NotificationEvent{
 			Type:   EventFlowStatusChange,
 			FlowID: flow.ID,
@@ -90,6 +110,10 @@ func (p *NotifyingPublisher) notifyFlowStatus(flow database.Flow) {
 		})
 
 	case database.FlowStatusFinished:
+		// Only notify ONCE on first transition to finished
+		if _, already := p.notifiedStatus.LoadOrStore(statusStr, true); already {
+			return
+		}
 		p.notifier.Notify(NotificationEvent{
 			Type:     EventFlowStatusChange,
 			FlowID:   flow.ID,
@@ -99,6 +123,10 @@ func (p *NotifyingPublisher) notifyFlowStatus(flow database.Flow) {
 		})
 
 	case database.FlowStatusFailed:
+		// Only notify ONCE on first transition to failed
+		if _, already := p.notifiedStatus.LoadOrStore(statusStr, true); already {
+			return
+		}
 		p.notifier.Notify(NotificationEvent{
 			Type:   EventFlowStatusChange,
 			FlowID: flow.ID,
@@ -232,14 +260,26 @@ func (p *NotifyingPublisher) scanSubtasksForFindings(subtasks []database.Subtask
 }
 
 // scanTextForFindings extracts finding events from text and notifies.
+// It detects multiple finding formats commonly used in pentest reports:
+//   - ### [CRITICAL] / ### [HIGH] / ### [MEDIUM] / ### [LOW]  (markdown headers)
+//   - [FINDING ...] / [finding ...]                            (bracket tags)
+//   - F-001: / F-002: etc.                                     (finding IDs)
+//   - [VULN_TYPE: ...]                                         (vuln type tags)
+//   - Lines with severity + vulnerability/finding/exploit keywords
 func (p *NotifyingPublisher) scanTextForFindings(text string) {
 	if text == "" {
 		return
 	}
 
-	// Quick check: skip if no finding-related keywords
-	if !strings.Contains(text, "FINDING") && !strings.Contains(text, "finding") &&
-		!strings.Contains(text, "vulnerability") && !strings.Contains(text, "Vulnerability") {
+	textUpper := strings.ToUpper(text)
+
+	// Quick check: skip if no finding-related keywords present anywhere
+	hasFindingKeyword := strings.Contains(textUpper, "FINDING") ||
+		strings.Contains(textUpper, "VULNERABILITY") ||
+		strings.Contains(textUpper, "VULN") ||
+		strings.Contains(textUpper, "EXPLOIT") ||
+		strings.Contains(textUpper, "F-0") // F-001, F-002, etc.
+	if !hasFindingKeyword {
 		return
 	}
 
@@ -252,15 +292,52 @@ func (p *NotifyingPublisher) scanTextForFindings(text string) {
 			continue
 		}
 
+		lineUpper := strings.ToUpper(line)
 		isFinding := false
-		if strings.Contains(line, "[FINDING") || strings.Contains(line, "[finding") {
-			isFinding = true
-		} else if (strings.Contains(line, "CRITICAL") || strings.Contains(line, "HIGH") ||
-			strings.Contains(line, "MEDIUM") || strings.Contains(line, "LOW")) &&
-			(strings.Contains(strings.ToLower(line), "vuln") ||
-				strings.Contains(strings.ToLower(line), "finding") ||
-				strings.Contains(strings.ToLower(line), "exploit")) {
-			isFinding = true
+
+		// Pattern 1: Markdown severity headers — ### [CRITICAL], ### [HIGH], etc.
+		if strings.HasPrefix(line, "###") || strings.HasPrefix(line, "##") {
+			for _, sev := range []string{"[CRITICAL]", "[HIGH]", "[MEDIUM]", "[LOW]", "[INFO]"} {
+				if strings.Contains(lineUpper, sev) {
+					isFinding = true
+					break
+				}
+			}
+		}
+
+		// Pattern 2: [FINDING ...] or [finding ...] bracket tags
+		if !isFinding {
+			if strings.Contains(line, "[FINDING") || strings.Contains(line, "[finding") {
+				isFinding = true
+			}
+		}
+
+		// Pattern 3: Finding IDs like F-001:, F-002:, F-123:
+		if !isFinding {
+			if isFindingID(line) {
+				isFinding = true
+			}
+		}
+
+		// Pattern 4: [VULN_TYPE: ...] tags
+		if !isFinding {
+			if strings.Contains(lineUpper, "[VULN_TYPE:") {
+				isFinding = true
+			}
+		}
+
+		// Pattern 5: Severity keyword + vulnerability/finding/exploit context
+		if !isFinding {
+			hasSeverity := strings.Contains(lineUpper, "CRITICAL") ||
+				strings.Contains(lineUpper, "HIGH") ||
+				strings.Contains(lineUpper, "MEDIUM") ||
+				strings.Contains(lineUpper, "LOW")
+			hasContext := strings.Contains(lineUpper, "VULN") ||
+				strings.Contains(lineUpper, "FINDING") ||
+				strings.Contains(lineUpper, "EXPLOIT")
+			if hasSeverity && hasContext {
+				isFinding = true
+			}
 		}
 
 		if !isFinding {
@@ -280,21 +357,24 @@ func (p *NotifyingPublisher) scanTextForFindings(text string) {
 
 		severity := "MEDIUM"
 		for _, sev := range []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"} {
-			if strings.Contains(strings.ToUpper(line), sev) {
+			if strings.Contains(lineUpper, sev) {
 				severity = sev
 				break
 			}
 		}
 
 		vulnType := ""
-		if idx := strings.Index(line, "[VULN_TYPE:"); idx >= 0 {
+		if idx := strings.Index(lineUpper, "[VULN_TYPE:"); idx >= 0 {
 			end := strings.Index(line[idx:], "]")
 			if end > 0 {
 				vulnType = strings.TrimSpace(line[idx+11 : idx+end])
 			}
 		}
 
+		// Extract a clean title: strip markdown prefixes and brackets
 		title := line
+		title = strings.TrimLeft(title, "#")
+		title = strings.TrimSpace(title)
 		if len(title) > 120 {
 			title = title[:117] + "..."
 		}
@@ -308,6 +388,31 @@ func (p *NotifyingPublisher) scanTextForFindings(text string) {
 			FindingVulnType: vulnType,
 		})
 	}
+}
+
+// isFindingID checks if a line starts with a finding ID pattern like "F-001:", "F-12:".
+func isFindingID(line string) bool {
+	if len(line) < 4 {
+		return false
+	}
+	if line[0] != 'F' && line[0] != 'f' {
+		return false
+	}
+	if line[1] != '-' {
+		return false
+	}
+	// Expect digits after F- followed by :
+	i := 2
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		i++
+	}
+	if i == 2 {
+		return false // no digits
+	}
+	if i < len(line) && line[i] == ':' {
+		return true
+	}
+	return false
 }
 
 // checkPhaseFromContext checks subtask context JSON for phase information

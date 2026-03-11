@@ -64,6 +64,7 @@ func NewTelegramNotifier(token, chatID string) *TelegramNotifier {
 // Send enqueues a message for delivery. Non-blocking: drops if queue is full.
 func (t *TelegramNotifier) Send(message string) {
 	if message == "" {
+		logrus.Debug("telegram Send called with empty message, skipping")
 		return
 	}
 
@@ -74,8 +75,9 @@ func (t *TelegramNotifier) Send(message string) {
 
 	select {
 	case t.queue <- message:
+		logrus.WithField("queue_len", len(t.queue)).Debug("telegram message enqueued")
 	default:
-		logrus.Warn("telegram notification queue full, dropping message")
+		logrus.WithField("queue_cap", cap(t.queue)).Warn("telegram notification queue full, dropping message")
 	}
 }
 
@@ -125,6 +127,7 @@ func (t *TelegramNotifier) drainQueue() {
 
 // sendMessage makes the HTTP POST to Telegram sendMessage API.
 func (t *TelegramNotifier) sendMessage(text string) {
+	logrus.WithField("chat_id", t.chatID).Debug("sending telegram message")
 	url := fmt.Sprintf("%s%s/sendMessage", telegramAPIBase, t.token)
 
 	body := telegramSendRequest{
