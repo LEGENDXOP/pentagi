@@ -639,6 +639,11 @@ func (fp *flowProvider) performAgentChain(
 
 		// Proactive reflector: check if tool history signals a behavioral loop
 		if shouldTrigger, reason := toolHistory.ShouldTriggerProactiveReflector(toolCallCount); shouldTrigger {
+			// Mark the reflector as fired to start the cooldown period.
+			// This prevents the reflector storm where the same condition
+			// fires the reflector on every consecutive tool call.
+			toolHistory.MarkReflectorFired()
+
 			logger.WithFields(logrus.Fields{
 				"trigger_reason":  reason,
 				"tool_call_count": toolCallCount,

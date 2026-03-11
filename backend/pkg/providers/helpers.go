@@ -166,11 +166,17 @@ const (
 	defaultToolHistorySize = 50
 )
 
+// minCallsBetweenReflector is the cooldown: after the proactive reflector fires,
+// it will not fire again until at least this many new tool calls have been recorded.
+const minCallsBetweenReflector = 3
+
 // ToolHistory is a thread-safe, bounded ring of recent tool call records.
 type ToolHistory struct {
-	mu      sync.Mutex
-	entries []ToolHistoryEntry
-	maxSize int
+	mu                     sync.Mutex
+	entries                []ToolHistoryEntry
+	maxSize                int
+	callsSinceLastReflect  int  // incremented on Add, reset on MarkReflectorFired
+	reflectorFiredAtLeast  bool // true once MarkReflectorFired has been called at least once
 }
 
 // NewToolHistory creates a new tool history tracker with the given capacity.
@@ -179,9 +185,25 @@ func NewToolHistory(maxSize int) *ToolHistory {
 		maxSize = defaultToolHistorySize
 	}
 	return &ToolHistory{
-		entries: make([]ToolHistoryEntry, 0, maxSize),
-		maxSize: maxSize,
+		entries:                make([]ToolHistoryEntry, 0, maxSize),
+		maxSize:                maxSize,
+		callsSinceLastReflect:  minCallsBetweenReflector, // allow first trigger without waiting
 	}
+}
+
+// MarkReflectorFired resets the cooldown counter. Call this every time the
+// proactive reflector actually fires.
+func (th *ToolHistory) MarkReflectorFired() {
+	th.mu.Lock()
+	defer th.mu.Unlock()
+	th.callsSinceLastReflect = 0
+	th.reflectorFiredAtLeast = true
+}
+
+// cooldownReady returns true if enough calls have been made since the last reflector.
+// Must be called with th.mu held.
+func (th *ToolHistory) cooldownReady() bool {
+	return th.callsSinceLastReflect >= minCallsBetweenReflector
 }
 
 // Add appends an entry, evicting the oldest when at capacity.
@@ -201,6 +223,7 @@ func (th *ToolHistory) Add(entry ToolHistoryEntry) {
 	if len(th.entries) > th.maxSize {
 		th.entries = th.entries[len(th.entries)-th.maxSize:]
 	}
+	th.callsSinceLastReflect++
 }
 
 // GetLast returns the last n entries (fewer if history is shorter).
@@ -241,9 +264,13 @@ func (th *ToolHistory) GetErrorRate(n int) float64 {
 	return float64(errCount) / float64(len(last))
 }
 
-// GetPatternScore returns a score from 0.0 (all unique tool names) to 1.0
-// (all identical tool names) over the last 10 entries.
+// GetPatternScore returns a score from 0.0 (all unique tool calls) to 1.0
+// (all identical tool calls) over the last 10 entries.
 // It measures how repetitive the recent tool usage is.
+//
+// Unlike the original name-only entropy, this version also considers argument
+// diversity when a single tool name dominates the window. This prevents false
+// positives for tools like "terminal" that are used with many different arguments.
 func (th *ToolHistory) GetPatternScore() float64 {
 	last := th.GetLast(repeatingWindowSize)
 	if len(last) <= 1 {
@@ -251,13 +278,39 @@ func (th *ToolHistory) GetPatternScore() float64 {
 	}
 
 	// Count frequency of each tool name
-	freq := make(map[string]int)
+	nameFreq := make(map[string]int)
 	for _, e := range last {
-		freq[e.Name]++
+		nameFreq[e.Name]++
+	}
+
+	n := float64(len(last))
+
+	// If a single tool name accounts for >60% of calls, use (name+args) as the
+	// dedup key instead of just the name. This way, "terminal" called 10 times
+	// with 10 different commands scores low (diverse), while "terminal" called
+	// 10 times with the same command scores high (repetitive).
+	useArgAware := false
+	for _, count := range nameFreq {
+		if float64(count)/n > 0.6 {
+			useArgAware = true
+			break
+		}
+	}
+
+	freq := make(map[string]int)
+	if useArgAware {
+		for _, e := range last {
+			// Combine name + truncated arguments as the key
+			key := e.Name + "\x00" + e.Arguments
+			freq[key]++
+		}
+	} else {
+		for _, e := range last {
+			freq[e.Name]++
+		}
 	}
 
 	// Shannon entropy normalized to [0,1]
-	n := float64(len(last))
 	var entropy float64
 	for _, count := range freq {
 		p := float64(count) / n
@@ -266,7 +319,7 @@ func (th *ToolHistory) GetPatternScore() float64 {
 		}
 	}
 
-	// Max entropy when all tool names are unique
+	// Max entropy when all keys are unique
 	maxEntropy := math.Log2(n)
 	if maxEntropy == 0 {
 		return 1.0 // single entry, trivially "all same"
@@ -349,13 +402,22 @@ func (th *ToolHistory) FormatForPrompt() string {
 
 // ShouldTriggerProactiveReflector checks whether tool history warrants a proactive
 // reflector invocation. Returns (shouldTrigger, reason).
+//
+// Cooldown: after the reflector fires, at least minCallsBetweenReflector new tool
+// calls must be recorded before it can fire again (except for periodic checkpoints
+// and critical error rates). This prevents the "reflector storm" where the same
+// condition fires the reflector every single call once triggered.
 func (th *ToolHistory) ShouldTriggerProactiveReflector(totalCalls int) (bool, string) {
-	// Trigger 1: Every 10 tool calls (periodic checkpoint)
+	th.mu.Lock()
+	cooldownOK := th.cooldownReady()
+	th.mu.Unlock()
+
+	// Trigger 1: Every 10 tool calls (periodic checkpoint) — always fires, ignores cooldown
 	if totalCalls > 0 && totalCalls%10 == 0 {
 		return true, fmt.Sprintf("periodic checkpoint at %d tool calls", totalCalls)
 	}
 
-	// Trigger 2: Error rate > 50% in last 5 calls
+	// Trigger 2: Error rate > 50% in last 5 calls — fires even during cooldown (critical)
 	if th.Len() >= 5 {
 		errorRate := th.GetErrorRate(5)
 		if errorRate > 0.5 {
@@ -363,18 +425,42 @@ func (th *ToolHistory) ShouldTriggerProactiveReflector(totalCalls int) (bool, st
 		}
 	}
 
-	// Trigger 3: Pattern score > 0.7 (highly repetitive)
+	// All remaining triggers respect the cooldown
+	if !cooldownOK {
+		return false, ""
+	}
+
+	// Trigger 3: Pattern score > 0.90 (highly repetitive, argument-aware)
+	// Raised from 0.7 to 0.90 because GetPatternScore now considers argument
+	// diversity for dominant tools. A score of 0.90+ means the agent is truly
+	// repeating the same calls with the same arguments.
 	if th.Len() >= 5 {
 		score := th.GetPatternScore()
-		if score > 0.7 {
+		if score > 0.90 {
 			return true, fmt.Sprintf("high pattern score %.2f (repetitive tool usage)", score)
 		}
 	}
 
-	// Trigger 4: Same command > 3 times in last 10
-	mostFreq, count := th.GetMostFrequentInLast(repeatingWindowSize)
-	if count > 3 {
-		return true, fmt.Sprintf("'%s' called %d times in last %d calls", mostFreq, count, repeatingWindowSize)
+	// Trigger 4: Same (name+args) pair repeated > 3 times in last 10
+	// Previously this checked tool NAME only, which false-triggered for tools
+	// like "terminal" that are used with many different arguments.
+	// Now checks (name+args) deduplication so diverse usage doesn't trigger.
+	if th.Len() >= 5 {
+		last := th.GetLast(repeatingWindowSize)
+		pairFreq := make(map[string]int)
+		bestKey := ""
+		bestCount := 0
+		for _, e := range last {
+			key := e.Name + "\x00" + e.Arguments
+			pairFreq[key]++
+			if pairFreq[key] > bestCount {
+				bestCount = pairFreq[key]
+				bestKey = e.Name
+			}
+		}
+		if bestCount > 3 {
+			return true, fmt.Sprintf("'%s' called with same arguments %d times in last %d calls", bestKey, bestCount, len(last))
+		}
 	}
 
 	return false, ""
