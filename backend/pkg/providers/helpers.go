@@ -41,9 +41,11 @@ const (
 const repeatingWindowSize = 10
 
 type repeatingDetector struct {
-	history    []llms.FunctionCall
-	threshold  int
-	readCounts map[string]int // per-file path → read count this subtask
+	history         []llms.FunctionCall
+	threshold       int
+	readCounts      map[string]int // per-file path → read count this subtask
+	totalBlocks     int            // total read blocks across ALL files this subtask
+	allReadsBlocked bool           // after 5 total blocks, block ALL reads (even new files)
 }
 
 func newRepeatingDetector() *repeatingDetector {
@@ -137,6 +139,18 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 	// Normalize to base name so /work/STATE.json and STATE.json count together.
 	key := filepath.Base(filePath)
 
+	// After 5 total blocks: hard-block ALL reads, even first reads of new files.
+	if rd.allReadsBlocked {
+		rd.totalBlocks++
+		return true, fmt.Sprintf(
+			"🛑 HARD BLOCK: ALL file reads are disabled for this subtask (total blocks: %d). "+
+				"File '%s' was NOT read. You have been repeatedly blocked and MUST stop reading files. "+
+				"Use the information you already have. Your NEXT tool call MUST be an offensive action "+
+				"(nmap, curl, nuclei_scan, browser_navigate) — NOT a file read.",
+			rd.totalBlocks, key,
+		)
+	}
+
 	if rd.readCounts == nil {
 		rd.readCounts = make(map[string]int)
 	}
@@ -152,17 +166,50 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 			key, count,
 		)
 	default:
+		// Per-file block — also escalate totalBlocks
+		rd.totalBlocks++
+
+		// After 5 total blocks: engage hard block for ALL future reads
+		if rd.totalBlocks >= 5 {
+			rd.allReadsBlocked = true
+			return true, fmt.Sprintf(
+				"🛑 HARD BLOCK ENGAGED: Read of '%s' denied (read %d times). "+
+					"You have now been blocked %d times total across all files. "+
+					"ALL file reads are now DISABLED for the rest of this subtask — even new files. "+
+					"STOP reading files. You already have all the information you need. "+
+					"Your NEXT tool call MUST be an offensive action (nmap, curl, nuclei_scan, browser_navigate).",
+				key, count, rd.totalBlocks,
+			)
+		}
+
+		// After 3 total blocks: critical escalation
+		if rd.totalBlocks >= 3 {
+			return true, fmt.Sprintf(
+				"🛑 CRITICAL: You have been blocked from reading files %d times. STOP ALL FILE READS IMMEDIATELY. "+
+					"Read of '%s' denied (read %d times). "+
+					"You already have all the information you need. Your NEXT tool call MUST be "+
+					"an offensive action (nmap, curl, nuclei_scan, browser_navigate) — NOT a file read. "+
+					"If you read another file, it will also be blocked.",
+				rd.totalBlocks, key, count,
+			)
+		}
+
+		// Standard block (totalBlocks 1-2)
 		return true, fmt.Sprintf(
 			"BLOCKED: Read of '%s' denied — already read %d times this subtask. "+
-				"The file content has not changed. Proceed with testing using the information you already have.",
-			key, count,
+				"The file content has not changed. Proceed with testing using the information you already have. "+
+				"(Total blocks so far: %d — further blocks will escalate to hard restrictions.)",
+			key, count, rd.totalBlocks,
 		)
 	}
 }
 
-// resetReadCounts clears the per-file read counter, intended for subtask boundaries.
+// resetReadCounts clears all read-cap state, intended for subtask boundaries.
+// Resets per-file counters, total block count, and the allReadsBlocked flag.
 func (rd *repeatingDetector) resetReadCounts() {
 	rd.readCounts = make(map[string]int)
+	rd.totalBlocks = 0
+	rd.allReadsBlocked = false
 }
 
 // extractReadFilePath extracts the file path from a read-only tool call.
