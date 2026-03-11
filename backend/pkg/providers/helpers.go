@@ -53,6 +53,14 @@ func (rd *repeatingDetector) detect(toolCall llms.ToolCall) bool {
 	}
 
 	funcCall := rd.clearCallArguments(toolCall.FunctionCall)
+
+	// Exempt read-only file operations — agents legitimately re-read state files
+	// like HANDOFF.md, STATE.json across subtask boundaries. Blocking these
+	// causes death loops where the agent can't bootstrap.
+	if rd.isReadOnlyCall(funcCall) {
+		return false
+	}
+
 	rd.history = append(rd.history, funcCall)
 	if len(rd.history) > repeatingWindowSize {
 		rd.history = rd.history[len(rd.history)-repeatingWindowSize:]
@@ -68,6 +76,33 @@ func (rd *repeatingDetector) detect(toolCall llms.ToolCall) bool {
 		}
 	}
 
+	return false
+}
+
+// isReadOnlyCall returns true for tool calls that only read data (file reads,
+// cat commands, state checks). These should never be blocked by repeat detection
+// because agents need to re-read shared state files (HANDOFF.md, STATE.json,
+// FINDINGS.md) at the start of each subtask.
+func (rd *repeatingDetector) isReadOnlyCall(fc llms.FunctionCall) bool {
+	// file tool with read_file action
+	if fc.Name == "file" {
+		if strings.Contains(fc.Arguments, `"read_file"`) {
+			return true
+		}
+	}
+	// terminal tool running cat/head/tail/jq read commands
+	if fc.Name == "terminal" {
+		args := fc.Arguments
+		// Match common read-only patterns in the input field
+		for _, pattern := range []string{
+			`"cat `, `"head `, `"tail `, `"jq `, `"cat /work/`,
+			`"ls `, `"wc `, `"grep `, `"find `,
+		} {
+			if strings.Contains(args, pattern) {
+				return true
+			}
+		}
+	}
 	return false
 }
 
