@@ -121,9 +121,9 @@ var readOnlyCmdPattern = regexp.MustCompile(`(?:^|\s)(cat|head|tail)\s+(?:-[^\s]
 // but without a cap they can read the same file 20+ times in infinite loops.
 //
 // Returns (blocked, message):
-//   - ≤2 reads:  (false, "")         — free, no warning
-//   - 3-5 reads: (false, "⚠️ ...")   — warning prepended to tool result
-//   - >5 reads:  (true, "BLOCKED...") — synthetic response, tool NOT executed
+//   - ≤1 read:   (false, "")         — free, initial bootstrap read
+//   - 2-3 reads: (false, "⚠️ ...")   — warning prepended to tool result
+//   - >3 reads:  (true, "BLOCKED...") — synthetic response, tool NOT executed
 func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, string) {
 	if !rd.isReadOnlyCall(funcCall) {
 		return false, ""
@@ -144,11 +144,11 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 	count := rd.readCounts[key]
 
 	switch {
-	case count <= 2:
+	case count <= 1:
 		return false, ""
-	case count <= 5:
+	case count <= 3:
 		return false, fmt.Sprintf(
-			"⚠️ WARNING: You've read '%s' %d times. Content unchanged. Move to actual testing.",
+			"⚠️ WARNING: You've read '%s' %d times. Content unchanged — do NOT read it again. Move to actual testing.",
 			key, count,
 		)
 	default:
