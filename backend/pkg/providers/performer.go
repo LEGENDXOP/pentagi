@@ -559,6 +559,19 @@ func (fp *flowProvider) performAgentChain(
 				phase = "finishing"
 			}
 			execState.Update(metrics, phase)
+
+			// Every 10 tool calls, generate and persist resume context so that
+			// if the subtask times out and resumes, the agent has a summary of
+			// what was already done and doesn't waste time re-bootstrapping.
+			if toolCallCount > 0 && toolCallCount%10 == 0 {
+				resumeContent := buildResumeContent(toolHistory, metrics)
+				if resumeContent != "" {
+					execState.ResumeContext = resumeContent
+					logger.WithField("tool_call_count", toolCallCount).
+						Debug("persisted resume context to execution state")
+				}
+			}
+
 			if stateJSON, err := execState.ToJSON(); err == nil {
 				stateWriter.Write(*subtaskID, stateJSON)
 			}

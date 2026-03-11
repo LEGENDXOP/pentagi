@@ -14,13 +14,14 @@ import (
 // ExecutionState captures the agent's execution progress for crash recovery.
 // It is serialized to JSON and persisted in the subtask's Context column.
 type ExecutionState struct {
-	Phase         string   `json:"phase"`
-	ToolCallCount int      `json:"tool_call_count"`
-	FindingsCount int      `json:"findings_count"`
-	AttacksDone   []string `json:"attacks_done"`
-	CurrentAttack string   `json:"current_attack"`
-	ErrorCount    int      `json:"error_count"`
-	LastUpdate    string   `json:"last_update"`
+	Phase          string   `json:"phase"`
+	ToolCallCount  int      `json:"tool_call_count"`
+	FindingsCount  int      `json:"findings_count"`
+	AttacksDone    []string `json:"attacks_done"`
+	CurrentAttack  string   `json:"current_attack"`
+	ErrorCount     int      `json:"error_count"`
+	LastUpdate     string   `json:"last_update"`
+	ResumeContext  string   `json:"resume_context,omitempty"` // auto-generated resume instructions for crash recovery
 }
 
 // MarshalJSON serializes the execution state to JSON.
