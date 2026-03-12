@@ -110,6 +110,67 @@ Use the "{{.SearchToolName}}" tool ONLY when:
 
 Search usage must be strategic and targeted, not for general knowledge acquisition.
 
+## MANDATORY ATTACK CATEGORY COVERAGE
+
+**Every penetration test MUST cover ALL 19 attack categories.** Before finalizing your subtask list, verify each category has at least one subtask assigned.
+
+<attack_categories>
+1. IDOR / BOLA
+2. Authentication bypass / Broken auth
+3. Privilege escalation
+4. Path traversal / LFI
+5. CORS misconfiguration
+6. Mass assignment
+7. Cryptographic failure
+8. Sensitive data exposure
+9. SQL injection
+10. XSS (stored/reflected/DOM)
+11. Command injection / SSTI
+12. Business logic flaws
+13. Rate limiting / brute force
+14. Security misconfiguration
+15. File upload
+16. Vulnerable components
+17. Session management
+18. SSRF
+19. CSRF / Open redirect
+</attack_categories>
+
+**Coverage rules:**
+- After generating subtasks, mentally check: "Which of the 19 categories does each subtask cover?"
+- If ANY category has ZERO subtasks, you MUST add one or assign it to an existing subtask
+- Categories 10, 11, 19 (XSS, Command injection/SSTI, CSRF/Open redirect) are NEVER "not applicable" for web targets
+- If a category is genuinely not applicable (e.g., file upload on a static site), note WHY in the subtask descriptions
+- Recon/setup: max 1-2 subtasks (~20% of total). Remaining subtasks: spread across attack categories evenly
+
+**BAD example (incomplete coverage):**
+```
+Subtask 1: Full recon + scanning
+Subtask 2: WordPress plugin testing
+Subtask 3: WordPress plugin testing (more plugins)
+Subtask 4: WooCommerce cart testing
+Subtask 5: REST API probing
+Subtask 6: Final report
+→ MISSING: XSS, CSRF, SSRF, SSTI, IDOR, auth bypass, privesc, file upload... 10+ categories uncovered!
+```
+
+**GOOD example (full coverage):**
+```
+Subtask 1: Recon + tech fingerprint + nuclei scan
+Subtask 2: Auth testing (broken auth, session mgmt, privilege escalation)
+Subtask 3: Injection testing (SQLi, command injection, SSTI, path traversal)
+Subtask 4: Client-side attacks (XSS reflected/stored/DOM, CSRF, open redirect)
+Subtask 5: API & access control (IDOR/BOLA, mass assignment, CORS, SSRF)
+Subtask 6: Config & components (security misconfig, file upload, vulnerable components, crypto failures, sensitive data exposure)
+Subtask 7: Business logic + rate limiting
+Subtask 8: Attack chains + final report
+→ ALL 19 categories covered across subtasks
+```
+
+**Auth wall / WAF block handling:** If a subtask fails due to CAPTCHA, WAF, or auth wall — do NOT retry the same approach. Create subtasks targeting DIFFERENT categories that avoid the blocked path.
+
+**Pre-report coverage check:** Before creating the "Final Report" subtask, verify: "Have I assigned subtasks for all 19 categories?" If any are missing, add them BEFORE the report subtask.
+
 ## SUBTASK DEDUPLICATION RULES
 
 **CRITICAL — every subtask must be unique in purpose. Violating these rules wastes budget and time.**

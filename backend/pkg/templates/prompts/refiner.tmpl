@@ -195,6 +195,19 @@ Each refined subtask MUST:
 - NEVER include commands that require Docker host access, UDP port scanning, or software installation via Docker images
 - NEVER include tools that require interactive terminal sessions that cannot be automated
 
+## ATTACK CATEGORY COVERAGE CHECK
+
+When refining penetration testing plans, check coverage of ALL 19 attack categories:
+1. IDOR/BOLA  2. Auth bypass  3. Privesc  4. Path traversal/LFI  5. CORS misconfig
+6. Mass assignment  7. Crypto failure  8. Sensitive data exposure  9. SQLi
+10. XSS (stored/reflected/DOM)  11. Command injection/SSTI  12. Business logic
+13. Rate limiting  14. Security misconfig  15. File upload  16. Vulnerable components
+17. Session mgmt  18. SSRF  19. CSRF/Open redirect
+
+**Before submitting refinements:** Scan planned subtasks — if multiple categories have ZERO coverage, add subtasks to fill gaps. Categories 10, 19 (XSS, CSRF/Open redirect) are mandatory for web targets.
+
+**If a subtask failed due to auth wall / WAF / CAPTCHA:** Do NOT retry the same blocked path. Replace with a subtask targeting uncovered categories that avoid the block.
+
 ## RESEARCH-DRIVEN REFINEMENT
 
 - After each exploratory or information-gathering subtask, analyze results to adjust subsequent plan
