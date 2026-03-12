@@ -203,6 +203,7 @@ func NewFlowWorker(
 	pub := notifications.WrapPublisher(
 		fwc.subs.NewFlowPublisher(fwc.userID, flow.ID),
 		fwc.notifier,
+		fwc.docker,
 	)
 	workers, err := newFlowProviderWorkers(ctx, flow.ID, &fwc.flowProviderControllers, pub)
 	if err != nil {
@@ -371,6 +372,7 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 	pub := notifications.WrapPublisher(
 		fwc.subs.NewFlowPublisher(flow.UserID, flow.ID),
 		fwc.notifier,
+		fwc.docker,
 	)
 	workers, err := newFlowProviderWorkers(ctx, flow.ID, &fwc.flowProviderControllers, pub)
 	if err != nil {
