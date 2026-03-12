@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strconv"
 	"time"
@@ -75,8 +76,14 @@ func (wd *flowWatchdog) check(ctx context.Context) {
 		}
 
 		// Found a waiting, non-completed task in a waiting flow.
-		// This is the stall condition: a subtask failed, the error propagated up,
-		// and now the flow is stuck waiting for user input.
+		// Before attempting resume, check for zombie state: task is waiting
+		// but no subtask has "waiting" status (e.g., after a refiner crash).
+		if err := wd.recoverZombieSubtasks(ctx, task.GetTaskID()); err != nil {
+			wd.logger.WithError(err).WithField("task_id", task.GetTaskID()).
+				Warn("flow watchdog: zombie recovery failed, skipping resume attempt")
+			return
+		}
+
 		wd.resumeCount++
 		wd.logger.WithFields(logrus.Fields{
 			"task_id":      task.GetTaskID(),
@@ -91,6 +98,53 @@ func (wd *flowWatchdog) check(ctx context.Context) {
 		}
 		return
 	}
+}
+
+// recoverZombieSubtasks detects the zombie state where a task is "waiting" but
+// no subtask has "waiting" status. This happens when the refiner crashes (e.g.,
+// context deadline exceeded) after a subtask completes — the remaining subtasks
+// stay in "created" status and PutInput would normally fail.
+//
+// This method logs the zombie state for diagnostics. The actual recovery happens
+// in task.PutInput() which detects the zombie condition and resets the task to
+// "running" so that Run() can pick up the next created subtask via PopSubtask().
+//
+// Returns nil to allow the resume attempt to proceed (PutInput handles recovery),
+// or an error only if the DB check itself fails.
+func (wd *flowWatchdog) recoverZombieSubtasks(ctx context.Context, taskID int64) error {
+	subtasks, err := wd.fw.flowCtx.DB.GetTaskSubtasks(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("failed to get subtasks for task %d: %w", taskID, err)
+	}
+
+	// Check if any subtask already has "waiting" status — if so, no zombie state
+	hasWaiting := false
+	hasCreated := false
+	for _, st := range subtasks {
+		if st.Status == database.SubtaskStatusWaiting {
+			hasWaiting = true
+		}
+		if st.Status == database.SubtaskStatusCreated {
+			hasCreated = true
+		}
+	}
+
+	if hasWaiting {
+		return nil // Normal stall, not a zombie — PutInput should work fine
+	}
+
+	if hasCreated {
+		// Zombie state: task waiting, no subtask waiting, but created subtasks exist.
+		// PutInput will handle recovery by resetting task to running.
+		wd.logger.WithField("task_id", taskID).
+			Info("flow watchdog: detected zombie state (task waiting, no subtask waiting, created subtasks exist) — PutInput will recover")
+	} else {
+		// All subtasks are finished/failed/running — no created subtasks left.
+		wd.logger.WithField("task_id", taskID).
+			Warn("flow watchdog: zombie state but no created subtasks remain — task may need manual intervention")
+	}
+
+	return nil
 }
 
 // isWatchdogEnabled checks the FLOW_WATCHDOG_ENABLED env var (default true).

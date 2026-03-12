@@ -289,6 +289,33 @@ func (tw *taskWorker) PutInput(ctx context.Context, input string) error {
 		}
 	}
 
+	// Zombie state recovery: task is waiting but no in-memory subtask is waiting.
+	// This happens when the refiner crashes after a subtask completes — remaining
+	// subtasks stay in "created" status and were never loaded as workers.
+	// Check if there are planned subtasks in the DB that can be executed.
+	planned, err := tw.taskCtx.DB.GetTaskPlannedSubtasks(ctx, tw.taskCtx.TaskID)
+	if err != nil {
+		return fmt.Errorf("task %d is waiting but no subtask is waiting for input (db check failed: %w)", tw.taskCtx.TaskID, err)
+	}
+
+	if len(planned) > 0 {
+		// Found created/waiting subtasks in DB. Transition task back to running
+		// so that Run() can pick them up via PopSubtask(). The caller (processInput)
+		// will call runTask() after PutInput succeeds, which calls task.Run().
+		logrus.WithContext(ctx).WithFields(logrus.Fields{
+			"task_id":            tw.taskCtx.TaskID,
+			"planned_subtasks":   len(planned),
+			"next_subtask_id":    planned[0].ID,
+			"next_subtask_title": planned[0].Title,
+		}).Info("zombie recovery: task waiting with no waiting subtask, resetting to running for re-execution")
+
+		if err := tw.SetStatus(ctx, database.TaskStatusRunning); err != nil {
+			return fmt.Errorf("zombie recovery failed to reset task %d status: %w", tw.taskCtx.TaskID, err)
+		}
+
+		return nil
+	}
+
 	return fmt.Errorf("task %d is waiting but no subtask is waiting for input", tw.taskCtx.TaskID)
 }
 
@@ -345,8 +372,34 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 			if errors.Is(err, context.Canceled) {
 				ctx = context.Background()
 			}
-			_ = tw.SetStatus(ctx, database.TaskStatusWaiting)
-			return fmt.Errorf("failed to refine subtasks list for the task %d: %w", tw.taskCtx.TaskID, err)
+
+			// Refiner failure is non-fatal: log the error and continue executing
+			// remaining subtasks. Without this recovery, the task enters a zombie
+			// state where it's "waiting" but no subtask is "waiting" for input,
+			// making it impossible to resume via PutInput or the watchdog.
+			logger.WithError(err).WithField("task_id", tw.taskCtx.TaskID).
+				Warn("refiner failed, recovering: will continue with remaining subtasks")
+
+			// Check if there are still created subtasks to execute.
+			// If yes, continue the loop — PopSubtask will pick the next one.
+			// If no, break out and let the task finalize normally.
+			remaining, dbErr := tw.taskCtx.DB.GetTaskPlannedSubtasks(ctx, tw.taskCtx.TaskID)
+			if dbErr != nil {
+				logger.WithError(dbErr).Error("refiner recovery: failed to check remaining subtasks")
+				_ = tw.SetStatus(ctx, database.TaskStatusWaiting)
+				return fmt.Errorf("failed to refine subtasks list for the task %d: %w", tw.taskCtx.TaskID, err)
+			}
+
+			if len(remaining) == 0 {
+				// No more subtasks to execute — break out to finalize the task
+				logger.Info("refiner recovery: no remaining subtasks, proceeding to task finalization")
+				break
+			}
+
+			// There are remaining subtasks — continue the execution loop
+			logger.WithField("remaining_subtasks", len(remaining)).
+				Info("refiner recovery: continuing with remaining subtasks")
+			continue
 		}
 	}
 
