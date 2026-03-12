@@ -69,6 +69,14 @@ func (rd *repeatingDetector) detect(toolCall llms.ToolCall) bool {
 		return false
 	}
 
+	// Exempt write operations — agents legitimately write/append to FINDINGS.md,
+	// STATE.json, HANDOFF.md multiple times during a subtask. This is normal
+	// workflow (updating findings, recording state), not a loop. Blocking writes
+	// causes deadlocks where the agent cannot save progress.
+	if isWriteOperation(funcCall) {
+		return false
+	}
+
 	rd.history = append(rd.history, funcCall)
 	if len(rd.history) > repeatingWindowSize {
 		rd.history = rd.history[len(rd.history)-repeatingWindowSize:]
@@ -87,10 +95,88 @@ func (rd *repeatingDetector) detect(toolCall llms.ToolCall) bool {
 	return false
 }
 
+// isWriteOperation returns true for tool calls that perform write/create/update
+// operations. These must NEVER be blocked by repeat detection because agents
+// legitimately write to the same files multiple times during normal workflow
+// (e.g., appending findings, updating state, writing handoff notes).
+//
+// This covers:
+//   - file tool with update_file action (the only write action for the file tool)
+//   - terminal tool with shell write patterns (redirects, heredocs, tee, mv, cp)
+//   - barrier/completion tools (hack_result, done) — these signal task completion
+func isWriteOperation(fc llms.FunctionCall) bool {
+	switch fc.Name {
+	// file tool: update_file is a write operation
+	case "file":
+		if strings.Contains(fc.Arguments, `"update_file"`) {
+			return true
+		}
+
+	// terminal tool: detect shell write patterns in the input command
+	case "terminal":
+		if isTerminalWriteCommand(fc.Arguments) {
+			return true
+		}
+
+	// Barrier/completion tools should never be blocked as "repeating"
+	case "hack_result", "done":
+		return true
+	}
+
+	return false
+}
+
+// writeCommandPattern matches shell commands that write to files.
+// It detects output redirects (>, >>), heredocs (<<), tee, mv, cp, mkdir, chmod, install.
+// The pattern is designed to avoid false-positives on read-only commands:
+//   - Output redirect uses a negative lookbehind-like [^<] to avoid matching <<
+//   - Heredoc << is matched separately as it always indicates a write
+var writeCommandPattern = regexp.MustCompile(
+	`(?:` +
+		`(?:^|[^<])>>?\s` + // output redirect: > file or >> file (but not <<)
+		`|<<[-']?\s*` + // heredoc: << EOF, <<- EOF, <<'EOF'
+		`|\|\s*tee\b` + // pipe to tee
+		`|^\s*tee\b` + // tee at start of command
+		`|\bmv\s` + // mv command
+		`|\bcp\s` + // cp command
+		`|\bmkdir\s` + // mkdir command
+		`|\bchmod\s` + // chmod command
+		`|\binstall\s` + // install command
+		`|\bprintf\s.*>` + // printf with redirect
+		`)`,
+)
+
+// isTerminalWriteCommand checks if a terminal tool's arguments contain a shell
+// command that writes to files. This is used to exempt writes from both repeat
+// detection and read-cap counting.
+func isTerminalWriteCommand(args string) bool {
+	// Parse the input field from the terminal tool arguments
+	var termArgs map[string]interface{}
+	if err := json.Unmarshal([]byte(args), &termArgs); err != nil {
+		return false
+	}
+	input, ok := termArgs["input"].(string)
+	if !ok || input == "" {
+		return false
+	}
+
+	// Check for output redirects: >, >> (but not << which is heredoc input)
+	// This catches: echo "x" > file, cat >> file, jq '.x' f > /tmp/s.json
+	if writeCommandPattern.MatchString(input) {
+		return true
+	}
+
+	return false
+}
+
 // isReadOnlyCall returns true for tool calls that only read data (file reads,
 // cat commands, state checks). These should never be blocked by repeat detection
 // because agents need to re-read shared state files (HANDOFF.md, STATE.json,
 // FINDINGS.md) at the start of each subtask.
+//
+// IMPORTANT: Commands that contain read-like patterns (cat, head, jq) but actually
+// WRITE to files (via redirects, heredocs, tee) must NOT be classified as reads.
+// Otherwise the read cap incorrectly blocks write operations.
 func (rd *repeatingDetector) isReadOnlyCall(fc llms.FunctionCall) bool {
 	// file tool with read_file action
 	if fc.Name == "file" {
@@ -100,6 +186,14 @@ func (rd *repeatingDetector) isReadOnlyCall(fc llms.FunctionCall) bool {
 	}
 	// terminal tool running cat/head/tail/jq read commands
 	if fc.Name == "terminal" {
+		// First check: if the command is a write operation, it's NOT a read.
+		// This prevents misclassification of commands like:
+		//   cat > FINDINGS.md << 'EOF' ...  (heredoc write, contains "cat ")
+		//   jq '.status="done"' STATE.json > /tmp/s.json && mv ...  (jq write, contains "jq ")
+		if isTerminalWriteCommand(fc.Arguments) {
+			return false
+		}
+
 		args := fc.Arguments
 		// Match common read-only patterns in the input field
 		for _, pattern := range []string{
