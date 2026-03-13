@@ -35,7 +35,7 @@ const (
 	maxReflectorCallsPerChain   = 3
 	delayBetweenRetries         = 5 * time.Second
 	defaultMaxToolCallsPerSubtask = 100              // hard cap per subtask (configurable via MAX_TOOL_CALLS_PER_SUBTASK)
-	defaultSubtaskDuration      = 30 * time.Minute   // default hard time limit per subtask
+	defaultSubtaskDuration      = 60 * time.Minute   // default hard time limit per subtask
 	defaultMaxNestingDepth      = 4                   // primary_agent(0) → pentester(1) → coder(2) → installer(3) all allowed
 	nestedTimeoutDepth1         = 25 * time.Minute    // timeout for depth-1 nested agents
 	nestedTimeoutDepth2         = 20 * time.Minute    // timeout for depth-2 nested agents
@@ -47,7 +47,7 @@ const (
 )
 
 // getSubtaskMaxDuration returns the subtask timeout, configurable via
-// SUBTASK_MAX_DURATION env var (value in minutes). Defaults to 15 min.
+// SUBTASK_MAX_DURATION env var (value in minutes). Defaults to 60 min.
 func getSubtaskMaxDuration() time.Duration {
 	if v := os.Getenv("SUBTASK_MAX_DURATION"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {

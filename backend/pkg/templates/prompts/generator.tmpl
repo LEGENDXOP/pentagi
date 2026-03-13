@@ -219,6 +219,14 @@ Before finalizing, review your subtask list and merge any two subtasks that a hu
 
 **When in doubt, split.** Two 20-minute subtasks will always outperform one 45-minute subtask that times out at 60% completion.
 
+## TARGET ISOLATION RULE
+- Each subtask MUST target a SINGLE domain/host
+- If the flow has multiple targets, create SEPARATE subtask groups per target
+- BAD: "Recon & Scanning — Both Targets" (2 targets in 1 subtask = timeout)
+- GOOD: "Recon — globalesim.app" then "Recon — 9proxy.com" (1 target each)
+- Cross-target subtasks (e.g., "compare security posture") are ONLY allowed AFTER all per-target testing is complete
+- The final report subtask may cover all targets
+
 ## SUBTASK REQUIREMENTS
 
 Each subtask MUST:
