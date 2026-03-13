@@ -1600,3 +1600,93 @@ func isEmptyChain(msgChain json.RawMessage) bool {
 
 	return len(msgList) == 0
 }
+
+// trackedStateFiles are the files that the agent writes findings/state into
+// during subtask execution. These are vulnerable to truncation when a `cat >`
+// or heredoc write is interrupted by a context deadline or timeout.
+var trackedStateFiles = []string{
+	"FINDINGS.md",
+	"STATE.json",
+	"HANDOFF.md",
+}
+
+// isTrackedFileWrite returns the base filename if the tool call is a write
+// operation targeting one of the tracked state files. Returns "" if not a
+// tracked file write.
+//
+// Supports both terminal tool (shell commands with redirects/heredocs) and
+// file tool (update_file action).
+func isTrackedFileWrite(funcName string, funcArgs json.RawMessage) string {
+	switch funcName {
+	case "terminal":
+		var termArgs map[string]interface{}
+		if err := json.Unmarshal(funcArgs, &termArgs); err != nil {
+			return ""
+		}
+		input, ok := termArgs["input"].(string)
+		if !ok || input == "" {
+			return ""
+		}
+		// Only check if the command is a write operation
+		if !writeCommandPattern.MatchString(input) {
+			return ""
+		}
+		// Check if any tracked file is mentioned in the command
+		inputLower := strings.ToLower(input)
+		for _, f := range trackedStateFiles {
+			if strings.Contains(inputLower, strings.ToLower(f)) {
+				return f
+			}
+		}
+
+	case "file":
+		var fileArgs map[string]interface{}
+		if err := json.Unmarshal(funcArgs, &fileArgs); err != nil {
+			return ""
+		}
+		action, _ := fileArgs["action"].(string)
+		if action != "update_file" {
+			return ""
+		}
+		path, _ := fileArgs["path"].(string)
+		if path == "" {
+			return ""
+		}
+		base := filepath.Base(path)
+		for _, f := range trackedStateFiles {
+			if strings.EqualFold(base, f) {
+				return f
+			}
+		}
+	}
+
+	return ""
+}
+
+// buildBackupCommand builds a shell command that creates .bak copies of tracked
+// state files before a write operation. The command is designed to never fail —
+// if the source file doesn't exist, the cp is silently skipped.
+func buildBackupCommand(filename string) string {
+	// Back up the specific file being written to.
+	// The `2>/dev/null || true` ensures the command always succeeds even
+	// if the file doesn't exist yet (first write).
+	return fmt.Sprintf(
+		"cp /work/%s /work/%s.bak 2>/dev/null || true",
+		filename, filename,
+	)
+}
+
+// buildRestoreCheckCommand builds a shell command that checks all tracked state
+// files and restores from .bak if the file is 0 bytes but .bak has content.
+// Output is a newline-separated list of restored filenames (empty if none restored).
+func buildRestoreCheckCommand() string {
+	var parts []string
+	for _, f := range trackedStateFiles {
+		// Check: file exists AND is 0 bytes AND .bak exists AND .bak is >0 bytes
+		parts = append(parts, fmt.Sprintf(
+			`if [ -f /work/%s ] && [ ! -s /work/%s ] && [ -s /work/%s.bak ]; then cp /work/%s.bak /work/%s && echo "restored:%s"; fi`,
+			f, f, f, f, f, f,
+		))
+	}
+	return strings.Join(parts, "; ")
+}

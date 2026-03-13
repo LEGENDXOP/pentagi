@@ -215,6 +215,30 @@ func (fp *flowProvider) performAgentChain(
 
 	logger := logrus.WithContext(ctx).WithFields(fields)
 
+	// --- Post-chain restore for tracked state files ---
+	// When the agent chain finishes (success or failure), check if any tracked
+	// state files were truncated to 0 bytes while a .bak exists with content.
+	// This catches the case where `cat > FILE << 'EOF'` truncated the file but
+	// the write was killed by context deadline before content was written.
+	defer func() {
+		restoreCmd := buildRestoreCheckCommand()
+		restoreArgs, _ := json.Marshal(map[string]interface{}{
+			"input":   restoreCmd,
+			"timeout": 5,
+		})
+		// Use a detached context since the original may be expired (that's the
+		// whole reason we need this restore — the context deadline killed the write).
+		restoreCtx := context.WithoutCancel(ctx)
+		restoreCtx, restoreCancel := context.WithTimeout(restoreCtx, 10*time.Second)
+		defer restoreCancel()
+		result, restoreErr := executor.Execute(restoreCtx, 0, "", "terminal", "", restoreArgs)
+		if restoreErr != nil {
+			logger.WithError(restoreErr).Debug("post-chain state file restore check failed (non-fatal)")
+		} else if strings.Contains(result, "restored:") {
+			logger.WithField("restore_result", result).Warn("auto-restored truncated state files from backup")
+		}
+	}()
+
 	// Track execution time for duration calculation
 	lastUpdateTime := time.Now()
 	rollLastUpdateTime := func() float64 {
@@ -856,6 +880,26 @@ func (fp *flowProvider) execToolCall(
 		logger.Warn("failed to exec function: tool call is repeating")
 
 		return response, nil
+	}
+
+	// --- Pre-write backup for tracked state files ---
+	// When a terminal or file tool call writes to FINDINGS.md, STATE.json, or HANDOFF.md,
+	// back up the file BEFORE execution. This protects against `cat > FILE << 'EOF'`
+	// truncating the file to 0 bytes when the context deadline kills the write mid-stream.
+	if trackedFile := isTrackedFileWrite(funcName, funcArgs); trackedFile != "" {
+		backupCmd := buildBackupCommand(trackedFile)
+		backupArgs, _ := json.Marshal(map[string]interface{}{
+			"input":   backupCmd,
+			"timeout": 5,
+		})
+		// Execute backup with a short timeout; failures are silently ignored.
+		_, backupErr := executor.Execute(ctx, 0, "", "terminal", "", backupArgs)
+		if backupErr != nil {
+			logger.WithError(backupErr).WithField("tracked_file", trackedFile).
+				Debug("pre-write backup failed (non-fatal, continuing with original command)")
+		} else {
+			logger.WithField("tracked_file", trackedFile).Debug("pre-write backup created")
+		}
 	}
 
 	var (
