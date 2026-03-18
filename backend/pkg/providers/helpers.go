@@ -46,12 +46,15 @@ type repeatingDetector struct {
 	readCounts      map[string]int // per-file path → read count this subtask
 	totalBlocks     int            // total read blocks across ALL files this subtask
 	allReadsBlocked bool           // after 5 total blocks, block ALL reads (even new files)
+	globalReadCount int            // total read operations across all files (regardless of detection)
+	maxGlobalReads  int            // hard limit on total reads per subtask
 }
 
 func newRepeatingDetector() *repeatingDetector {
 	return &repeatingDetector{
-		threshold:  RepeatingToolCallThreshold,
-		readCounts: make(map[string]int),
+		threshold:      RepeatingToolCallThreshold,
+		readCounts:     make(map[string]int),
+		maxGlobalReads: 30,
 	}
 }
 
@@ -184,33 +187,80 @@ func (rd *repeatingDetector) isReadOnlyCall(fc llms.FunctionCall) bool {
 			return true
 		}
 	}
-	// terminal tool running cat/head/tail/jq read commands
+	// terminal tool running read commands
 	if fc.Name == "terminal" {
 		// First check: if the command is a write operation, it's NOT a read.
-		// This prevents misclassification of commands like:
-		//   cat > FINDINGS.md << 'EOF' ...  (heredoc write, contains "cat ")
-		//   jq '.status="done"' STATE.json > /tmp/s.json && mv ...  (jq write, contains "jq ")
 		if isTerminalWriteCommand(fc.Arguments) {
 			return false
 		}
 
-		args := fc.Arguments
-		// Match common read-only patterns in the input field
-		for _, pattern := range []string{
-			`"cat `, `"head `, `"tail `, `"jq `, `"cat /work/`,
-			`"ls `, `"wc `, `"grep `, `"find `,
-		} {
-			if strings.Contains(args, pattern) {
+		var termArgs map[string]interface{}
+		if err := json.Unmarshal([]byte(fc.Arguments), &termArgs); err != nil {
+			// Fallback to old string matching if JSON parse fails
+			args := fc.Arguments
+			for _, pattern := range []string{
+				`"cat `, `"head `, `"tail `, `"jq `, `"cat /work/`,
+				`"ls `, `"wc `, `"grep `, `"find `,
+			} {
+				if strings.Contains(args, pattern) {
+					return true
+				}
+			}
+			return false
+		}
+		input, ok := termArgs["input"].(string)
+		if !ok || input == "" {
+			return false
+		}
+
+		// Comprehensive read-command detection including patterns that
+		// previously bypassed the cap (sed, awk, python3 file reads).
+		inputLower := strings.ToLower(input)
+
+		// sed with -i flag is a WRITE, not a read — exclude it
+		if strings.Contains(inputLower, "sed ") && !strings.Contains(inputLower, "sed -i") {
+			return true
+		}
+
+		readPatterns := []string{
+			"cat ", "head ", "tail ", "less ", "more ",
+			"awk ", "grep ", "jq ", "wc ", "ls ", "find ",
+			"file ", "stat ", "strings ", "xxd ", "hexdump ",
+			"python3 -c", "python -c", "perl -e",
+		}
+		for _, pattern := range readPatterns {
+			if strings.Contains(inputLower, pattern) {
 				return true
 			}
+		}
+
+		// Shell read patterns: $(<file), $(cat file)
+		if strings.Contains(input, "$(cat ") || strings.Contains(input, "$(<") {
+			return true
 		}
 	}
 	return false
 }
 
-// readOnlyCmdPattern matches read-only shell commands (cat, head, tail) followed by a file path.
-// It captures the first non-option argument as the file path.
-var readOnlyCmdPattern = regexp.MustCompile(`(?:^|\s)(cat|head|tail)\s+(?:-[^\s]*\s+)*([^\s|;&>]+)`)
+// readOnlyCmdPatterns matches various read-only shell commands and captures the file path.
+var readOnlyCmdPatterns = []*regexp.Regexp{
+	// cat/head/tail [-flags] FILE
+	regexp.MustCompile(`(?:^|\s)(cat|head|tail)\s+(?:-[^\s]*\s+)*([^\s|;&>]+)`),
+	// sed [-flags] 'pattern' FILE
+	regexp.MustCompile(`(?:^|\s)sed\s+(?:-[^\s]*\s+)*(?:'[^']*'|"[^"]*")\s+([^\s|;&>]+)`),
+	// awk 'program' FILE
+	regexp.MustCompile(`(?:^|\s)awk\s+(?:-[^\s]*\s+)*(?:'[^']*'|"[^"]*")\s+([^\s|;&>]+)`),
+	// grep [-flags] 'pattern' FILE
+	regexp.MustCompile(`(?:^|\s)grep\s+(?:-[^\s]*\s+)*(?:'[^']*'|"[^"]*")\s+([^\s|;&>]+)`),
+	// jq 'filter' FILE
+	regexp.MustCompile(`(?:^|\s)jq\s+(?:-[^\s]*\s+)*(?:'[^']*'|"[^"]*")\s+([^\s|;&>]+)`),
+	// python3 -c "with open('FILE')" or open("FILE")
+	regexp.MustCompile(`open\(\s*['"]([^'"]+)['"]\s*\)`),
+	// wc [-flags] FILE
+	regexp.MustCompile(`(?:^|\s)wc\s+(?:-[^\s]*\s+)*([^\s|;&>]+)`),
+	// less/more FILE
+	regexp.MustCompile(`(?:^|\s)(?:less|more)\s+([^\s|;&>]+)`),
+}
 
 // checkReadCap enforces a soft cap on per-file read operations. Read-only calls
 // are exempt from the repeat detector's detect() method to let agents bootstrap,
@@ -223,6 +273,17 @@ var readOnlyCmdPattern = regexp.MustCompile(`(?:^|\s)(cat|head|tail)\s+(?:-[^\s]
 func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, string) {
 	if !rd.isReadOnlyCall(funcCall) {
 		return false, ""
+	}
+
+	// Global read counter: absolute backstop regardless of per-file tracking
+	rd.globalReadCount++
+	if rd.globalReadCount > rd.maxGlobalReads {
+		return true, fmt.Sprintf(
+			"🛑 ABSOLUTE READ LIMIT: You have made %d read operations this subtask (limit: %d). "+
+				"ALL file reads are now blocked. You have ALL the information you need. "+
+				"STOP reading and take action — write your findings or call the result tool.",
+			rd.globalReadCount, rd.maxGlobalReads,
+		)
 	}
 
 	filePath := extractReadFilePath(funcCall)
@@ -256,7 +317,12 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 		return false, ""
 	case count <= 3:
 		return false, fmt.Sprintf(
-			"⚠️ WARNING: You've read '%s' %d times. Content unchanged — do NOT read it again. Move to actual testing.",
+			"⚠️ WARNING: You've read '%s' %d times. The content has NOT changed since your first read. "+
+				"STOP reading this file. Instead, you MUST now:\n"+
+				"1. Write your findings/report using the 'file' tool with 'update_file'\n"+
+				"2. OR execute an offensive action (curl, nmap, nuclei_scan)\n"+
+				"3. OR call the result tool if you've completed the task\n"+
+				"Reading this file again WILL be blocked.",
 			key, count,
 		)
 	default:
@@ -304,6 +370,7 @@ func (rd *repeatingDetector) resetReadCounts() {
 	rd.readCounts = make(map[string]int)
 	rd.totalBlocks = 0
 	rd.allReadsBlocked = false
+	rd.globalReadCount = 0
 }
 
 // extractReadFilePath extracts the file path from a read-only tool call.
@@ -331,10 +398,24 @@ func extractReadFilePath(fc llms.FunctionCall) string {
 		if !ok {
 			return ""
 		}
-		// Match cat/head/tail commands and extract the file path argument.
-		matches := readOnlyCmdPattern.FindStringSubmatch(input)
-		if len(matches) >= 3 {
-			return matches[2]
+		// Try each pattern to extract a file path
+		for _, pattern := range readOnlyCmdPatterns {
+			matches := pattern.FindStringSubmatch(input)
+			if len(matches) >= 2 {
+				candidate := matches[len(matches)-1]
+				if candidate != "" && !strings.HasPrefix(candidate, "-") {
+					return candidate
+				}
+			}
+		}
+		// Fallback: look for commonly tracked files in the command
+		inputLower := strings.ToLower(input)
+		for _, tracked := range []string{
+			"findings.md", "state.json", "handoff.md", "resume.md", "report.md",
+		} {
+			if strings.Contains(inputLower, tracked) {
+				return tracked
+			}
 		}
 	}
 	return ""
@@ -428,15 +509,25 @@ func injectMetricsIntoSystemPrompt(systemPrompt string, metrics ExecutionMetrics
 			urgency = "CRITICAL"
 		case timeRemainingMinutes < 10:
 			urgency = "LOW"
+		case timeRemainingMinutes < 20:
+			urgency = "MODERATE"
+		}
+
+		delegationNote := ""
+		if timeRemainingMinutes < 15 {
+			delegationNote = "\n  <delegation>BLOCKED — use terminal/file tool directly</delegation>"
+		} else if timeRemainingMinutes < 25 {
+			delegationNote = "\n  <delegation>DISCOURAGED — prefer terminal/file tool for speed</delegation>"
 		}
 
 		timeBlock := fmt.Sprintf(
 			"<time_remaining>\n"+
 				"  <minutes>%d</minutes>\n"+
-				"  <urgency>%s</urgency>\n"+
+				"  <urgency>%s</urgency>%s\n"+
 				"</time_remaining>",
 			timeRemainingMinutes,
 			urgency,
+			delegationNote,
 		)
 
 		trStartTag := "<time_remaining>"

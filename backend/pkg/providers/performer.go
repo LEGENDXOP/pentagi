@@ -301,6 +301,8 @@ func (fp *flowProvider) performAgentChain(
 	}
 	defer timeoutCancel()
 
+	timeWarningInjected := false
+
 	for {
 		if err := ctx.Err(); err != nil {
 			logger.WithError(err).Warn("context cancelled/timed out in agent chain loop")
@@ -396,6 +398,53 @@ func (fp *flowProvider) performAgentChain(
 			if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
 				logger.WithError(err).Error("failed to update msg chain after repair")
 				return err
+			}
+		}
+
+		// Proactive time-based delegation warning: inject explicit human-role message
+		// when time is running low. Uses boolean flag to prevent re-injection after
+		// chain summarization (reviewer recommendation: don't scan chain content).
+		if !timeWarningInjected && metrics.ToolCallCount > 0 {
+			if deadline, hasDL := ctx.Deadline(); hasDL {
+				remaining := time.Until(deadline)
+				if remaining > 0 && remaining < 20*time.Minute {
+					timeWarningInjected = true
+					remainingMin := int(remaining.Minutes())
+					var warningMsg string
+					if remainingMin < 10 {
+						warningMsg = fmt.Sprintf(
+							"[TIME WARNING — CRITICAL: %d minutes remaining]\n"+
+								"⛔ DO NOT delegate to coder, installer, or maintenance — delegation is BLOCKED.\n"+
+								"Write any remaining files DIRECTLY using terminal heredoc or file tool.\n"+
+								"Call the result/report tool NOW to save your work.",
+							remainingMin,
+						)
+					} else {
+						warningMsg = fmt.Sprintf(
+							"[TIME WARNING: %d minutes remaining]\n"+
+								"⚠ Do NOT delegate to coder, installer, or maintenance — there is not enough time.\n"+
+								"If you need to write files (reports, findings), use terminal heredoc directly:\n"+
+								"  cat > /work/REPORT.md << 'EOF'\n"+
+								"  [content]\n"+
+								"  EOF\n"+
+								"Focus on saving your findings and completing the report.",
+							remainingMin,
+						)
+					}
+					chain = append(chain, llms.MessageContent{
+						Role: llms.ChatMessageTypeHuman,
+						Parts: []llms.ContentPart{
+							llms.TextContent{Text: warningMsg},
+						},
+					})
+					if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+						logger.WithError(err).Error("failed to update msg chain after time warning")
+					}
+					logger.WithFields(logrus.Fields{
+						"remaining_minutes": remainingMin,
+						"tool_call_count":   metrics.ToolCallCount,
+					}).Warn("injected proactive time warning into agent chain")
+				}
 			}
 		}
 

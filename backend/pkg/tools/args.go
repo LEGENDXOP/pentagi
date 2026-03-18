@@ -132,7 +132,7 @@ type SploitusAction struct {
 type NucleiScanAction struct {
 	Target    string `json:"target" jsonschema:"required" jsonschema_description:"Target URL or host to scan (e.g. 'https://target.com' or '192.168.1.100'). Only one target per scan."`
 	Tags      string `json:"tags,omitempty" jsonschema_description:"Comma-separated nuclei template tags to filter which checks to run (e.g. 'cve,sqli,xss,lfi,rce,misconfig'). Leave empty to use all available templates."`
-	Severity  string `json:"severity,omitempty" jsonschema:"enum=critical,enum=high,enum=medium,enum=low,enum=info" jsonschema_description:"Minimum severity filter for nuclei templates. Only templates at this severity or above will be executed. Options: critical, high, medium, low, info. Default: medium."`
+	Severity  string `json:"severity,omitempty" jsonschema_description:"Comma-separated severity levels for nuclei templates (e.g. 'medium,high,critical'). Allowed values: critical, high, medium, low, info. Default: medium,high,critical."`
 	RateLimit Int64  `json:"rate_limit" jsonschema:"type=integer" jsonschema_description:"Maximum requests per second for nuclei scanner (minimum 10; maximum 500; default 100). Lower values are safer for production targets."`
 	Message   string `json:"message" jsonschema:"required,title=Nuclei scan message" jsonschema_description:"Not so long message explaining why you are running this nuclei scan and what you expect to find, to send to the user in English"`
 }

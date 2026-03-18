@@ -46,18 +46,33 @@ func checkDelegationAllowed(ctx context.Context, agentName string) string {
 		)
 	}
 
-	// Deadline gating: block delegation if <20% of timeout remains.
-	// Use 20% threshold (not 30%) to give nested agents more opportunity to work.
-	// Nested agents get their own fresh timeout anyway, so this is mainly a safety net.
+	// Deadline gating: two-tier system for delegation control.
+	// Hard block at 15 min: prevents the pattern where agents attempt delegation
+	// 5-6 times with only minutes left (Flow 38 wasted 2+ hours this way).
+	// Soft warning at 25 min: logs but allows delegation to proceed.
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
-		threshold := getSubtaskMaxDuration() / 5 // 20%
-		if remaining < threshold {
+
+		// Hard block: not enough time for delegation overhead + meaningful nested work
+		hardBlockThreshold := 15 * time.Minute
+		if remaining < hardBlockThreshold {
 			return fmt.Sprintf(
-				"Low time remaining (%v) for delegation to %s. "+
-					"Consider using terminal directly for faster execution.",
+				"DELEGATION BLOCKED: Only %v remaining — not enough time for %s. "+
+					"Write files DIRECTLY using the terminal tool with heredoc "+
+					"(cat > /work/file.md << 'EOF' ... EOF) or the file tool "+
+					"(action=update_file). Do NOT retry this delegation.",
 				remaining.Round(time.Second), agentName,
 			)
+		}
+
+		// Soft warning: delegation allowed but agent should consider direct approach
+		softWarnThreshold := 25 * time.Minute
+		if remaining < softWarnThreshold {
+			logrus.WithContext(ctx).WithFields(logrus.Fields{
+				"remaining":  remaining.Round(time.Second),
+				"agent_name": agentName,
+				"threshold":  softWarnThreshold,
+			}).Warn("delegation allowed but time is getting low")
 		}
 	}
 

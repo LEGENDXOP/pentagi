@@ -101,13 +101,40 @@ func (n *nucleiTool) Handle(ctx context.Context, name string, args json.RawMessa
 
 	// Log the command to terminal log
 	containerName := PrimaryTerminalName(n.flowID)
+
+	// Validate nuclei setup: check templates are available
+	if ok, diagMsg := n.validateNucleiSetup(ctx, containerName, logger); !ok {
+		// Attempt auto-fix: download templates
+		logger.Warn("nuclei validation failed, attempting template download: " + diagMsg)
+		fixCmd := "nuclei -update-templates 2>&1 | tail -5"
+		fixCtx, fixCancel := context.WithTimeout(ctx, 3*time.Minute)
+		defer fixCancel()
+		fixOutput, fixErr := n.execInContainer(fixCtx, containerName, fixCmd)
+		if fixErr != nil {
+			errMsg := fmt.Sprintf("[ERROR] nuclei is not properly configured: %s\nAuto-fix failed: %v\nFix output: %s",
+				diagMsg, fixErr, fixOutput)
+			formattedOutput := FormatTerminalSystemOutput(errMsg)
+			n.tlp.PutMsg(ctx, database.TermlogTypeStdout, formattedOutput, n.containerID, n.taskID, n.subtaskID)
+			return errMsg, nil
+		}
+		// Re-validate after fix
+		if ok2, diagMsg2 := n.validateNucleiSetup(ctx, containerName, logger); !ok2 {
+			errMsg := fmt.Sprintf("[ERROR] nuclei setup still invalid after template download: %s", diagMsg2)
+			formattedOutput := FormatTerminalSystemOutput(errMsg)
+			n.tlp.PutMsg(ctx, database.TermlogTypeStdout, formattedOutput, n.containerID, n.taskID, n.subtaskID)
+			return errMsg, nil
+		}
+		logger.Info("nuclei templates downloaded successfully, proceeding with scan")
+	}
 	formattedCmd := FormatTerminalInput(docker.WorkFolderPathInContainer, cmd)
 	if _, err := n.tlp.PutMsg(ctx, database.TermlogTypeStdin, formattedCmd, n.containerID, n.taskID, n.subtaskID); err != nil {
 		logger.WithError(err).Warn("failed to put terminal log for nuclei command")
 	}
 
 	// Execute nuclei in the container
+	scanStartTime := time.Now()
 	output, err := n.execInContainer(ctx, containerName, cmd)
+	scanDuration := time.Since(scanStartTime)
 	if err != nil {
 		errMsg := fmt.Sprintf("[ERROR] nuclei scan failed: %v", err)
 		if output != "" {
@@ -125,6 +152,19 @@ func (n *nucleiTool) Handle(ctx context.Context, name string, args json.RawMessa
 		}
 
 		return errMsg, nil
+	}
+
+	// Viability check: if scan completed in <5 seconds, something is likely wrong
+	if scanDuration < 5*time.Second {
+		logger.WithField("scan_duration", scanDuration).Warn("nuclei scan completed suspiciously fast — possible misconfiguration")
+		diagCmd := fmt.Sprintf("ls -la %s 2>/dev/null && wc -l %s 2>/dev/null || echo 'results file not found'",
+			nucleiOutputPath, nucleiOutputPath)
+		diagOutput, _ := n.execInContainer(ctx, containerName, diagCmd)
+		output += fmt.Sprintf("\n[DIAGNOSTIC] Scan completed in %v (expected >30s for real scan).\n"+
+			"This usually means nuclei has no templates loaded or the target is unreachable.\n"+
+			"Results file check: %s\n"+
+			"Stdout output length: %d bytes",
+			scanDuration, strings.TrimSpace(diagOutput), len(output))
 	}
 
 	// Read results file from container
@@ -200,8 +240,12 @@ func (n *nucleiTool) buildCommand(action NucleiScanAction) string {
 	// Disable update checks (running in container, templates pre-installed)
 	parts = append(parts, "-duc")
 
-	// Silent mode to reduce noise in stderr, but keep jsonl output
-	parts = append(parts, "-silent")
+	// Use -no-color to keep output parseable but don't suppress it entirely.
+	// -silent was previously used but it suppresses ALL output including error
+	// diagnostics, making it impossible to debug scan failures.
+	parts = append(parts, "-no-color")
+	parts = append(parts, "-stats")
+	parts = append(parts, "-stats-interval", "10")
 
 	return strings.Join(parts, " ")
 }
@@ -626,4 +670,33 @@ func sanitizeCSV(input string) string {
 // Helper: simple shell quoting (single quotes with escaping)
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+// validateNucleiSetup checks that nuclei has templates available.
+// Returns (ok, diagnosticMessage). If !ok, the caller should attempt template download.
+func (n *nucleiTool) validateNucleiSetup(ctx context.Context, containerName string, logger *logrus.Entry) (bool, string) {
+	checkCmd := "nuclei -tl 2>/dev/null | wc -l"
+
+	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	output, err := n.execInContainer(checkCtx, containerName, checkCmd)
+	if err != nil {
+		return false, fmt.Sprintf("failed to check nuclei templates: %v", err)
+	}
+
+	countStr := strings.TrimSpace(output)
+	count := 0
+	fmt.Sscanf(countStr, "%d", &count)
+
+	if count == 0 {
+		return false, fmt.Sprintf(
+			"nuclei has 0 templates loaded. Templates path '%s' may be empty or missing. "+
+				"Run 'nuclei -update-templates' in the container first.",
+			n.templatesPath,
+		)
+	}
+
+	logger.WithField("template_count", count).Debug("nuclei template validation passed")
+	return true, ""
 }
