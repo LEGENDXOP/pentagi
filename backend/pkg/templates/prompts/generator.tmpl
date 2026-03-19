@@ -54,7 +54,15 @@ All subtasks will be performed in:
      * ~30% for focused execution along the chosen solution path
    - Ensure each phase builds on the previous, maintaining convergence toward the goal
 
-4. **Solution Path Diversity**
+4. **Pentest Time Budget — MANDATORY for security testing tasks**
+   - MAXIMUM 1 recon subtask — combine ALL recon into ONE subtask
+   - MAXIMUM 1 report subtask — placed LAST, NEVER mid-flow
+   - MINIMUM 60% of subtasks MUST be EXPLOITATION
+   - If N subtasks total: 1 recon + (N-2) exploitation + 1 report
+   - NEVER create "Consolidate findings", "Update report", "Interim assessment" subtasks mid-flow
+   - NEVER create a second report subtask — report is written ONCE at the end
+
+5. **Solution Path Diversity**
    - Include multiple potential solution paths when appropriate
    - Create exploratory subtasks to test different approaches
    - Design the plan to allow pivoting when initial approaches prove suboptimal
@@ -275,13 +283,14 @@ Each subtask MUST:
 
    **Pentest Phase Mapping — structure subtasks around methodology:**
    ```
-   Phase 1: Bootstrap + Recon (1-2 subtasks) — nmap, nuclei_scan, tech fingerprint, JS analysis
-   Phase 2: Auth Context + Triage (1-2 subtasks) — auth_login sessions, scripted endpoint testing
-   Phase 3: Deep Dive on Top Findings (2-4 subtasks, one per attack category)
-   Phase 4: Attack Chains (1 subtask) — combine findings for escalated impact
-   Phase 5: Report Generation (1 subtask) — compile FINDINGS.md into final report
+   Phase 1: Bootstrap + Recon (EXACTLY 1 subtask) — nmap, nuclei_scan, tech fingerprint, JS analysis, endpoint enum
+   Phase 2: Auth Acquisition (1 MANDATORY subtask) — register account, try OAuth, credential stuffing, JS cred extraction
+   Phase 3: Exploitation (N-3 subtasks) — active vuln testing, one attack category group per subtask
+   Phase 4: Report Generation (EXACTLY 1 subtask, LAST) — compile FINDINGS.md into final report
    ```
-   - First subtask should ALWAYS combine recon AND triage — don't split "run nmap" and "enumerate web services" into separate subtasks
+   ⚠ HARD BUDGET: 1 recon + 1 auth + (N-3) exploitation + 1 report. MINIMUM 60% exploitation.
+   - Auth acquisition is MANDATORY — without auth, 40-60% of attack surface is untestable
+   - First subtask should ALWAYS combine recon AND triage — don't split them
    - Each subtask should represent 15-30 minutes of work. If <5 min → merge with another. If >45 min → split it.
    - For multi-target pentests, group by target not by phase (one subtask per target is better than one phase across all targets)
 

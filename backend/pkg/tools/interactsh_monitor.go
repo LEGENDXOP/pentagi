@@ -129,6 +129,12 @@ func (m *InteractshMonitor) pollOnce(ctx context.Context, logger *logrus.Entry) 
 		return
 	}
 
+	// Verify process is actually alive; attempt auto-restart if dead
+	if !m.client.ensureRunning(ctx) {
+		logger.Warn("interactsh-client process dead and auto-restart failed, skipping poll")
+		return
+	}
+
 	interactions, err := m.client.PollInteractions(ctx)
 	if err != nil {
 		logger.WithError(err).Debug("error polling interactsh interactions")

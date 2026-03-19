@@ -179,6 +179,10 @@ func (t *terminal) Handle(ctx context.Context, name string, args json.RawMessage
 			result, err := t.ReadFile(ctx, t.flowID, action.Path)
 			return t.wrapCommandResult(ctx, args, name, result, err)
 		case UpdateFile:
+			if len(action.Content) == 0 {
+				return t.wrapCommandResult(ctx, args, name, "",
+					fmt.Errorf("file write refused: content is empty. Provide non-empty content for update_file action on path %s", action.Path))
+			}
 			result, err := t.WriteFile(ctx, t.flowID, action.Content, action.Path)
 			return t.wrapCommandResult(ctx, args, name, result, err)
 		default:
@@ -370,6 +374,10 @@ func (t *terminal) getExecResult(ctx context.Context, id string, timeout time.Du
 }
 
 func (t *terminal) ReadFile(ctx context.Context, flowID int64, path string) (string, error) {
+	// Acquire mutex to prevent race conditions with concurrent writes
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	containerName := PrimaryTerminalName(flowID)
 
 	isRunning, err := t.dockerClient.IsContainerRunning(ctx, t.containerLID)
@@ -471,6 +479,10 @@ func (t *terminal) WriteFile(ctx context.Context, flowID int64, content string, 
 		}
 	}
 
+	// Acquire mutex to prevent race conditions with concurrent terminal commands
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	containerName := PrimaryTerminalName(flowID)
 
 	isRunning, err := t.dockerClient.IsContainerRunning(ctx, t.containerLID)
@@ -488,9 +500,10 @@ func (t *terminal) WriteFile(ctx context.Context, flowID int64, content string, 
 
 	filename := filepath.Base(path)
 	tarHeader := &tar.Header{
-		Name: filename,
-		Mode: 0600,
-		Size: int64(len(content)),
+		Name:    filename,
+		Mode:    0600,
+		Size:    int64(len(content)),
+		ModTime: time.Now(),
 	}
 	err = tarWriter.WriteHeader(tarHeader)
 	if err != nil {
@@ -515,13 +528,52 @@ func (t *terminal) WriteFile(ctx context.Context, flowID int64, content string, 
 		return "", fmt.Errorf("failed to write file: %w", err)
 	}
 
-	formattedCommand := FormatTerminalSystemOutput(fmt.Sprintf("Wrote to %s", path))
+	// Post-write verification: confirm file exists with expected size
+	expectedSize := int64(len(content))
+	verifyCmd := fmt.Sprintf("stat -c '%%s' '%s' 2>/dev/null || echo 'FILE_NOT_FOUND'",
+		strings.ReplaceAll(path, "'", "'\"'\"'"))
+	verifyExec, verifyErr := t.dockerClient.ContainerExecCreate(ctx, containerName, container.ExecOptions{
+		Cmd:          []string{"sh", "-c", verifyCmd},
+		AttachStdout: true,
+		AttachStderr: true,
+	})
+	if verifyErr == nil {
+		verifyCtx, verifyCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer verifyCancel()
+		verifyResp, attachErr := t.dockerClient.ContainerExecAttach(verifyCtx, verifyExec.ID, container.ExecAttachOptions{})
+		if attachErr == nil {
+			var verifyBuf bytes.Buffer
+			_, _ = io.Copy(&verifyBuf, verifyResp.Reader)
+			verifyResp.Close()
+			verifyOutput := strings.TrimSpace(verifyBuf.String())
+
+			if verifyOutput == "FILE_NOT_FOUND" || verifyOutput == "" {
+				return "", fmt.Errorf("file write verification failed: file not found at %s after write. Use terminal heredoc instead: cat > %s << 'EOF'\n...\nEOF", path, path)
+			}
+
+			var actualSize int64
+			if _, scanErr := fmt.Sscanf(verifyOutput, "%d", &actualSize); scanErr == nil {
+				if actualSize == 0 && expectedSize > 0 {
+					return "", fmt.Errorf("[ERROR] file write produced 0-byte file at %s (expected %s). Use terminal heredoc instead: cat > %s << 'EOF'\n...\nEOF",
+						path, formatByteSize(expectedSize), path)
+				}
+				logrus.WithFields(logrus.Fields{
+					"flow_id":       t.flowID,
+					"path":          path,
+					"expected_size": expectedSize,
+					"actual_size":   actualSize,
+				}).Debug("file write verification passed")
+			}
+		}
+	}
+
+	formattedCommand := FormatTerminalSystemOutput(fmt.Sprintf("Wrote to %s (%s)", path, formatByteSize(expectedSize)))
 	_, err = t.tlp.PutMsg(ctx, database.TermlogTypeStdin, formattedCommand, t.containerID, t.taskID, t.subtaskID)
 	if err != nil {
 		return "", fmt.Errorf("failed to put terminal log (write file cmd): %w", err)
 	}
 
-	return fmt.Sprintf("file %s written successfully", path), nil
+	return fmt.Sprintf("File written: %s (%s)", path, formatByteSize(expectedSize)), nil
 }
 
 func PrimaryTerminalName(flowID int64) string {
@@ -538,6 +590,16 @@ func FormatTerminalSystemOutput(text string) string {
 	blue := "\033[34m" // ANSI escape code for blue color
 	reset := "\033[0m" // ANSI escape code to reset color
 	return fmt.Sprintf("%s%s%s\r\n", blue, text, reset)
+}
+
+// formatByteSize returns a human-readable byte size string.
+func formatByteSize(size int64) string {
+	if size < 1024 {
+		return fmt.Sprintf("%d bytes", size)
+	} else if size < 1024*1024 {
+		return fmt.Sprintf("%.1f KB", float64(size)/1024)
+	}
+	return fmt.Sprintf("%.1f MB", float64(size)/(1024*1024))
 }
 
 func (t *terminal) IsAvailable() bool {

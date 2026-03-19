@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"pentagi/pkg/database"
 	"pentagi/pkg/docker"
 
 	"github.com/docker/docker/api/types/container"
@@ -18,12 +19,19 @@ import (
 )
 
 const (
-	defaultInteractshServer = "oast.fun"
-	interactshStartTimeout  = 30 * time.Second
-	interactshOutputFile    = "/work/.oob-interactions.jsonl"
-	interactshPidFile       = "/work/.interactsh.pid"
-	interactshExecTimeout   = 15 * time.Second
+	defaultInteractshServer   = "oast.fun"
+	interactshStartTimeout    = 30 * time.Second
+	interactshOutputFile      = "/work/.oob-interactions.jsonl"
+	interactshPidFile         = "/work/.interactsh.pid"
+	interactshExecTimeout     = 15 * time.Second
+	interactshMaxStartRetries = 3
+	interactshRetryDelay      = 10 * time.Second
 )
+
+// interactshStartupWarning is injected into the agent chain when interactsh fails to start after all retries.
+const interactshStartupWarning = "⚠ Interactsh OOB monitoring failed to start. " +
+	"Blind injection testing will NOT detect out-of-band callbacks. " +
+	"Adjust your testing strategy accordingly."
 
 // InteractshGetURLAction is the argument schema for the interactsh_url tool
 type InteractshGetURLAction struct {
@@ -115,6 +123,102 @@ func (ic *interactshClient) GetAttacks() map[string]string {
 		result[k] = v
 	}
 	return result
+}
+
+// checkProcessAlive verifies the interactsh-client process is actually running in the container.
+// Returns true if the PID file exists AND the process is alive.
+func (ic *interactshClient) checkProcessAlive(ctx context.Context) bool {
+	containerName := PrimaryTerminalName(ic.flowID)
+	checkCmd := fmt.Sprintf("test -f %s && kill -0 $(cat %s 2>/dev/null) 2>/dev/null && echo ALIVE || echo DEAD",
+		interactshPidFile, interactshPidFile)
+	result, err := ic.execInContainer(ctx, containerName, checkCmd, 5*time.Second)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.TrimSpace(result), "ALIVE")
+}
+
+// ensureRunning verifies that the interactsh process is actually alive.
+// If the in-memory state says running but the process is dead, it resets state and attempts a restart.
+// Returns true if interactsh is confirmed running after this call.
+func (ic *interactshClient) ensureRunning(ctx context.Context) bool {
+	if !ic.IsRunning() {
+		return false
+	}
+
+	if ic.checkProcessAlive(ctx) {
+		return true
+	}
+
+	// Process is dead but state says running — reset and try to restart
+	logger := logrus.WithFields(logrus.Fields{
+		"flow_id":   ic.flowID,
+		"component": "interactsh",
+	})
+	logger.Warn("interactsh-client process died, resetting state and attempting restart")
+
+	ic.mu.Lock()
+	ic.running = false
+	ic.baseURL = ""
+	ic.mu.Unlock()
+
+	// Attempt restart
+	if err := ic.StartWithRetry(ctx); err != nil {
+		logger.WithError(err).Error("failed to restart interactsh-client after process death")
+		return false
+	}
+	return true
+}
+
+// StartWithRetry attempts to start interactsh-client with up to interactshMaxStartRetries attempts.
+// Returns nil on success. On total failure, returns the last error and logs a prominent warning.
+func (ic *interactshClient) StartWithRetry(ctx context.Context) error {
+	logger := logrus.WithFields(logrus.Fields{
+		"flow_id":   ic.flowID,
+		"component": "interactsh",
+	})
+
+	var lastErr error
+	for attempt := 1; attempt <= interactshMaxStartRetries; attempt++ {
+		logger.WithField("attempt", attempt).Info("attempting to start interactsh-client")
+
+		lastErr = ic.Start(ctx)
+		if lastErr == nil {
+			if attempt > 1 {
+				logger.WithField("attempt", attempt).Info("interactsh-client started successfully after retry")
+			}
+			return nil
+		}
+
+		logger.WithError(lastErr).WithField("attempt", attempt).
+			Warnf("interactsh-client start attempt %d/%d failed", attempt, interactshMaxStartRetries)
+
+		if attempt < interactshMaxStartRetries {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("context cancelled during interactsh startup retry: %w", ctx.Err())
+			case <-time.After(interactshRetryDelay):
+				// continue to next attempt
+			}
+		}
+	}
+
+	logger.Error(interactshStartupWarning)
+
+	// Log to terminal if TLP is available so the warning appears in the agent's context
+	if ic.tlp != nil {
+		formattedMsg := FormatTerminalSystemOutput(interactshStartupWarning)
+		_, _ = ic.tlp.PutMsg(
+			ctx,
+			database.TermlogTypeStdout,
+			formattedMsg,
+			ic.containerID,
+			ic.taskID,
+			ic.subtaskID,
+		)
+	}
+
+	return fmt.Errorf("interactsh-client failed to start after %d attempts: %w", interactshMaxStartRetries, lastErr)
 }
 
 // Start launches interactsh-client inside the container and captures the base URL.
@@ -234,10 +338,12 @@ func (ic *interactshClient) handleGetURL(ctx context.Context, logger *logrus.Ent
 	}
 
 	if !ic.IsRunning() {
-		// Try to start on-demand
-		if err := ic.Start(ctx); err != nil {
-			return "OOB detection is not available: interactsh-client could not be started. " +
-				"You can still perform active testing without OOB callbacks.", nil
+		// Try to start on-demand with retries
+		if err := ic.StartWithRetry(ctx); err != nil {
+			return "⚠ OOB detection is NOT available: interactsh-client could not be started after " +
+				fmt.Sprintf("%d", interactshMaxStartRetries) + " attempts. " +
+				"Blind injection testing (blind SSRF, blind SQLi, blind XXE, blind RCE) will NOT detect out-of-band callbacks. " +
+				"You can still perform active testing, but adjust your strategy to focus on in-band detection methods.", nil
 		}
 	}
 
@@ -283,6 +389,13 @@ func (ic *interactshClient) handlePoll(ctx context.Context, logger *logrus.Entry
 
 	if !ic.IsRunning() {
 		return "OOB detection is not running. Use `interactsh_url` first to start the client and get a callback URL.", nil
+	}
+
+	// Verify the process is actually alive before trusting poll results
+	if !ic.ensureRunning(ctx) {
+		return "⚠ OOB detection process was found dead and could not be restarted. " +
+			"Previous OOB callback URLs are no longer being monitored. " +
+			"Use `interactsh_url` to request a new URL (this will attempt to restart the client).", nil
 	}
 
 	interactions, err := ic.PollInteractions(ctx)
@@ -358,6 +471,17 @@ func (ic *interactshClient) PollInteractions(ctx context.Context) ([]InteractshI
 
 	if !running {
 		return nil, nil
+	}
+
+	// Verify the actual process is alive
+	if !ic.checkProcessAlive(ctx) {
+		logrus.WithField("flow_id", ic.flowID).
+			Warn("interactsh-client process not alive during PollInteractions, marking as not running")
+		ic.mu.Lock()
+		ic.running = false
+		// Keep baseURL for reference but mark as not running
+		ic.mu.Unlock()
+		return nil, fmt.Errorf("interactsh-client process is no longer running (PID not alive)")
 	}
 
 	containerName := PrimaryTerminalName(ic.flowID)
