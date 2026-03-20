@@ -161,7 +161,7 @@ The refinement context is provided in XML format:
      * ~30% for diverse experimentation with different approaches
      * ~30% for evaluation and selection of the most promising path
      * ~30% for focused execution along the chosen solution path
-   - For penetration testing: 20% recon / 60% exploitation / 20% report
+   - For penetration testing: **P0=35% / P1=35% / P2=20% / Report=10%** (recon is 1 subtask max, exploitation ≥60% of subtasks)
 
 7. **Exploitation Time Protection — MANDATORY for penetration testing**
    - NEVER add more report/consolidation subtasks. EXACTLY 1 report, ALWAYS the LAST subtask.
@@ -169,6 +169,11 @@ The refinement context is provided in XML format:
    - NEVER replace an exploitation subtask with report/consolidation.
    - REJECT anti-patterns: "Consolidate findings", "Update report", "Plan next steps" mid-flow.
    - Post-modification plan MUST still have ≥60% exploitation subtasks.
+   - **Priority enforcement:** P0 categories (Auth, Data Harvest, SSRF) must be covered before adding P2/P3 subtasks.
+   - If time is running short, CUT P3 (opportunistic) categories first, NEVER cut P0.
+   - When refining: ensure at least 35% of remaining exploitation subtasks cover P0 categories.
+   - SSRF is MANDATORY — if no remaining subtask covers SSRF, ADD one immediately.
+   - **P0 coverage gate at 50% mark:** If ≥50% of subtasks are completed and P0 categories (Auth, Data Harvest, SSRF) have NOT been tested, REFUSE to add more P1/P2 subtasks. Instead, ADD a P0 subtask covering the missing P0 categories.
 
 ## STRATEGIC SEARCH USAGE
 
@@ -205,14 +210,25 @@ Each refined subtask MUST:
 
 ## ATTACK CATEGORY COVERAGE CHECK
 
-When refining penetration testing plans, check coverage of ALL 19 attack categories:
-1. IDOR/BOLA  2. Auth bypass  3. Privesc  4. Path traversal/LFI  5. CORS misconfig
-6. Mass assignment  7. Crypto failure  8. Sensitive data exposure  9. SQLi
-10. XSS (stored/reflected/DOM)  11. Command injection/SSTI  12. Business logic
-13. Rate limiting  14. Security misconfig  15. File upload  16. Vulnerable components
-17. Session mgmt  18. SSRF  19. CSRF/Open redirect
+When refining penetration testing plans, check coverage of ALL 14 attack categories by priority tier:
 
-**Before submitting refinements:** Scan planned subtasks — if multiple categories have ZERO coverage, add subtasks to fill gaps. Categories 10, 19 (XSS, CSRF/Open redirect) are mandatory for web targets.
+**P0 — MUST TEST (35% of exploitation time):**
+1. Auth Acquisition & Bypass  2. Sensitive Data Harvest  3. SSRF + Cloud Metadata
+
+**P1 — HIGH PRIORITY (35% of exploitation time):**
+4. IDOR/BOLA + Privilege Escalation  5. Business Logic & Payment Manipulation  6. Race Conditions / TOCTOU  7. Account Takeover Chains
+
+**P2 — STANDARD (20% of exploitation time):**
+8. SQL/NoSQL Injection  9. API-Specific Attacks  10. RCE Vectors  11. KYC/Identity Bypass (fintech only)
+
+**P3 — OPPORTUNISTIC (10% of exploitation time):**
+12. Cloud/Infra Misconfig  13. HTTP Smuggling & Cache Attacks  14. AI/LLM Exploitation (if applicable)
+
+**Before submitting refinements:**
+- Scan planned subtasks — ALL P0 categories (1-3) MUST have coverage. If any P0 category has ZERO coverage, ADD a subtask immediately.
+- SSRF (category 3) is MANDATORY — if no remaining subtask covers SSRF, ADD one.
+- P1 categories (4-7) should have coverage — fill gaps where possible.
+- P2/P3 categories may be skipped only if genuinely not applicable.
 
 **If a subtask failed due to auth wall / WAF / CAPTCHA:** Do NOT retry the same blocked path. Replace with a subtask targeting uncovered categories that avoid the block.
 

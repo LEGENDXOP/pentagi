@@ -255,6 +255,17 @@ type BrowserCookiesAction struct {
 	Message string `json:"message" jsonschema:"required,title=Cookies message" jsonschema_description:"Not so long message explaining why you want to retrieve cookies, to send to the user in English"`
 }
 
+// RaceConditionAction is the argument schema for the race_condition_test tool
+type RaceConditionAction struct {
+	TargetURL          string `json:"target_url" jsonschema:"required" jsonschema_description:"Target endpoint URL to test for race conditions (e.g., 'https://target.com/api/transfer'). Must be a fully qualified URL."`
+	Method             string `json:"method,omitempty" jsonschema:"enum=GET,enum=POST,enum=PUT,enum=PATCH,enum=DELETE" jsonschema_description:"HTTP method to use. Default: POST. Use POST/PUT for state-changing operations most likely to have race conditions."`
+	Headers            string `json:"headers,omitempty" jsonschema_description:"JSON string of HTTP headers to include (e.g., '{\"Authorization\": \"Bearer xxx\", \"Content-Type\": \"application/json\"}'). Include authentication and content-type headers as needed."`
+	Body               string `json:"body,omitempty" jsonschema_description:"Request body to send with each concurrent request. For JSON APIs, provide a valid JSON string."`
+	ConcurrentRequests Int64  `json:"concurrent_requests" jsonschema:"type=integer" jsonschema_description:"Number of requests to send simultaneously per round (minimum 2; maximum 50; default 10). Higher values increase chance of triggering race conditions."`
+	Rounds             Int64  `json:"rounds" jsonschema:"type=integer" jsonschema_description:"Number of test rounds to execute (minimum 1; maximum 10; default 3). Multiple rounds improve detection reliability."`
+	Message            string `json:"message" jsonschema:"required,title=Race condition test message" jsonschema_description:"Not so long message explaining what race condition you are testing for and why, to send to the user in English"`
+}
+
 type MaintenanceAction struct {
 	Question string `json:"question" jsonschema:"required" jsonschema_description:"Question to DevOps team member as a task to maintain local environment and tools inside the docker container in English"`
 	Message  string `json:"message" jsonschema:"required,title=Maintenance task message" jsonschema_description:"Not so long message with the task and question to maintain local environment to send to the user in English"`

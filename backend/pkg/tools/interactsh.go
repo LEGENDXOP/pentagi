@@ -50,6 +50,17 @@ type InteractshStatusAction struct {
 	Message string `json:"message" jsonschema:"required,title=Status message" jsonschema_description:"Not so long message explaining why you are checking OOB detection status, to send to the user in English"`
 }
 
+// PayloadLogEntry records when an OOB payload URL was generated and its intended use context.
+// This allows correlating incoming callbacks with the specific injection point that triggered them.
+type PayloadLogEntry struct {
+	AttackID       string    `json:"attack_id"`
+	Description    string    `json:"description"`
+	OOBURL         string    `json:"oob_url"`
+	ToolName       string    `json:"tool_name"`       // which tool used this URL (e.g., "terminal", "browser_navigate")
+	TargetEndpoint string    `json:"target_endpoint"` // endpoint the payload was sent to (if known)
+	Timestamp      time.Time `json:"timestamp"`
+}
+
 // interactshClient manages an interactsh-client process inside a container
 type interactshClient struct {
 	mu           sync.RWMutex
@@ -66,6 +77,9 @@ type interactshClient struct {
 
 	// Track registered attack IDs and their descriptions
 	attacks map[string]string // attackID -> description
+
+	// Payload correlation: log every generated URL with context for callback matching
+	payloadLog []PayloadLogEntry
 }
 
 // NewInteractshTool creates a new interactsh tool instance.
@@ -123,6 +137,53 @@ func (ic *interactshClient) GetAttacks() map[string]string {
 		result[k] = v
 	}
 	return result
+}
+
+// RecordPayloadContext records contextual information about where an OOB URL was used.
+// Called by the performer when it detects a tool call argument containing an interactsh URL.
+func (ic *interactshClient) RecordPayloadContext(attackID, toolName, targetEndpoint string) {
+	ic.mu.Lock()
+	defer ic.mu.Unlock()
+
+	description := ic.attacks[attackID]
+	oobURL := ""
+	if ic.baseURL != "" {
+		oobURL = sanitizeAttackID(attackID) + "." + ic.baseURL
+	}
+
+	ic.payloadLog = append(ic.payloadLog, PayloadLogEntry{
+		AttackID:       attackID,
+		Description:    description,
+		OOBURL:         oobURL,
+		ToolName:       toolName,
+		TargetEndpoint: targetEndpoint,
+		Timestamp:      time.Now(),
+	})
+}
+
+// GetPayloadLog returns a copy of the payload log for correlation.
+func (ic *interactshClient) GetPayloadLog() []PayloadLogEntry {
+	ic.mu.RLock()
+	defer ic.mu.RUnlock()
+
+	result := make([]PayloadLogEntry, len(ic.payloadLog))
+	copy(result, ic.payloadLog)
+	return result
+}
+
+// correlateInteraction attempts to match an interaction with a logged payload.
+func (ic *interactshClient) correlateInteraction(attackID string) *PayloadLogEntry {
+	ic.mu.RLock()
+	defer ic.mu.RUnlock()
+
+	// Search payload log for matching attack ID (most recent first)
+	for i := len(ic.payloadLog) - 1; i >= 0; i-- {
+		if ic.payloadLog[i].AttackID == attackID {
+			entry := ic.payloadLog[i]
+			return &entry
+		}
+	}
+	return nil
 }
 
 // checkProcessAlive verifies the interactsh-client process is actually running in the container.
@@ -347,13 +408,22 @@ func (ic *interactshClient) handleGetURL(ctx context.Context, logger *logrus.Ent
 		}
 	}
 
-	ic.mu.Lock()
-	ic.attacks[action.AttackID] = action.Description
-	ic.mu.Unlock()
-
 	// Generate a unique OOB URL for this attack
 	sanitizedID := sanitizeAttackID(action.AttackID)
-	oobURL := fmt.Sprintf("%s.%s", sanitizedID, ic.GetBaseURL())
+	baseURL := ic.GetBaseURL()
+	oobURL := fmt.Sprintf("%s.%s", sanitizedID, baseURL)
+
+	ic.mu.Lock()
+	ic.attacks[action.AttackID] = action.Description
+	// Auto-log the payload generation event for correlation
+	ic.payloadLog = append(ic.payloadLog, PayloadLogEntry{
+		AttackID:    action.AttackID,
+		Description: action.Description,
+		OOBURL:      oobURL,
+		ToolName:    "interactsh_url",
+		Timestamp:   time.Now(),
+	})
+	ic.mu.Unlock()
 
 	logger.WithFields(logrus.Fields{
 		"attack_id": action.AttackID,
@@ -519,7 +589,7 @@ func (ic *interactshClient) PollInteractions(ctx context.Context) ([]InteractshI
 		description := ic.attacks[attackID]
 		ic.mu.RUnlock()
 
-		interactions = append(interactions, InteractshInteraction{
+		interaction := InteractshInteraction{
 			AttackID:    attackID,
 			Description: description,
 			Protocol:    raw.Protocol,
@@ -529,7 +599,16 @@ func (ic *interactshClient) PollInteractions(ctx context.Context) ([]InteractshI
 			RawResponse: raw.RawResponse,
 			RemoteAddr:  raw.RemoteAddress,
 			Timestamp:   raw.Timestamp,
-		})
+		}
+
+		// Attempt payload correlation
+		if correlated := ic.correlateInteraction(attackID); correlated != nil {
+			interaction.CorrelatedToolName = correlated.ToolName
+			interaction.CorrelatedTargetEndpoint = correlated.TargetEndpoint
+			interaction.CorrelatedTimestamp = correlated.Timestamp.Format(time.RFC3339)
+		}
+
+		interactions = append(interactions, interaction)
 	}
 
 	return interactions, nil
@@ -557,6 +636,11 @@ type InteractshInteraction struct {
 	RawResponse string `json:"raw_response"`
 	RemoteAddr  string `json:"remote_addr"`
 	Timestamp   string `json:"timestamp"`
+
+	// Payload correlation fields (populated when a matching PayloadLogEntry exists)
+	CorrelatedToolName       string `json:"correlated_tool_name,omitempty"`
+	CorrelatedTargetEndpoint string `json:"correlated_target_endpoint,omitempty"`
+	CorrelatedTimestamp      string `json:"correlated_timestamp,omitempty"`
 }
 
 // parseInteractshBaseURL extracts the base URL from interactsh-client startup output
@@ -655,6 +739,17 @@ func formatInteractions(interactions []InteractshInteraction) string {
 		sb.WriteString(fmt.Sprintf("- **Remote Address:** `%s`\n", interaction.RemoteAddr))
 		sb.WriteString(fmt.Sprintf("- **Timestamp:** `%s`\n", interaction.Timestamp))
 		sb.WriteString(fmt.Sprintf("- **Full ID:** `%s`\n", interaction.FullID))
+
+		// Payload correlation details
+		if interaction.CorrelatedToolName != "" {
+			sb.WriteString(fmt.Sprintf("- **🔗 Correlated Tool:** `%s`\n", interaction.CorrelatedToolName))
+			if interaction.CorrelatedTargetEndpoint != "" {
+				sb.WriteString(fmt.Sprintf("- **🔗 Target Endpoint:** `%s`\n", interaction.CorrelatedTargetEndpoint))
+			}
+			if interaction.CorrelatedTimestamp != "" {
+				sb.WriteString(fmt.Sprintf("- **🔗 Payload Sent At:** `%s`\n", interaction.CorrelatedTimestamp))
+			}
+		}
 
 		if interaction.RawRequest != "" {
 			request := interaction.RawRequest

@@ -49,6 +49,7 @@ const (
 	BrowserScreenshotToolName = "browser_screenshot"
 	BrowserEvaluateToolName   = "browser_evaluate"
 	BrowserCookiesToolName    = "browser_cookies"
+	RaceConditionToolName      = "race_condition_test"
 	AttackPathAnalyzeToolName  = "attack_path_analyze"
 	ReportResultToolName      = "report_result"
 	SubtaskListToolName       = "subtask_list"
@@ -131,6 +132,7 @@ var toolsTypeMapping = map[string]ToolType{
 	SearchCodeToolName:        SearchVectorDbToolType,
 	StoreCodeToolName:         StoreVectorDbToolType,
 	GraphitiSearchToolName:    SearchVectorDbToolType,
+	RaceConditionToolName:     EnvironmentToolType,
 	AttackPathAnalyzeToolName: EnvironmentToolType,
 	InteractshGetURLToolName:  EnvironmentToolType,
 	InteractshPollToolName:    EnvironmentToolType,
@@ -162,6 +164,7 @@ var allowedSummarizingToolsResult = []string{
 	TerminalToolName,
 	BrowserToolName,
 	NucleiToolName,
+	RaceConditionToolName,
 	BrowserNavigateToolName,
 	BrowserEvaluateToolName,
 }
@@ -178,6 +181,7 @@ var allowedStoringInMemoryTools = []string{
 	SearxngToolName,
 	SploitusToolName,
 	NucleiToolName,
+	RaceConditionToolName,
 	AuthLoginToolName,
 	AuthStatusToolName,
 	MaintenanceToolName,
@@ -293,6 +297,16 @@ var registryDefinitions = map[string]llms.FunctionDefinition{
 			"Findings are deduplicated against previously discovered vulnerabilities in the current engagement. " +
 			"Use this for broad automated vulnerability detection before deeper manual testing.",
 		Parameters: reflector.Reflect(&NucleiScanAction{}),
+	},
+	RaceConditionToolName: {
+		Name: RaceConditionToolName,
+		Description: "Execute race condition / TOCTOU (Time-of-Check-to-Time-of-Use) tests by sending concurrent " +
+			"HTTP requests to a target endpoint. Tests for duplicate transactions, balance manipulation, " +
+			"coupon reuse, double-spend, and other time-of-check-to-time-of-use vulnerabilities. " +
+			"Analyses response status codes, timing differences, body length variations, and detects anomalies " +
+			"that indicate state inconsistencies under concurrency. Use on state-changing endpoints " +
+			"(transfers, purchases, votes, coupon redemptions) that should be idempotent.",
+		Parameters: reflector.Reflect(&RaceConditionAction{}),
 	},
 	EnricherResultToolName: {
 		Name:        EnricherResultToolName,
@@ -536,6 +550,8 @@ func getMessageType(name string) database.MsglogType {
 		BrowserScreenshotToolName, BrowserEvaluateToolName, BrowserCookiesToolName:
 		return database.MsglogTypeBrowser
 	case NucleiToolName:
+		return database.MsglogTypeTerminal
+	case RaceConditionToolName:
 		return database.MsglogTypeTerminal
 	case InteractshGetURLToolName, InteractshPollToolName, InteractshStatusToolName:
 		return database.MsglogTypeTerminal

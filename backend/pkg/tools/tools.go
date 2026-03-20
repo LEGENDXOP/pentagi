@@ -1175,6 +1175,21 @@ func (fte *flowToolsExecutor) GetPentesterExecutor(cfg PentesterExecutorConfig) 
 		ce.handlers[NucleiToolName] = nucleiTool.Handle
 	}
 
+	// Race condition / TOCTOU testing tool
+	raceTool := NewRaceConditionTool(
+		fte.flowID,
+		cfg.TaskID,
+		cfg.SubtaskID,
+		container.ID,
+		container.LocalID.String,
+		fte.docker,
+		fte.tlp,
+	)
+	if raceTool.IsAvailable() {
+		ce.definitions = append(ce.definitions, registryDefinitions[RaceConditionToolName])
+		ce.handlers[RaceConditionToolName] = raceTool.Handle
+	}
+
 	// Interactsh OOB detection tools
 	if fte.cfg.InteractshEnabled {
 		interactsh := NewInteractshTool(

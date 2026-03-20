@@ -194,7 +194,19 @@ func (fp *flowProvider) performAgentChain(
 		toolHistory          = NewToolHistory(defaultToolHistorySize)
 		execState            = NewExecutionState()
 		ctxManager           = NewContextManager(defaultMaxContextTokens)
+
+		// Sprint 3: Integration placeholders for Sprint 2 modules.
+		// These will be wired once finding_tracker.go, industry_detector.go,
+		// and category_tracker.go are created by the Sprint 2 agent.
+		chainSuggestionsInjected int // cap chain suggestions to avoid context bloat
+		industryDetected         bool
+		halfwayAlertSent         bool
 	)
+
+	// Silence unused variable warnings — these guard future Sprint 2 integration.
+	_ = chainSuggestionsInjected
+	_ = industryDetected
+	_ = halfwayAlertSent
 
 	// Async state writer — batches DB writes so the agent loop isn't blocked.
 	stateWriter := NewAsyncStateWriter(fp.db)
@@ -252,6 +264,21 @@ func (fp *flowProvider) performAgentChain(
 		logger.WithError(err).Error("failed to get execution context")
 		return fmt.Errorf("failed to get execution context: %w", err)
 	}
+
+	// TODO(sprint2): Wire IndustryDetector.DetectIndustry(executionContext) here.
+	// Once industry_detector.go is available:
+	//   industryProfile := DetectIndustry(executionContext)
+	//   if industryProfile.Type != "generic" && !industryDetected {
+	//       industryDetected = true
+	//       // Inject industry-specific playbook into system prompt
+	//       if len(chain) > 0 && chain[0].Role == llms.ChatMessageTypeSystem {
+	//           if text, ok := chain[0].Parts[0].(llms.TextContent); ok {
+	//               updated := injectIndustryIntoSystemPrompt(text.Text, industryProfile)
+	//               chain[0].Parts[0] = llms.TextContent{Text: updated}
+	//           }
+	//       }
+	//       logger.WithField("industry", industryProfile.Type).Info("detected target industry from execution context")
+	//   }
 
 	// Load persisted execution state from DB for resume (if any).
 	if subtaskID != nil {
@@ -448,6 +475,31 @@ func (fp *flowProvider) performAgentChain(
 			}
 		}
 
+		// TODO(sprint2): Wire CategoryTracker.CheckHalfwayAlert() here (50% time mark P0 coverage).
+		// Once category_tracker.go is available:
+		//   if !halfwayAlertSent && metrics.ToolCallCount > 0 {
+		//       if deadline, hasDL := ctx.Deadline(); hasDL {
+		//           elapsed := time.Since(metricsStartTime)
+		//           totalBudget := time.Until(deadline) + elapsed
+		//           if elapsed > totalBudget/2 {
+		//               shouldAlert, alertMsg := categoryTracker.CheckHalfwayAlert()
+		//               if shouldAlert {
+		//                   halfwayAlertSent = true
+		//                   chain = append(chain, llms.MessageContent{
+		//                       Role: llms.ChatMessageTypeHuman,
+		//                       Parts: []llms.ContentPart{
+		//                           llms.TextContent{Text: "[SYSTEM-AUTO] " + alertMsg},
+		//                       },
+		//                   })
+		//                   if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+		//                       logger.WithError(err).Error("failed to update msg chain after P0 coverage alert")
+		//                   }
+		//                   logger.Info("injected P0 coverage alert at 50% time mark")
+		//               }
+		//           }
+		//       }
+		//   }
+
 		result, err := fp.callWithRetries(ctx, chain, optAgentType, executor)
 		if err != nil {
 			logger.WithError(err).Error("failed to call agent chain")
@@ -626,6 +678,28 @@ func (fp *flowProvider) performAgentChain(
 			if toolCall.FunctionCall != nil {
 				ctxManager.MarkReferenced(toolCall.FunctionCall.Arguments)
 			}
+
+			// TODO(sprint2): Wire FindingTracker.RecordFinding(response) here.
+			// Once finding_tracker.go is available:
+			//   findingTracker.RecordFinding(response)
+			//   if findingTracker.HasNewHighFindings() && chainSuggestionsInjected < 3 {
+			//       chainMsg := findingTracker.GetChainSuggestions()
+			//       chain = append(chain, llms.MessageContent{
+			//           Role: llms.ChatMessageTypeHuman,
+			//           Parts: []llms.ContentPart{
+			//               llms.TextContent{Text: "[SYSTEM-AUTO] [ATTACK CHAIN SUGGESTION] " + chainMsg},
+			//           },
+			//       })
+			//       chainSuggestionsInjected++
+			//       if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+			//           logger.WithError(err).Error("failed to update msg chain after chain suggestion")
+			//       }
+			//       logger.Info("injected attack chain suggestion into agent chain")
+			//   }
+
+			// TODO(sprint2): Wire CategoryTracker.RecordToolCall(funcName, toolCall.FunctionCall.Arguments) here.
+			// Once category_tracker.go is available:
+			//   categoryTracker.RecordToolCall(funcName, toolCall.FunctionCall.Arguments)
 
 			if executor.IsBarrierFunction(funcName) {
 				wantToStop = true
