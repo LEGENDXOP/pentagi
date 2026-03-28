@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/vxcontrol/langchaingo/llms"
 	"github.com/vxcontrol/langchaingo/textsplitter"
 	"github.com/vxcontrol/langchaingo/vectorstores/pgvector"
+	"golang.org/x/time/rate"
 )
 
 const DefaultResultSizeLimit = 16 * 1024 // 16 KB
@@ -127,6 +129,24 @@ func (w *noopObservationWrapper) ctx() context.Context {
 
 func (w *noopObservationWrapper) end(result string, err error, durationSeconds float64) {
 	// no-op
+}
+
+// Fix 14: per-tool-type rate limiters to prevent runaway API costs and resource exhaustion
+var (
+	toolRateLimiters     map[ToolType]*rate.Limiter
+	toolRateLimitersOnce sync.Once
+)
+
+func getToolRateLimiters() map[ToolType]*rate.Limiter {
+	toolRateLimitersOnce.Do(func() {
+		toolRateLimiters = map[ToolType]*rate.Limiter{
+			EnvironmentToolType:    rate.NewLimiter(rate.Limit(5), 10),  // 5 rps, burst 10
+			SearchNetworkToolType:  rate.NewLimiter(rate.Limit(2), 5),   // 2 rps, burst 5
+			SearchVectorDbToolType: rate.NewLimiter(rate.Limit(5), 10),  // 5 rps, burst 10
+			AgentToolType:          rate.NewLimiter(rate.Limit(1), 3),   // 1 rps, burst 3
+		}
+	})
+	return toolRateLimiters
 }
 
 type customExecutor struct {
@@ -258,6 +278,13 @@ func (ce *customExecutor) Execute(
 
 	// Create observation based on tool type
 	toolType := GetToolType(name)
+
+	// Fix 14: apply per-tool-type rate limiting
+	if limiter, ok := getToolRateLimiters()[toolType]; ok {
+		if err := limiter.Wait(ctx); err != nil {
+			return "", fmt.Errorf("rate limit exceeded for tool '%s' (type %s): %w", name, toolType, err)
+		}
+	}
 	var obsWrapper observationWrapper
 
 	switch toolType {

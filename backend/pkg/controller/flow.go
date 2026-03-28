@@ -14,6 +14,7 @@ import (
 	"pentagi/pkg/database"
 	"pentagi/pkg/docker"
 	"pentagi/pkg/graph/subscriptions"
+	"pentagi/pkg/notifications"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/observability/langfuse"
 	"pentagi/pkg/providers"
@@ -46,18 +47,19 @@ type FlowWorker interface {
 }
 
 type flowWorker struct {
-	tc      TaskController
-	wg      *sync.WaitGroup
-	aws     map[int64]AssistantWorker
-	awsMX   *sync.Mutex
-	ctx     context.Context
-	cancel  context.CancelFunc
-	taskMX  *sync.Mutex
-	taskST  context.CancelFunc
-	taskWG  *sync.WaitGroup
-	input   chan flowInput
-	flowCtx *FlowContext
-	logger  *logrus.Entry
+	tc        TaskController
+	wg        *sync.WaitGroup
+	aws       map[int64]AssistantWorker
+	awsMX     *sync.Mutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+	taskMX    *sync.Mutex
+	taskST    context.CancelFunc
+	taskWG    *sync.WaitGroup
+	input     chan flowInput
+	closeOnce sync.Once
+	flowCtx   *FlowContext
+	logger    *logrus.Entry
 }
 
 type newFlowWorkerCtx struct {
@@ -72,11 +74,13 @@ type newFlowWorkerCtx struct {
 }
 
 type flowWorkerCtx struct {
-	db     database.Querier
-	cfg    *config.Config
-	docker docker.DockerClient
-	provs  providers.ProviderController
-	subs   subscriptions.SubscriptionsController
+	db          database.Querier
+	cfg         *config.Config
+	docker      docker.DockerClient
+	provs       providers.ProviderController
+	subs        subscriptions.SubscriptionsController
+	flowControl FlowControlManager
+	notifier    *notifications.NotificationManager
 
 	flowProviderControllers
 }
@@ -196,7 +200,11 @@ func NewFlowWorker(
 		return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to update flow in DB", err)
 	}
 
-	pub := fwc.subs.NewFlowPublisher(fwc.userID, flow.ID)
+	pub := notifications.WrapPublisher(
+		fwc.subs.NewFlowPublisher(fwc.userID, flow.ID),
+		fwc.notifier,
+		fwc.docker,
+	)
 	workers, err := newFlowProviderWorkers(ctx, flow.ID, &fwc.flowProviderControllers, pub)
 	if err != nil {
 		return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to create flow provider workers", err)
@@ -215,16 +223,22 @@ func NewFlowWorker(
 	executor.SetVectorStoreLogProvider(workers.vslw)
 	executor.SetGraphitiClient(fwc.provs.GraphitiClient())
 
+	// Wire flow control checkpoint into the provider's agent loop
+	if fwc.flowWorkerCtx.flowControl != nil {
+		flowProvider.SetFlowControlCheckpoint(fwc.flowWorkerCtx.flowControl.CheckPoint)
+	}
+
 	flowCtx := &FlowContext{
-		DB:         fwc.db,
-		UserID:     fwc.userID,
-		FlowID:     flow.ID,
-		Executor:   executor,
-		Provider:   flowProvider,
-		Publisher:  pub,
-		MsgLog:     workers.mlw,
-		TermLog:    workers.tlw,
-		Screenshot: workers.sw,
+		DB:          fwc.db,
+		UserID:      fwc.userID,
+		FlowID:      flow.ID,
+		Executor:    executor,
+		Provider:    flowProvider,
+		Publisher:   pub,
+		FlowControl: fwc.flowWorkerCtx.flowControl,
+		MsgLog:      workers.mlw,
+		TermLog:     workers.tlw,
+		Screenshot:  workers.sw,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, _ = obs.Observer.NewObservation(ctx, langfuse.WithObservationTraceID(observation.TraceID()))
@@ -261,6 +275,16 @@ func NewFlowWorker(
 
 	fw.wg.Add(1)
 	go fw.worker()
+
+	// Start flow watchdog for auto-recovery of stalled flows
+	if isWatchdogEnabled() {
+		fw.wg.Add(1)
+		go func() {
+			defer fw.wg.Done()
+			wd := newFlowWatchdog(fw)
+			wd.run(fw.ctx)
+		}()
+	}
 
 	if !fwc.dryRun {
 		if err := fw.PutInput(ctx, fwc.input); err != nil {
@@ -345,7 +369,11 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 		return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to get flow provider", err)
 	}
 
-	pub := fwc.subs.NewFlowPublisher(flow.UserID, flow.ID)
+	pub := notifications.WrapPublisher(
+		fwc.subs.NewFlowPublisher(flow.UserID, flow.ID),
+		fwc.notifier,
+		fwc.docker,
+	)
 	workers, err := newFlowProviderWorkers(ctx, flow.ID, &fwc.flowProviderControllers, pub)
 	if err != nil {
 		return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to create flow provider workers", err)
@@ -364,16 +392,22 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 	executor.SetVectorStoreLogProvider(workers.vslw)
 	executor.SetGraphitiClient(fwc.provs.GraphitiClient())
 
+	// Wire flow control checkpoint into the provider's agent loop
+	if fwc.flowControl != nil {
+		flowProvider.SetFlowControlCheckpoint(fwc.flowControl.CheckPoint)
+	}
+
 	flowCtx := &FlowContext{
-		DB:         fwc.db,
-		UserID:     flow.UserID,
-		FlowID:     flow.ID,
-		Executor:   executor,
-		Provider:   flowProvider,
-		Publisher:  pub,
-		MsgLog:     workers.mlw,
-		TermLog:    workers.tlw,
-		Screenshot: workers.sw,
+		DB:          fwc.db,
+		UserID:      flow.UserID,
+		FlowID:      flow.ID,
+		Executor:    executor,
+		Provider:    flowProvider,
+		Publisher:   pub,
+		FlowControl: fwc.flowControl,
+		MsgLog:      workers.mlw,
+		TermLog:     workers.tlw,
+		Screenshot:  workers.sw,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, _ = obs.Observer.NewObservation(ctx, langfuse.WithObservationTraceID(observation.TraceID()))
@@ -437,6 +471,16 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 
 	fw.wg.Add(1)
 	go fw.worker()
+
+	// Start flow watchdog for auto-recovery of stalled flows
+	if isWatchdogEnabled() {
+		fw.wg.Add(1)
+		go func() {
+			defer fw.wg.Done()
+			wd := newFlowWatchdog(fw)
+			wd.run(fw.ctx)
+		}()
+	}
 
 	flowSpan.End(langfuse.WithSpanStatus("flow worker restored"))
 
@@ -594,9 +638,17 @@ func (fw *flowWorker) PutInput(ctx context.Context, input string) error {
 	}
 }
 
-func (fw *flowWorker) Finish(ctx context.Context) error {
+func (fw *flowWorker) Finish(ctx context.Context) (retErr error) {
 	ctx, span := obs.Observer.NewSpan(ctx, obs.SpanKindInternal, "controller.flowWorker.Finish")
 	defer span.End()
+
+	defer func() {
+		if retErr != nil {
+			// On any error path, mark the flow as failed so it doesn't remain
+			// in "Running" status on restart and attempt to resume corrupted state.
+			_ = fw.SetStatus(ctx, database.FlowStatusFailed)
+		}
+	}()
 
 	if err := fw.finish(); err != nil {
 		return err
@@ -685,7 +737,7 @@ func (fw *flowWorker) finish() error {
 	}
 
 	fw.cancel()
-	close(fw.input)
+	fw.closeOnce.Do(func() { close(fw.input) })
 	fw.wg.Wait()
 
 	return nil
@@ -788,7 +840,8 @@ func (fw *flowWorker) runTask(spanName, input string, task TaskWorker) error {
 	)
 
 	fw.taskMX.Lock()
-	fw.taskST()
+	fw.taskST()    // cancel previous task
+	fw.taskWG.Wait() // wait for previous task to fully stop before starting new one
 	ctx, taskST := context.WithCancel(fw.ctx)
 	fw.taskST = taskST
 	fw.taskMX.Unlock()

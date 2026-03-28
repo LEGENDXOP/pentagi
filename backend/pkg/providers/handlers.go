@@ -3,8 +3,10 @@ package providers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"pentagi/pkg/cast"
 	"pentagi/pkg/csum"
@@ -21,8 +23,60 @@ import (
 )
 
 func wrapError(ctx context.Context, msg string, err error) error {
+	if err == nil {
+		logrus.WithContext(ctx).Error(msg)
+		return errors.New(msg)
+	}
 	logrus.WithContext(ctx).WithError(err).Error(msg)
 	return fmt.Errorf("%s: %w", msg, err)
+}
+
+// checkDelegationAllowed verifies that nesting depth and remaining time
+// permit spawning another nested agent chain. Returns a user-friendly error
+// message string (empty if delegation is allowed).
+func checkDelegationAllowed(ctx context.Context, agentName string) string {
+	maxDepth := getMaxNestingDepth()
+	depth := getNestingDepth(ctx)
+	if depth >= maxDepth {
+		return fmt.Sprintf(
+			"Maximum agent delegation depth reached (%d/%d). "+
+				"Consider using terminal directly for faster execution instead of "+
+				"delegating to %s. Write scripts directly, use 'apt-get install' in terminal, etc.",
+			depth, maxDepth, agentName,
+		)
+	}
+
+	// Deadline gating: two-tier system for delegation control.
+	// Hard block at 15 min: prevents the pattern where agents attempt delegation
+	// 5-6 times with only minutes left (Flow 38 wasted 2+ hours this way).
+	// Soft warning at 25 min: logs but allows delegation to proceed.
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+
+		// Hard block: not enough time for delegation overhead + meaningful nested work
+		hardBlockThreshold := 15 * time.Minute
+		if remaining < hardBlockThreshold {
+			return fmt.Sprintf(
+				"DELEGATION BLOCKED: Only %v remaining — not enough time for %s. "+
+					"Write files DIRECTLY using the terminal tool with heredoc "+
+					"(cat > /work/file.md << 'EOF' ... EOF) or the file tool "+
+					"(action=update_file). Do NOT retry this delegation.",
+				remaining.Round(time.Second), agentName,
+			)
+		}
+
+		// Soft warning: delegation allowed but agent should consider direct approach
+		softWarnThreshold := 25 * time.Minute
+		if remaining < softWarnThreshold {
+			logrus.WithContext(ctx).WithFields(logrus.Fields{
+				"remaining":  remaining.Round(time.Second),
+				"agent_name": agentName,
+				"threshold":  softWarnThreshold,
+			}).Warn("delegation allowed but time is getting low")
+		}
+	}
+
+	return ""
 }
 
 func wrapErrorEndAgentSpan(ctx context.Context, span langfuse.Agent, msg string, err error) error {
@@ -230,6 +284,11 @@ func (fp *flowProvider) GetCoderHandler(ctx context.Context, taskID, subtaskID *
 	}
 
 	coderHandler := func(ctx context.Context, action tools.CoderAction) (string, error) {
+		if msg := checkDelegationAllowed(ctx, "coder"); msg != "" {
+			logrus.WithContext(ctx).WithField("depth", getNestingDepth(ctx)).Warn("coder delegation blocked: " + msg)
+			return "", fmt.Errorf("%s", msg)
+		}
+
 		coderContext := map[string]map[string]any{
 			"user": {
 				"Question": action.Question,
@@ -327,6 +386,11 @@ func (fp *flowProvider) GetInstallerHandler(ctx context.Context, taskID, subtask
 	}
 
 	installerHandler := func(ctx context.Context, action tools.MaintenanceAction) (string, error) {
+		if msg := checkDelegationAllowed(ctx, "installer"); msg != "" {
+			logrus.WithContext(ctx).WithField("depth", getNestingDepth(ctx)).Warn("installer delegation blocked: " + msg)
+			return "", fmt.Errorf("%s", msg)
+		}
+
 		installerContext := map[string]map[string]any{
 			"user": {
 				"Question": action.Question,
@@ -427,36 +491,38 @@ func (fp *flowProvider) GetMemoristHandler(ctx context.Context, taskID, subtaskI
 		if action.TaskID != nil && taskID != nil && action.TaskID.Int64() == *taskID {
 			executionDetails += fmt.Sprintf("user requested current task '%d'\n", *taskID)
 		} else if action.TaskID != nil {
-			taskID := action.TaskID.Int64()
+			requestedTaskID := action.TaskID.Int64()
 			t, err := fp.db.GetFlowTask(ctx, database.GetFlowTaskParams{
-				ID:     taskID,
+				ID:     requestedTaskID,
 				FlowID: fp.flowID,
 			})
 			if err != nil {
-				executionDetails += fmt.Sprintf("failed to get requested task '%d': %s\n", taskID, err)
+				executionDetails += fmt.Sprintf("failed to get requested task '%d': %s\n", requestedTaskID, err)
 			}
 			requestedTask = &t
+		} else if taskID != nil {
+			executionDetails += fmt.Sprintf("user did not specify a task, using current task '%d'\n", *taskID)
 		} else {
-			executionDetails += fmt.Sprintf("user no specified task, using current task '%d'\n", taskID)
+			executionDetails += "user did not specify a task and no current task is set\n"
 		}
 
 		var requestedSubtask *database.Subtask
 		if action.SubtaskID != nil && subtaskID != nil && action.SubtaskID.Int64() == *subtaskID {
 			executionDetails += fmt.Sprintf("user requested current subtask '%d'\n", *subtaskID)
 		} else if action.SubtaskID != nil {
-			subtaskID := action.SubtaskID.Int64()
+			requestedSubtaskID := action.SubtaskID.Int64()
 			st, err := fp.db.GetFlowSubtask(ctx, database.GetFlowSubtaskParams{
-				ID:     subtaskID,
+				ID:     requestedSubtaskID,
 				FlowID: fp.flowID,
 			})
 			if err != nil {
-				executionDetails += fmt.Sprintf("failed to get requested subtask '%d': %s\n", subtaskID, err)
+				executionDetails += fmt.Sprintf("failed to get requested subtask '%d': %s\n", requestedSubtaskID, err)
 			}
 			requestedSubtask = &st
 		} else if subtaskID != nil {
-			executionDetails += fmt.Sprintf("user no specified subtask, using current subtask '%d'\n", *subtaskID)
+			executionDetails += fmt.Sprintf("user did not specify a subtask, using current subtask '%d'\n", *subtaskID)
 		} else {
-			executionDetails += "user no specified subtask, using all subtasks related to the task\n"
+			executionDetails += "user did not specify a subtask, using all subtasks related to the task\n"
 		}
 
 		memoristContext := map[string]map[string]any{
@@ -521,7 +587,8 @@ func (fp *flowProvider) GetMemoristHandler(ctx context.Context, taskID, subtaskI
 
 		memoristResult, err := fp.performMemorist(ctx, taskID, subtaskID, systemMemoristTmpl, userMemoristTmpl, action.Question)
 		if err != nil {
-			return "", wrapError(ctx, "failed to get memorist result", err)
+			logrus.WithContext(ctx).WithError(err).Warn("memorist failed, returning degraded result")
+			return "Memory lookup is temporarily unavailable. Please proceed without historical context.", nil
 		}
 
 		return memoristResult, nil
@@ -558,6 +625,33 @@ func (fp *flowProvider) GetPentesterHandler(ctx context.Context, taskID, subtask
 	}
 
 	pentesterHandler := func(ctx context.Context, action tools.PentesterAction) (string, error) {
+		if msg := checkDelegationAllowed(ctx, "pentester"); msg != "" {
+			logrus.WithContext(ctx).WithField("depth", getNestingDepth(ctx)).Warn("pentester delegation blocked: " + msg)
+			return "", fmt.Errorf("%s", msg)
+		}
+
+		// Load persisted execution state for this subtask (if any).
+		var subtaskContext string
+		if subtaskID != nil {
+			if st, err := fp.db.GetSubtask(ctx, *subtaskID); err == nil && st.Context != "" {
+				if parsed := ParseExecutionState(st.Context); parsed != nil {
+					if j, err := parsed.ToJSON(); err == nil {
+						subtaskContext = j
+					}
+				}
+			}
+		}
+
+		// Query cross-flow findings to share intelligence between concurrent assessments.
+		var crossFlowInsights string
+		crossFlowRows, err := fp.db.GetRecentCrossFlowFindings(ctx, fp.flowID)
+		if err != nil {
+			logrus.WithContext(ctx).WithError(err).Warn("failed to query cross-flow findings, continuing without them")
+		} else if len(crossFlowRows) > 0 {
+			insights := ExtractCrossFlowInsights(crossFlowRows)
+			crossFlowInsights = FormatInsightsForPrompt(insights)
+		}
+
 		pentesterContext := map[string]map[string]any{
 			"user": {
 				"Question": action.Question,
@@ -568,6 +662,16 @@ func (fp *flowProvider) GetPentesterHandler(ctx context.Context, taskID, subtask
 				"StoreGuideToolName":      tools.StoreGuideToolName,
 				"GraphitiEnabled":         fp.graphitiClient != nil && fp.graphitiClient.IsEnabled(),
 				"GraphitiSearchToolName":  tools.GraphitiSearchToolName,
+				"InteractshEnabled":       fp.interactshEnabled,
+				"InteractshGetURLToolName":  tools.InteractshGetURLToolName,
+				"InteractshPollToolName":    tools.InteractshPollToolName,
+				"InteractshStatusToolName":  tools.InteractshStatusToolName,
+				"AuthStoreEnabled":          fp.authStoreEnabled,
+				"AuthLoginToolName":         tools.AuthLoginToolName,
+				"AuthStatusToolName":        tools.AuthStatusToolName,
+				"AuthInjectToolName":        tools.AuthInjectToolName,
+				"AuthRefreshToolName":       tools.AuthRefreshToolName,
+				"AuthLogoutToolName":        tools.AuthLogoutToolName,
 				"SearchToolName":          tools.SearchToolName,
 				"CoderToolName":           tools.CoderToolName,
 				"AdviceToolName":          tools.AdviceToolName,
@@ -580,9 +684,12 @@ func (fp *flowProvider) GetPentesterHandler(ctx context.Context, taskID, subtask
 				"Cwd":                     docker.WorkFolderPathInContainer,
 				"ContainerPorts":          fp.getContainerPortsDescription(),
 				"ExecutionContext":        executionContext,
+				"SubtaskContext":          subtaskContext,
+				"CrossFlowInsights":      crossFlowInsights,
 				"Lang":                    fp.language,
 				"CurrentTime":             getCurrentTime(),
 				"ToolPlaceholder":         ToolPlaceholder,
+				"ExecutionMetrics":        &ExecutionMetrics{}, // zero-valued; refreshed in agent loop
 			},
 		}
 
@@ -850,13 +957,66 @@ func (fp *flowProvider) GetSummarizeResultHandler(taskID, subtaskID *int64) tool
 			return "", wrapErrorEndAgentSpan(ctx, summarizerAgent, "failed to get summarizer template", err)
 		}
 
-		// TODO: here need to summarize result by chunks in iterations
+		// Context-aware content preservation: extract findings/critical content
+		// before applying size-based truncation. Findings must NEVER be lost.
+		findingsBlock := ExtractFindings(result)
+
+		// Preserve beginning, middle samples, and end to avoid silently dropping important content
 		if len(result) > 2*msgSummarizerLimit {
-			result = database.SanitizeUTF8(
-				result[:msgSummarizerLimit] +
-					"\n\n{TRUNCATED}...\n\n" +
-					result[len(result)-msgSummarizerLimit:],
-			)
+			chunkSize := msgSummarizerLimit / 2
+			totalBudget := 2 * msgSummarizerLimit
+
+			// Reserve space for findings block if present
+			findingsOverhead := len(findingsBlock)
+			if findingsOverhead > 0 {
+				// Reduce available budget for head/middle/tail to make room for findings
+				totalBudget = max(totalBudget-findingsOverhead, msgSummarizerLimit)
+				chunkSize = totalBudget / 4
+			}
+
+			// Always keep the first and last chunk
+			head := result[:min(chunkSize, len(result))]
+			tail := result[max(len(result)-chunkSize, 0):]
+
+			// Sample from the middle to fill remaining budget
+			middleBudget := totalBudget - 2*chunkSize
+			middleStart := chunkSize
+			middleEnd := len(result) - chunkSize
+			middleLen := middleEnd - middleStart
+
+			var middle string
+			if middleBudget > 0 && middleLen > 0 {
+				if middleLen <= middleBudget {
+					middle = result[middleStart:middleEnd]
+				} else {
+					// Take evenly spaced samples from the middle
+					numSamples := 3
+					sampleSize := middleBudget / numSamples
+					var samples []string
+					for i := 0; i < numSamples; i++ {
+						offset := middleStart + (middleLen*i)/numSamples
+						end := offset + sampleSize
+						if end > middleEnd {
+							end = middleEnd
+						}
+						samples = append(samples, result[offset:end])
+					}
+					middle = strings.Join(samples, "\n\n{...}\n\n")
+				}
+			}
+
+			truncated := head +
+				"\n\n{SAMPLED_MIDDLE}...\n\n" +
+				middle +
+				"\n\n{...END_SECTION}...\n\n" +
+				tail
+
+			// Prepend preserved findings so the LLM summarizer always sees them
+			if findingsBlock != "" {
+				truncated = "{PRESERVED_FINDINGS}\n" + findingsBlock + "\n{END_PRESERVED_FINDINGS}\n\n" + truncated
+			}
+
+			result = database.SanitizeUTF8(truncated)
 		}
 
 		opt := pconfig.OptionsTypeSimple
@@ -924,6 +1084,17 @@ func (fp *flowProvider) fixToolCallArgs(
 	toolCallFixerResult, err := fp.performSimpleChain(ctx, nil, nil, opt, msgChainType, systemToolCallFixerTmpl, userToolCallFixerTmpl)
 	if err != nil {
 		return nil, wrapErrorEndAgentSpan(ctx, toolCallFixerAgent, "failed to get tool call fixer result", err)
+	}
+
+	// Validate that the fixer produced valid JSON before returning
+	var fixedArgs map[string]any
+	if err := json.Unmarshal([]byte(toolCallFixerResult), &fixedArgs); err != nil {
+		toolCallFixerAgent.End(
+			langfuse.WithAgentStatus("invalid_json"),
+			langfuse.WithAgentOutput(toolCallFixerResult),
+			langfuse.WithAgentLevel(langfuse.ObservationLevelWarning),
+		)
+		return nil, fmt.Errorf("tool call fixer produced invalid JSON: %w", err)
 	}
 
 	toolCallFixerAgent.End(

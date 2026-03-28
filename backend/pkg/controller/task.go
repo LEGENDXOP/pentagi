@@ -4,12 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
+	"time"
 
 	"pentagi/pkg/database"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/providers"
 	"pentagi/pkg/tools"
+
+	"github.com/sirupsen/logrus"
 )
 
 type FlowUpdater interface {
@@ -196,43 +201,53 @@ func (tw *taskWorker) GetStatus(ctx context.Context) (database.TaskStatus, error
 
 // this function is exclusively change task internal properties "completed" and "waiting"
 func (tw *taskWorker) SetStatus(ctx context.Context, status database.TaskStatus) error {
+	// Acquire lock FIRST to prevent race between DB write and in-memory state read
+	tw.mx.Lock()
+
 	task, err := tw.taskCtx.DB.UpdateTaskStatus(ctx, database.UpdateTaskStatusParams{
 		Status: status,
 		ID:     tw.taskCtx.TaskID,
 	})
 	if err != nil {
+		tw.mx.Unlock()
 		return fmt.Errorf("failed to set task %d status: %w", tw.taskCtx.TaskID, err)
 	}
 
 	subtasks, err := tw.taskCtx.DB.GetTaskSubtasks(ctx, tw.taskCtx.TaskID)
 	if err != nil {
+		tw.mx.Unlock()
 		return fmt.Errorf("failed to get task %d subtasks: %w", tw.taskCtx.TaskID, err)
 	}
 
 	tw.taskCtx.Publisher.TaskUpdated(ctx, task, subtasks)
 
-	tw.mx.Lock()
-	defer tw.mx.Unlock()
-
+	// Update in-memory state while holding the lock
+	var flowStatus database.FlowStatus
 	switch status {
 	case database.TaskStatusRunning:
 		tw.completed = false
 		tw.waiting = false
-		err = tw.updater.SetStatus(ctx, database.FlowStatusRunning)
+		flowStatus = database.FlowStatusRunning
 	case database.TaskStatusWaiting:
 		tw.completed = false
 		tw.waiting = true
-		err = tw.updater.SetStatus(ctx, database.FlowStatusWaiting)
+		flowStatus = database.FlowStatusWaiting
 	case database.TaskStatusFinished, database.TaskStatusFailed:
 		tw.completed = true
 		tw.waiting = false
 		// the last task was done, set flow status to Waiting new user input
-		err = tw.updater.SetStatus(ctx, database.FlowStatusWaiting)
+		flowStatus = database.FlowStatusWaiting
 	default:
+		tw.mx.Unlock()
 		// status Created is not possible to set by this call
 		return fmt.Errorf("unsupported task status: %s", status)
 	}
-	if err != nil {
+
+	// Release lock BEFORE calling updater to prevent deadlock in the
+	// Task→Flow status propagation chain
+	tw.mx.Unlock()
+
+	if err := tw.updater.SetStatus(ctx, flowStatus); err != nil {
 		return fmt.Errorf("failed to set flow status in back propagation: %w", err)
 	}
 
@@ -269,17 +284,49 @@ func (tw *taskWorker) PutInput(ctx context.Context, input string) error {
 		if !st.IsCompleted() && st.IsWaiting() {
 			if err := st.PutInput(ctx, input); err != nil {
 				return fmt.Errorf("failed to put input to subtask %d: %w", st.GetSubtaskID(), err)
-			} else {
-				break
 			}
+			return nil
 		}
 	}
 
-	return nil
+	// Zombie state recovery: task is waiting but no in-memory subtask is waiting.
+	// This happens when the refiner crashes after a subtask completes — remaining
+	// subtasks stay in "created" status and were never loaded as workers.
+	// Check if there are planned subtasks in the DB that can be executed.
+	planned, err := tw.taskCtx.DB.GetTaskPlannedSubtasks(ctx, tw.taskCtx.TaskID)
+	if err != nil {
+		return fmt.Errorf("task %d is waiting but no subtask is waiting for input (db check failed: %w)", tw.taskCtx.TaskID, err)
+	}
+
+	if len(planned) > 0 {
+		// Found created/waiting subtasks in DB. Transition task back to running
+		// so that Run() can pick them up via PopSubtask(). The caller (processInput)
+		// will call runTask() after PutInput succeeds, which calls task.Run().
+		logrus.WithContext(ctx).WithFields(logrus.Fields{
+			"task_id":            tw.taskCtx.TaskID,
+			"planned_subtasks":   len(planned),
+			"next_subtask_id":    planned[0].ID,
+			"next_subtask_title": planned[0].Title,
+		}).Info("zombie recovery: task waiting with no waiting subtask, resetting to running for re-execution")
+
+		if err := tw.SetStatus(ctx, database.TaskStatusRunning); err != nil {
+			return fmt.Errorf("zombie recovery failed to reset task %d status: %w", tw.taskCtx.TaskID, err)
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("task %d is waiting but no subtask is waiting for input", tw.taskCtx.TaskID)
 }
 
 func (tw *taskWorker) Run(ctx context.Context) error {
 	ctx = tools.PutAgentContext(ctx, database.MsgchainTypePrimaryAgent)
+
+	maxRetries := getSubtaskMaxRetries()
+	logger := logrus.WithContext(ctx).WithFields(logrus.Fields{
+		"task_id": tw.taskCtx.TaskID,
+		"flow_id": tw.taskCtx.FlowID,
+	})
 
 	for len(tw.stc.ListSubtasks(ctx)) < providers.TasksNumberLimit+3 {
 		st, err := tw.stc.PopSubtask(ctx, tw)
@@ -292,8 +339,28 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 			break
 		}
 
-		if err := st.Run(ctx); err != nil {
-			return err
+		// Subtask execution with retry logic
+		subtaskErr := tw.runSubtaskWithRetry(ctx, st, maxRetries, logger)
+		if subtaskErr != nil {
+			// Context cancellation is always fatal — propagate immediately
+			if errors.Is(subtaskErr, context.Canceled) {
+				return subtaskErr
+			}
+
+			// If subtask is waiting for user input, propagate
+			if tw.IsWaiting() {
+				return nil
+			}
+
+			// After exhausting retries, skip this subtask and continue to next
+			logger.WithError(subtaskErr).WithFields(logrus.Fields{
+				"subtask_id":    st.GetSubtaskID(),
+				"subtask_title": st.GetTitle(),
+			}).Warn("subtask failed after all retries, skipping to next subtask")
+
+			// Mark as failed and continue
+			_ = st.SetStatus(ctx, database.SubtaskStatusFailed)
+			continue
 		}
 
 		// pass through if task is waiting from back status propagation
@@ -305,8 +372,34 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 			if errors.Is(err, context.Canceled) {
 				ctx = context.Background()
 			}
-			_ = tw.SetStatus(ctx, database.TaskStatusWaiting)
-			return fmt.Errorf("failed to refine subtasks list for the task %d: %w", tw.taskCtx.TaskID, err)
+
+			// Refiner failure is non-fatal: log the error and continue executing
+			// remaining subtasks. Without this recovery, the task enters a zombie
+			// state where it's "waiting" but no subtask is "waiting" for input,
+			// making it impossible to resume via PutInput or the watchdog.
+			logger.WithError(err).WithField("task_id", tw.taskCtx.TaskID).
+				Warn("refiner failed, recovering: will continue with remaining subtasks")
+
+			// Check if there are still created subtasks to execute.
+			// If yes, continue the loop — PopSubtask will pick the next one.
+			// If no, break out and let the task finalize normally.
+			remaining, dbErr := tw.taskCtx.DB.GetTaskPlannedSubtasks(ctx, tw.taskCtx.TaskID)
+			if dbErr != nil {
+				logger.WithError(dbErr).Error("refiner recovery: failed to check remaining subtasks")
+				_ = tw.SetStatus(ctx, database.TaskStatusWaiting)
+				return fmt.Errorf("failed to refine subtasks list for the task %d: %w", tw.taskCtx.TaskID, err)
+			}
+
+			if len(remaining) == 0 {
+				// No more subtasks to execute — break out to finalize the task
+				logger.Info("refiner recovery: no remaining subtasks, proceeding to task finalization")
+				break
+			}
+
+			// There are remaining subtasks — continue the execution loop
+			logger.WithField("remaining_subtasks", len(remaining)).
+				Info("refiner recovery: continuing with remaining subtasks")
+			continue
 		}
 	}
 
@@ -365,4 +458,98 @@ func (tw *taskWorker) Finish(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// runSubtaskWithRetry executes a subtask with exponential backoff retry.
+// Returns nil on success, context.Canceled if cancelled, or the last error
+// after exhausting all retries.
+func (tw *taskWorker) runSubtaskWithRetry(
+	ctx context.Context,
+	st SubtaskWorker,
+	maxRetries int,
+	logger *logrus.Entry,
+) error {
+	var lastErr error
+	backoffs := []time.Duration{30 * time.Second, 90 * time.Second, 270 * time.Second}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Wait with exponential backoff before retry
+			backoffIdx := attempt - 1
+			if backoffIdx >= len(backoffs) {
+				backoffIdx = len(backoffs) - 1
+			}
+			delay := backoffs[backoffIdx]
+
+			logger.WithFields(logrus.Fields{
+				"subtask_id":    st.GetSubtaskID(),
+				"subtask_title": st.GetTitle(),
+				"attempt":       attempt,
+				"max_retries":   maxRetries,
+				"backoff":       delay.String(),
+			}).Warn("subtask failed, retrying after backoff")
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+
+			// Reset subtask status to created for re-run
+			if err := st.SetStatus(ctx, database.SubtaskStatusCreated); err != nil {
+				logger.WithError(err).Error("failed to reset subtask status for retry")
+				return err
+			}
+
+			// Reset execution state (including tool_call_count) so the retry
+			// starts fresh instead of immediately hitting limits again.
+			if subtaskDB, getErr := tw.taskCtx.DB.GetSubtask(ctx, st.GetSubtaskID()); getErr == nil && subtaskDB.Context != "" {
+				if parsed := providers.ParseExecutionState(subtaskDB.Context); parsed != nil {
+					oldCount := parsed.ToolCallCount
+					parsed.ToolCallCount = 0
+					parsed.ErrorCount = 0
+					parsed.Phase = "retry"
+					parsed.AttacksDone = nil
+					parsed.CurrentAttack = ""
+					if stateJSON, jsonErr := parsed.ToJSON(); jsonErr == nil {
+						tw.taskCtx.DB.UpdateSubtaskContextWithTimestamp(ctx, database.UpdateSubtaskContextWithTimestampParams{
+							ID:      st.GetSubtaskID(),
+							Context: stateJSON,
+						})
+					}
+					logger.WithFields(logrus.Fields{
+						"subtask_id":     st.GetSubtaskID(),
+						"old_tool_count": oldCount,
+					}).Info("retrying subtask, resetting tool call count from old value to 0")
+				}
+			}
+		}
+
+		lastErr = st.Run(ctx)
+		if lastErr == nil {
+			return nil // success
+		}
+
+		// Context cancellation is not retryable
+		if errors.Is(lastErr, context.Canceled) {
+			return lastErr
+		}
+
+		// If subtask went to waiting state (user input needed), not retryable
+		if tw.IsWaiting() || st.IsWaiting() {
+			return lastErr
+		}
+	}
+
+	return lastErr
+}
+
+// getSubtaskMaxRetries returns the max retry count from env var or default.
+func getSubtaskMaxRetries() int {
+	if v := os.Getenv("SUBTASK_MAX_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 2 // default
 }

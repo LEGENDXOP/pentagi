@@ -38,4 +38,30 @@
     {{end}}
   </previous_subtasks>
   {{end}}
+
+  {{if .WorkspaceFiles}}
+  <workspace_state>
+    <description>Files already present in the working directory. Consider these when planning — avoid re-creating work that already exists.</description>
+    <working_directory>{{.Cwd}}</working_directory>
+    {{range .WorkspaceFiles}}
+    <file>
+      <path>{{.Path}}</path>
+      <size>{{.Size}}</size>
+      <modified>{{.Modified}}</modified>
+    </file>
+    {{end}}
+  </workspace_state>
+  {{end}}
+
+  {{if .ExecutionState}}
+  <execution_state>
+  {{.ExecutionState}}
+  </execution_state>
+  {{end}}
+
+  {{if .ExecutionLogs}}
+  <execution_logs>
+  {{.ExecutionLogs}}
+  </execution_logs>
+  {{end}}
 </task_context>

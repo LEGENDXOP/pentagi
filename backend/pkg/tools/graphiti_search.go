@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"pentagi/pkg/graphiti"
@@ -23,6 +24,13 @@ type graphitiSearcher interface {
 	RecentContextSearch(ctx context.Context, req graphiti.RecentContextSearchRequest) (*graphiti.RecentContextSearchResponse, error)
 	EntityByLabelSearch(ctx context.Context, req graphiti.EntityByLabelSearchRequest) (*graphiti.EntityByLabelSearchResponse, error)
 }
+
+// graphitiFallbackSearcher is an optional interface for circuit breaker fallback.
+// Clients that support fallback (e.g., *graphiti.Client with a configured pgvector store) implement this.
+type graphitiFallbackSearcher interface {
+	FallbackSearch(ctx context.Context, query string, groupID string) (string, error)
+}
+
 
 const (
 	// Default values for search parameters
@@ -60,6 +68,11 @@ type GraphitiSearchTool struct {
 	taskID         *int64
 	subtaskID      *int64
 	graphitiClient graphitiSearcher
+
+	// queryCache deduplicates identical searches within the same subtask.
+	// Key: normalized "searchType:query" string. Value: cached result.
+	queryCache map[string]string
+	cacheMu    sync.Mutex
 }
 
 // NewGraphitiSearchTool creates a new Graphiti search tool
@@ -73,6 +86,7 @@ func NewGraphitiSearchTool(
 		taskID:         taskID,
 		subtaskID:      subtaskID,
 		graphitiClient: graphitiClient,
+		queryCache:     make(map[string]string),
 	}
 }
 
@@ -110,6 +124,18 @@ func (t *GraphitiSearchTool) Handle(ctx context.Context, name string, args json.
 		return "", fmt.Errorf("search_type parameter is required")
 	}
 
+	// Dedup: check if the same search was already executed in this subtask.
+	// Cache key is normalized (lowercase, trimmed) "searchType:query".
+	cacheKey := strings.ToLower(strings.TrimSpace(searchArgs.SearchType)) + ":" +
+		strings.ToLower(strings.TrimSpace(searchArgs.Query))
+	t.cacheMu.Lock()
+	if cached, ok := t.queryCache[cacheKey]; ok {
+		t.cacheMu.Unlock()
+		logger.WithField("cache_key", cacheKey).Warn("duplicate search skipped — returning cached result")
+		return "[CACHED RESULT — identical query already executed this subtask. Use the results you have.]\n\n" + cached, nil
+	}
+	t.cacheMu.Unlock()
+
 	ctx, observation := obs.Observer.NewObservation(ctx)
 	observationObject := &graphiti.Observation{
 		ID:      observation.ID(),
@@ -145,6 +171,22 @@ func (t *GraphitiSearchTool) Handle(ctx context.Context, name string, args json.
 	}
 
 	if err != nil {
+		// Check if this is a circuit breaker open error — attempt fallback
+		if coe, ok := graphiti.IsCircuitOpenError(err); ok {
+			logger.WithField("circuit_state", "OPEN").
+				Warn("graphiti circuit breaker is open, attempting pgvector fallback")
+			if fb, ok := t.graphitiClient.(graphitiFallbackSearcher); ok {
+				fallbackResult, fbErr := fb.FallbackSearch(ctx, coe.Query, coe.GroupID)
+				if fbErr != nil {
+					logger.WithError(fbErr).Error("pgvector fallback search also failed")
+					return "", fmt.Errorf("graphiti unavailable and fallback failed: %w", fbErr)
+				}
+				return fallbackResult, nil
+			}
+			// No fallback searcher available — return a helpful message instead of error
+			return "Graphiti knowledge graph is temporarily unavailable (circuit breaker open). Please try again later.", nil
+		}
+
 		logger.WithError(err).Errorf("failed to perform graphiti search '%s'", searchArgs.SearchType)
 		return "", err
 	}

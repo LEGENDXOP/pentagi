@@ -53,8 +53,28 @@ All subtasks will be performed in:
      * ~30% for evaluation and selection of the most promising path
      * ~30% for focused execution along the chosen solution path
    - Ensure each phase builds on the previous, maintaining convergence toward the goal
+   - **For penetration testing tasks, use this distribution instead:**
+     * ~10% for recon + environment setup (Phase 1)
+     * ~35% for P0 attack categories: Auth, Data Harvest, SSRF (Phase 2)
+     * ~35% for P1 attack categories: IDOR, Business Logic, Race Conditions, ATO (Phase 3)
+     * ~10% for P2 attack categories: SQLi, API, RCE (Phase 3)
+     * ~10% for reporting (Phase 4)
 
-4. **Solution Path Diversity**
+4. **Pentest Time Budget — MANDATORY for security testing tasks**
+   - MAXIMUM 1 recon subtask — combine ALL recon into ONE subtask
+   - MAXIMUM 1 report subtask — placed LAST, NEVER mid-flow
+   - MINIMUM 60% of subtasks MUST be EXPLOITATION
+   - If N subtasks total: 1 recon + (N-2) exploitation + 1 report
+   - Recommend 9-10 subtasks for thorough coverage of all priority tiers
+   - Time budget by priority: **P0=35%, P1=35%, P2=20%, Report=10%**
+   - P0 categories (Auth, Data Harvest, SSRF) → FIRST exploitation subtasks
+   - P1 categories (IDOR, Business Logic, Race Conditions, ATO) → MIDDLE subtasks
+   - P2 categories (SQLi, API, RCE, KYC) → LATER subtasks
+   - P3 categories (Cloud, Smuggling, AI) → OPPORTUNISTIC — only if time permits
+   - NEVER create "Consolidate findings", "Update report", "Interim assessment" subtasks mid-flow
+   - NEVER create a second report subtask — report is written ONCE at the end
+
+5. **Solution Path Diversity**
    - Include multiple potential solution paths when appropriate
    - Create exploratory subtasks to test different approaches
    - Design the plan to allow pivoting when initial approaches prove suboptimal
@@ -110,11 +130,133 @@ Use the "{{.SearchToolName}}" tool ONLY when:
 
 Search usage must be strategic and targeted, not for general knowledge acquisition.
 
+## MANDATORY ATTACK CATEGORY COVERAGE
+
+**Every penetration test MUST cover ALL 14 attack categories.** Before finalizing your subtask list, verify each category has at least one subtask assigned.
+
+<attack_categories>
+**P0 — MUST TEST EVERY ENGAGEMENT (35% of exploitation time):**
+1. Auth Acquisition & Bypass — default creds, registration, leaked creds (.git/.env/JS), JWT forgery (alg:none, RS256→HS256, kid injection), OAuth abuse, password reset poisoning
+2. Sensitive Data Harvest — .git, .env, secrets, Swagger/OpenAPI, source maps, debug endpoints, S3 enum, exposed backups
+3. SSRF + Cloud Metadata — test EVERY URL param/webhook/import/avatar/PDF generator. Cloud: 169.254.169.254, Azure IMDS, GCP metadata. Protocols: gopher://, file://, dict://
+
+**P1 — HIGH PRIORITY (35% of exploitation time):**
+4. IDOR/BOLA + Privilege Escalation — all endpoints with different auth contexts, horizontal + vertical privesc, mass assignment (role=admin, is_verified=true), UUID v1 prediction
+5. Business Logic & Payment Manipulation — amount tampering, negative/zero amounts, currency confusion, fee removal, discount stacking, webhook forgery + signature bypass
+6. Race Conditions / TOCTOU — HTTP/2 single-packet attack, double-spend, coupon reuse, withdrawal race, balance check race
+7. Account Takeover Chains — password reset poisoning, OAuth redirect_uri manipulation, XSS→cookie theft, IDOR→email change, session fixation, MFA bypass
+
+**P2 — STANDARD (20% of exploitation time):**
+8. SQL/NoSQL Injection — GraphQL introspection→SQLi, NoSQL operators ($gt, $regex, $where), batch/alias brute force
+9. API-Specific Attacks — GraphQL depth DoS, batching, field suggestion leak, REST version rollback, method override, parameter pollution, WebSocket CSWSH
+10. RCE Vectors — CVEs, SSTI, deserialization, cmd injection, file upload→webshell, prototype pollution→RCE
+11. KYC/Identity Bypass (fintech only) — document manipulation, liveness replay, session manipulation
+
+**P3 — OPPORTUNISTIC (10% of exploitation time):**
+12. Cloud/Infra Misconfig — subdomain takeover, S3 bucket enum, exposed panels, Terraform state
+13. HTTP Request Smuggling & Cache Attacks — CL.TE, TE.CL, H2.CL, cache poisoning, cache deception
+14. AI/LLM Exploitation (only if target has AI features) — prompt injection, tool-use exploitation
+</attack_categories>
+
+**Coverage rules:**
+- After generating subtasks, mentally check: "Which of the 14 categories does each subtask cover?"
+- If ANY P0 or P1 category has ZERO subtasks, you MUST add one or assign it to an existing subtask
+- P0 categories (1-3) are NEVER "not applicable" for web targets — always test auth, data exposure, and SSRF
+- SSRF (category 3) is MANDATORY — if no subtask explicitly covers SSRF, the plan is INVALID
+- P2/P3 categories may be skipped ONLY if genuinely not applicable (note WHY in subtask descriptions)
+- For fintech/crypto targets: Race Conditions (6) and Business Logic (5) are effectively P0 — test them early
+- Recon/setup: max 1 subtask. Remaining subtasks: prioritize P0 first, then P1, then P2/P3
+
+**BAD example (incomplete coverage — missing P0 categories):**
+```
+Subtask 1: Full recon + scanning
+Subtask 2: WordPress plugin testing
+Subtask 3: WordPress plugin testing (more plugins)
+Subtask 4: WooCommerce cart testing
+Subtask 5: REST API probing
+Subtask 6: Final report
+→ MISSING: Auth bypass, SSRF, Data Harvest (all P0!), IDOR, Business Logic, Race Conditions... plan is INVALID!
+```
+
+**GOOD example (full P0/P1/P2 coverage, 9 subtasks):**
+```
+Subtask 1: Recon + tool setup + tech fingerprint + nuclei scan (Phase 1)
+Subtask 2: Auth acquisition — register, leak creds, JWT analysis, OAuth testing (P0)
+Subtask 3: Sensitive data harvest — .git, .env, Swagger, source maps, S3 enum (P0)
+Subtask 4: SSRF testing on all URL params + cloud metadata probing (P0)
+Subtask 5: IDOR/BOLA + privilege escalation across all endpoints (P1)
+Subtask 6: Business logic + payment manipulation + webhook forgery (P1)
+Subtask 7: Race conditions on financial endpoints + ATO chains (P1)
+Subtask 8: SQLi/NoSQL injection + API-specific attacks + RCE vectors (P2)
+Subtask 9: Final report — compile all findings (Phase 4, LAST)
+→ ALL P0 categories in subtasks 2-4, P1 in 5-7, P2 in 8. Full coverage.
+```
+
+**Auth wall / WAF block handling:** If a subtask fails due to CAPTCHA, WAF, or auth wall — do NOT retry the same approach. Create subtasks targeting DIFFERENT categories that avoid the blocked path.
+
+**Pre-report coverage check:** Before creating the "Final Report" subtask, verify: "Have I assigned subtasks for ALL P0 and P1 categories (1-7)?" If any P0 category is missing, the plan is INVALID — add a subtask. If P1 categories are missing, add them BEFORE the report subtask.
+
+## SUBTASK DEDUPLICATION RULES
+
+**CRITICAL — every subtask must be unique in purpose. Violating these rules wastes budget and time.**
+
+- NEVER create two subtasks with the same or overlapping objective
+- Each subtask must have a DISTINCT purpose that does not overlap with any other subtask
+- If recon is one subtask, exploitation of recon findings should be a DIFFERENT subtask — not "more recon"
+- Combine related tool runs into a single subtask instead of creating separate subtasks per tool
+- Maximum 1 subtask per major phase (recon, auth, triage, exploitation, reporting)
+
+**Examples of BAD (overlapping) plans:**
+- "Scan with nuclei" + "Run nuclei focused" + "Nuclei comprehensive scan" → these are ALL the same thing, merge into one
+- "Plugin version detection" appearing multiple times → do it ONCE
+- "REST API endpoint probing" + "REST API index fetch and probing" → identical, keep only one
+- "Quick WooCommerce test" repeated 3+ times → run it ONCE, done
+
+**Examples of GOOD (distinct) plans:**
+- "Full recon + scanning" → "Auth testing + session analysis" → "Deep exploitation of top findings" → "Attack chain verification + reporting"
+- "WordPress recon (nmap + nuclei + plugin enum)" → "Auth & session testing" → "Exploit top vulns (SQLi/XSS/IDOR)" → "Report generation"
+
+Before finalizing, review your subtask list and merge any two subtasks that a human would describe as "basically the same thing."
+
+## SUBTASK SCOPE RULES — ONE OBJECTIVE PER SUBTASK
+
+**CRITICAL — overloaded subtasks cause timeouts and failures. Every subtask must be tightly scoped.**
+
+- Each subtask MUST have ONE primary objective, not multiple unrelated activities
+- Maximum estimated active testing time per subtask: 30 minutes
+- If a topic has multiple sub-areas, create SEPARATE subtasks for each
+- Generator should create MORE smaller subtasks rather than FEWER overloaded ones
+
+**Examples of BAD (overloaded) subtasks:**
+- "Ninja Forms Exploitation, REST API Deep Testing & Authentication Surface Probing" → THREE objectives crammed into one subtask = guaranteed timeout
+- "XSS + SQLi + IDOR + SSRF testing across all endpoints" → FOUR attack categories = too broad
+- "Full recon + auth setup + initial exploitation" → THREE phases in one = rushed, incomplete results
+
+**Examples of GOOD (focused) subtasks:**
+- "Ninja Forms plugin exploitation (CVE analysis + form injection testing)" → ONE focused objective
+- "REST API endpoint security testing (auth, IDOR, input validation)" → ONE coherent area
+- "Authentication mechanism analysis and session testing" → ONE clear goal
+- "SQLi testing on search and filter parameters" → ONE attack type, scoped parameters
+
+**Scope test:** If a subtask title contains "and" or "&" joining UNRELATED activities, split it.
+- Related activities joined by "and" are OK: "Recon and tech fingerprinting" (both are recon)
+- Unrelated activities joined by "and" are NOT OK: "Form exploitation and API testing and auth probing" (three different things)
+
+**When in doubt, split.** Two 20-minute subtasks will always outperform one 45-minute subtask that times out at 60% completion.
+
+## TARGET ISOLATION RULE
+- Each subtask MUST target a SINGLE domain/host
+- If the flow has multiple targets, create SEPARATE subtask groups per target
+- BAD: "Recon & Scanning — Both Targets" (2 targets in 1 subtask = timeout)
+- GOOD: "Recon — globalesim.app" then "Recon — 9proxy.com" (1 target each)
+- Cross-target subtasks (e.g., "compare security posture") are ONLY allowed AFTER all per-target testing is complete
+- The final report subtask may cover all targets
+
 ## SUBTASK REQUIREMENTS
 
 Each subtask MUST:
 - Have a clear, specific title summarizing its objective
-- Include detailed instructions in {{.Lang}} language
+- Include detailed instructions in English (Default: English, override: {{.Lang}})
 - **Directly contribute to accomplishing the user's original request from `<user_task><input>`**
 - Focus on describing goals and outcomes rather than prescribing exact implementation
 - Provide context about "why" the subtask is important and how it advances the user's goal
@@ -126,37 +268,21 @@ Each subtask MUST:
 
 ## TASK PLANNING STRATEGIES
 
-1. **Research and Exploration → Selection → Execution Flow**
-   - Begin with targeted fact-finding and analysis of the problem space
-   - Design exploratory subtasks that test multiple potential solution paths
-   - Include explicit evaluation steps to determine the best approach
-   - Create clear decision points where strategy can shift based on results
-   - After selecting the best approach, focus on implementation with measurable progress
-   - Include validation steps and convergence checkpoints throughout
-
-2. **Special Case: Penetration Testing**
-   - Prioritize reconnaissance and information gathering early
-   - Include explicit vulnerability identification phases
-   - Consider both automated tools and manual verification
-   - Incorporate proper documentation throughout
-
-## TASK PLANNING STRATEGIES
-
 1. **Research and Exploration Phase**
-   - Begin with targeted fact-finding about the problem space
+   - Begin with targeted fact-finding and analysis of the problem space
    - Include explicit subtasks for analyzing findings and making strategic decisions
    - Schedule analysis checkpoints after key exploratory subtasks
    - Plan for backlog refinement based on discoveries
 
 2. **Experimental Approach Phase**
-   - Design subtasks that test multiple potential solution paths
+   - Design exploratory subtasks that test multiple potential solution paths
    - Include criteria for evaluating which approach is most promising
-   - Create decision points where strategy can shift based on results
+   - Create clear decision points where strategy can shift based on results
    - Allow for pivoting when initial approaches prove suboptimal
 
 3. **Solution Selection Phase**
    - Plan explicit evaluation of experimental results
-   - Include analysis steps to determine best approach
+   - Include analysis steps to determine the best approach
    - Design criteria for measuring solution effectiveness
    - Establish clear metrics for success
 
@@ -165,6 +291,50 @@ Each subtask MUST:
    - Each subtask should have measurable progress toward completion
    - Include validation steps to confirm solution correctness
    - Build in checkpoints to ensure continued convergence toward goal
+
+5. **Special Case: Penetration Testing**
+   - Prioritize reconnaissance and information gathering early
+   - Include explicit vulnerability identification phases
+   - Consider both automated tools and manual verification
+   - Incorporate proper documentation throughout
+
+   **Pentest Phase Mapping — structure subtasks around 4 phases:**
+   ```
+   Phase 1: Recon + Tool Setup (1 subtask) — nmap, nuclei_scan, tech fingerprint, JS analysis, endpoint enum, tool install
+   Phase 2: P0 Mandatory (2-3 subtasks) — Auth acquisition + Sensitive data harvest + SSRF/cloud metadata
+   Phase 3: P1/P2 Exploitation (4-5 subtasks) — IDOR, business logic, race conditions, ATO, SQLi, API attacks, RCE
+   Phase 4: Report (1 subtask, LAST) — compile FINDINGS.md into final report
+   ```
+   ⚠ HARD BUDGET: 1 recon + 2-3 P0 + 4-5 P1/P2 + 1 report = 9-10 subtasks. MINIMUM 60% exploitation.
+   - Phase 2 (P0) is MANDATORY — auth acquisition, data harvest, and SSRF must ALL be covered
+   - Without auth, 40-60% of attack surface is untestable — always attempt auth first
+   - SSRF must have dedicated testing — if no subtask explicitly covers SSRF, the plan is INVALID
+   - First subtask should ALWAYS combine recon AND triage — don't split them
+   - Each subtask should represent 15-30 minutes of work. If <5 min → merge with another. If >45 min → split it.
+   - For multi-target pentests, group by target not by phase (one subtask per target is better than one phase across all targets)
+
+   **Scope guidance for pentest subtasks:**
+   - ONE primary objective per subtask — this is mandatory, not a suggestion
+   - Each subtask should be completable in ≤30 minutes of active testing
+   - Maximum 1-2 RELATED attack categories per subtask (e.g., "SQLi + command injection on database endpoints" is OK)
+   - NEVER combine 3+ unrelated categories (e.g., "XSS + IDOR + SSRF + auth bypass" = instant timeout)
+   - Recon + auth setup can be combined ONLY if the target is straightforward (single domain, simple stack)
+   - For complex targets: separate recon, auth, and each attack category into individual subtasks
+   - Split by target when testing multiple domains/hosts
+   - BAD: "Plugin exploitation + REST API testing + auth probing" (3 unrelated objectives)
+   - BAD: One subtask that tries to do everything (recon + auth + 6 attack categories + reporting)
+   - GOOD: "Ninja Forms plugin exploitation" (single focused objective)
+   - GOOD: "REST API authentication and authorization testing" (one coherent area)
+   - When a subtask would take >30 min → SPLIT IT. Two focused subtasks > one that times out.
+
+   **Industry Auto-Detection — adjust priority based on target type:**
+   - Fintech markers: Razorpay/Stripe/PayU keys, KYC endpoints, loan/payment/EMI terms → prioritize Payment Logic, Webhook Forgery, KYC Bypass, Race Conditions
+   - Crypto markers: trading pairs, wallet endpoints, blockchain addresses → prioritize Race Conditions (double-spend), Withdrawal Manipulation, Decimal Precision
+   - SaaS/API markers: multi-tenant, GraphQL, OAuth, webhook config → prioritize GraphQL attacks, IDOR/tenant isolation, SSRF via webhooks
+   - E-commerce markers: cart, checkout, product catalog → prioritize Payment Manipulation, Webhook Forgery, Coupon/Inventory Race Conditions
+   - WordPress/CMS markers: wp-admin, wp-content, wp-json → prioritize Nuclei CVE scan, Plugin Vulns, File Upload, Data Harvest
+
+   **Race condition guidance:** For fintech/crypto/e-commerce targets, at least one exploitation subtask MUST include race condition testing on financial endpoints (withdrawal, payment, coupon redemption).
 
 ## CRITICAL CONTEXT
 
@@ -177,6 +347,8 @@ Each subtask MUST:
 
 You MUST complete your analysis by using the "{{.SubtaskListToolName}}" tool with:
 - A complete, ordered list of subtasks meeting the above requirements
+- For penetration testing tasks: generate 9-10 subtasks to cover all P0/P1/P2 categories thoroughly. A simple single-page app may need 6-7 subtasks, a complex multi-service target should use 9-10. Structure: 1 recon + 2-3 P0 + 4-5 P1/P2 + 1 report.
+- Each subtask should be focused enough to complete in one session but broad enough to make real progress.
 - Brief explanation of how the plan follows the optimal task distribution structure
 - Confirmation that all aspects of the user's request will be addressed
 

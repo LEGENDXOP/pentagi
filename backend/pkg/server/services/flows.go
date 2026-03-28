@@ -441,6 +441,32 @@ func (s *FlowService) PatchFlow(c *gin.Context) {
 		return
 	}
 
+	// Handle resume separately since the flow may not be in-memory for finished/failed flows
+	if patchFlow.Action == "resume" {
+		userInput := ""
+		if patchFlow.Input != nil {
+			userInput = *patchFlow.Input
+		}
+		if _, err := s.fc.ResumeFlow(c, int64(flow.ID), userInput); err != nil {
+			logger.FromContext(c).WithError(err).Errorf("error resuming flow")
+			response.Error(c, response.ErrInternal, err)
+			return
+		}
+
+		if err = s.db.Model(&flow).Scopes(scope).Take(&flow).Error; err != nil {
+			logger.FromContext(c).WithError(err).Errorf("error getting flow by id")
+			if gorm.IsRecordNotFoundError(err) {
+				response.Error(c, response.ErrFlowsNotFound, err)
+			} else {
+				response.Error(c, response.ErrInternal, err)
+			}
+			return
+		}
+
+		response.Success(c, http.StatusOK, flow)
+		return
+	}
+
 	fw, err := s.fc.GetFlow(c, int64(flow.ID))
 	if err != nil {
 		logger.FromContext(c).WithError(err).Errorf("error getting flow by id in flow controller")

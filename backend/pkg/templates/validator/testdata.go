@@ -34,6 +34,16 @@ func CreateDummyTemplateData() map[string]any {
 		"MaintenanceToolName":       tools.MaintenanceToolName,
 		"GraphitiSearchToolName":    tools.GraphitiSearchToolName,
 		"GraphitiEnabled":           true,
+		"InteractshEnabled":         true,
+		"InteractshGetURLToolName":  tools.InteractshGetURLToolName,
+		"InteractshPollToolName":    tools.InteractshPollToolName,
+		"InteractshStatusToolName":  tools.InteractshStatusToolName,
+		"AuthStoreEnabled":          true,
+		"AuthLoginToolName":         tools.AuthLoginToolName,
+		"AuthStatusToolName":        tools.AuthStatusToolName,
+		"AuthInjectToolName":        tools.AuthInjectToolName,
+		"AuthRefreshToolName":       tools.AuthRefreshToolName,
+		"AuthLogoutToolName":        tools.AuthLogoutToolName,
 		"TerminalToolName":          tools.TerminalToolName,
 		"FileToolName":              tools.FileToolName,
 		"BrowserToolName":           tools.BrowserToolName,
@@ -256,6 +266,12 @@ func CreateDummyTemplateData() map[string]any {
 				ResultFormat: database.MsglogResultFormatMarkdown,
 				Thinking:     sql.NullString{String: "Thinking about search strategy", Valid: true},
 			},
+		},
+
+		// Workspace file listing for subtask generator
+		"WorkspaceFiles": []tools.FileInfo{
+			{Path: "/work/STATE.json", Size: 1234, Modified: "2025-07-02 12:00"},
+			{Path: "/work/FINDINGS.md", Size: 5678, Modified: "2025-07-02 12:15"},
 		},
 
 		// Barrier tools - using proper logic from tools package

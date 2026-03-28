@@ -127,12 +127,14 @@ type ProviderController interface {
 }
 
 type providerController struct {
-	db             database.Querier
-	cfg            *config.Config
-	docker         docker.DockerClient
-	publicIP       string
-	embedder       embeddings.Embedder
-	graphitiClient *graphiti.Client
+	db                database.Querier
+	cfg               *config.Config
+	docker            docker.DockerClient
+	publicIP          string
+	embedder          embeddings.Embedder
+	graphitiClient    *graphiti.Client
+	interactshEnabled bool
+	authStoreEnabled  bool
 
 	startCallNumber *atomic.Int64
 
@@ -273,10 +275,18 @@ func NewProviderController(
 		KeepQASections: cfg.AssistantSummarizerKeepQASections,
 	})
 
-	graphitiClient, err := graphiti.NewClient(
+	cbConfig := graphiti.CircuitBreakerConfig{
+		Enabled:          cfg.GraphitiCBEnabled,
+		FailureThreshold: cfg.GraphitiCBThreshold,
+		FailureWindow:    60 * time.Second,
+		OpenTimeout:      time.Duration(cfg.GraphitiCBTimeout) * time.Second,
+		MaxRetries:       cfg.GraphitiCBMaxRetries,
+	}
+	graphitiClient, err := graphiti.NewClientWithCircuitBreaker(
 		cfg.GraphitiURL,
 		time.Duration(cfg.GraphitiTimeout)*time.Second,
 		cfg.GraphitiEnabled && cfg.GraphitiURL != "",
+		cbConfig,
 	)
 	if err != nil {
 		logrus.WithError(err).Warn("failed to initialize graphiti client, continuing without it")
@@ -284,12 +294,14 @@ func NewProviderController(
 	}
 
 	return &providerController{
-		db:             db,
-		cfg:            cfg,
-		docker:         docker,
-		publicIP:       cfg.DockerPublicIP,
-		embedder:       embedder,
-		graphitiClient: graphitiClient,
+		db:                db,
+		cfg:               cfg,
+		docker:            docker,
+		publicIP:          cfg.DockerPublicIP,
+		embedder:          embedder,
+		graphitiClient:    graphitiClient,
+		interactshEnabled: cfg.InteractshEnabled,
+		authStoreEnabled:  cfg.AuthStoreEnabled,
 
 		startCallNumber: newAtomicInt64(0), // 0 means to make it random
 
@@ -371,22 +383,24 @@ func (pc *providerController) NewFlowProvider(
 	}
 
 	fp := &flowProvider{
-		db:             pc.db,
-		mx:             &sync.RWMutex{},
-		embedder:       pc.embedder,
-		graphitiClient: pc.graphitiClient,
-		flowID:         flowID,
-		publicIP:       pc.publicIP,
-		callCounter:    newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
-		image:          image,
-		title:          title,
-		language:       language,
-		askUser:        askUser,
-		tcIDTemplate:   tcIDTemplate,
-		prompter:       prompter,
-		executor:       executor,
-		summarizer:     pc.summarizerAgent,
-		Provider:       prv,
+		db:                pc.db,
+		mx:                &sync.RWMutex{},
+		embedder:          pc.embedder,
+		graphitiClient:    pc.graphitiClient,
+		interactshEnabled: pc.interactshEnabled,
+		authStoreEnabled:  pc.authStoreEnabled,
+		flowID:            flowID,
+		publicIP:          pc.publicIP,
+		callCounter:       newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
+		image:             image,
+		title:             title,
+		language:          language,
+		askUser:           askUser,
+		tcIDTemplate:      tcIDTemplate,
+		prompter:          prompter,
+		executor:          executor,
+		summarizer:        pc.summarizerAgent,
+		Provider:          prv,
 	}
 
 	return fp, nil
@@ -410,22 +424,24 @@ func (pc *providerController) LoadFlowProvider(
 	}
 
 	fp := &flowProvider{
-		db:             pc.db,
-		mx:             &sync.RWMutex{},
-		embedder:       pc.embedder,
-		graphitiClient: pc.graphitiClient,
-		flowID:         flowID,
-		publicIP:       pc.publicIP,
-		callCounter:    newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
-		image:          image,
-		title:          title,
-		language:       language,
-		askUser:        askUser,
-		tcIDTemplate:   tcIDTemplate,
-		prompter:       prompter,
-		executor:       executor,
-		summarizer:     pc.summarizerAgent,
-		Provider:       prv,
+		db:                pc.db,
+		mx:                &sync.RWMutex{},
+		embedder:          pc.embedder,
+		graphitiClient:    pc.graphitiClient,
+		interactshEnabled: pc.interactshEnabled,
+		authStoreEnabled:  pc.authStoreEnabled,
+		flowID:            flowID,
+		publicIP:          pc.publicIP,
+		callCounter:       newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
+		image:             image,
+		title:             title,
+		language:          language,
+		askUser:           askUser,
+		tcIDTemplate:      tcIDTemplate,
+		prompter:          prompter,
+		executor:          executor,
+		summarizer:        pc.summarizerAgent,
+		Provider:          prv,
 	}
 
 	return fp, nil
@@ -494,22 +510,24 @@ func (pc *providerController) NewAssistantProvider(
 		id:         assistantID,
 		summarizer: pc.summarizerAssistant,
 		fp: flowProvider{
-			db:             pc.db,
-			mx:             &sync.RWMutex{},
-			embedder:       pc.embedder,
-			graphitiClient: pc.graphitiClient,
-			flowID:         flowID,
-			publicIP:       pc.publicIP,
-			callCounter:    newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
-			image:          image,
-			title:          title,
-			language:       language,
-			tcIDTemplate:   tcIDTemplate,
-			prompter:       prompter,
-			executor:       executor,
-			streamCb:       streamCb,
-			summarizer:     pc.summarizerAgent,
-			Provider:       prv,
+			db:                pc.db,
+			mx:                &sync.RWMutex{},
+			embedder:          pc.embedder,
+			graphitiClient:    pc.graphitiClient,
+			interactshEnabled: pc.interactshEnabled,
+		authStoreEnabled:  pc.authStoreEnabled,
+			flowID:            flowID,
+			publicIP:          pc.publicIP,
+			callCounter:       newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
+			image:             image,
+			title:             title,
+			language:          language,
+			tcIDTemplate:      tcIDTemplate,
+			prompter:          prompter,
+			executor:          executor,
+			streamCb:          streamCb,
+			summarizer:        pc.summarizerAgent,
+			Provider:          prv,
 		},
 	}
 
@@ -537,22 +555,24 @@ func (pc *providerController) LoadAssistantProvider(
 		id:         assistantID,
 		summarizer: pc.summarizerAssistant,
 		fp: flowProvider{
-			db:             pc.db,
-			mx:             &sync.RWMutex{},
-			embedder:       pc.embedder,
-			graphitiClient: pc.graphitiClient,
-			flowID:         flowID,
-			publicIP:       pc.publicIP,
-			callCounter:    newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
-			image:          image,
-			title:          title,
-			language:       language,
-			tcIDTemplate:   tcIDTemplate,
-			prompter:       prompter,
-			executor:       executor,
-			streamCb:       streamCb,
-			summarizer:     pc.summarizerAgent,
-			Provider:       prv,
+			db:                pc.db,
+			mx:                &sync.RWMutex{},
+			embedder:          pc.embedder,
+			graphitiClient:    pc.graphitiClient,
+			interactshEnabled: pc.interactshEnabled,
+		authStoreEnabled:  pc.authStoreEnabled,
+			flowID:            flowID,
+			publicIP:          pc.publicIP,
+			callCounter:       newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
+			image:             image,
+			title:             title,
+			language:          language,
+			tcIDTemplate:      tcIDTemplate,
+			prompter:          prompter,
+			executor:          executor,
+			streamCb:          streamCb,
+			summarizer:        pc.summarizerAgent,
+			Provider:          prv,
 		},
 	}
 

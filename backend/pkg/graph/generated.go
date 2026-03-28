@@ -307,6 +307,7 @@ type ComplexityRoot struct {
 		DeletePrompt       func(childComplexity int, promptID int64) int
 		DeleteProvider     func(childComplexity int, providerID int64) int
 		FinishFlow         func(childComplexity int, flowID int64) int
+		ResumeFlow         func(childComplexity int, flowID int64, input *string) int
 		PutUserInput       func(childComplexity int, flowID int64, input string) int
 		RenameFlow         func(childComplexity int, flowID int64, title string) int
 		StopAssistant      func(childComplexity int, flowID int64, assistantID int64) int
@@ -618,6 +619,7 @@ type MutationResolver interface {
 	PutUserInput(ctx context.Context, flowID int64, input string) (model.ResultType, error)
 	StopFlow(ctx context.Context, flowID int64) (model.ResultType, error)
 	FinishFlow(ctx context.Context, flowID int64) (model.ResultType, error)
+	ResumeFlow(ctx context.Context, flowID int64, input *string) (*model.Flow, error)
 	DeleteFlow(ctx context.Context, flowID int64) (model.ResultType, error)
 	RenameFlow(ctx context.Context, flowID int64, title string) (model.ResultType, error)
 	CreateAssistant(ctx context.Context, flowID int64, modelProvider string, input string, useAgents bool) (*model.FlowAssistant, error)
@@ -1994,6 +1996,18 @@ func (e *executableSchema) Complexity(typeName, field string, childComplexity in
 		}
 
 		return e.complexity.Mutation.FinishFlow(childComplexity, args["flowId"].(int64)), true
+
+	case "Mutation.resumeFlow":
+		if e.complexity.Mutation.ResumeFlow == nil {
+			break
+		}
+
+		args, err := ec.field_Mutation_resumeFlow_args(context.TODO(), rawArgs)
+		if err != nil {
+			return 0, false
+		}
+
+		return e.complexity.Mutation.ResumeFlow(childComplexity, args["flowId"].(int64), args["input"].(*string)), true
 
 	case "Mutation.putUserInput":
 		if e.complexity.Mutation.PutUserInput == nil {
@@ -4637,6 +4651,58 @@ func (ec *executionContext) field_Mutation_finishFlow_argsFlowID(
 	}
 
 	var zeroVal int64
+	return zeroVal, nil
+}
+
+func (ec *executionContext) field_Mutation_resumeFlow_args(ctx context.Context, rawArgs map[string]interface{}) (map[string]interface{}, error) {
+	var err error
+	args := map[string]interface{}{}
+	arg0, err := ec.field_Mutation_resumeFlow_argsFlowID(ctx, rawArgs)
+	if err != nil {
+		return nil, err
+	}
+	args["flowId"] = arg0
+	arg1, err := ec.field_Mutation_resumeFlow_argsInput(ctx, rawArgs)
+	if err != nil {
+		return nil, err
+	}
+	args["input"] = arg1
+	return args, nil
+}
+func (ec *executionContext) field_Mutation_resumeFlow_argsFlowID(
+	ctx context.Context,
+	rawArgs map[string]interface{},
+) (int64, error) {
+	_, ok := rawArgs["flowId"]
+	if !ok {
+		var zeroVal int64
+		return zeroVal, nil
+	}
+
+	ctx = graphql.WithPathContext(ctx, graphql.NewPathWithField("flowId"))
+	if tmp, ok := rawArgs["flowId"]; ok {
+		return ec.unmarshalNID2int64(ctx, tmp)
+	}
+
+	var zeroVal int64
+	return zeroVal, nil
+}
+func (ec *executionContext) field_Mutation_resumeFlow_argsInput(
+	ctx context.Context,
+	rawArgs map[string]interface{},
+) (*string, error) {
+	_, ok := rawArgs["input"]
+	if !ok {
+		var zeroVal *string
+		return zeroVal, nil
+	}
+
+	ctx = graphql.WithPathContext(ctx, graphql.NewPathWithField("input"))
+	if tmp, ok := rawArgs["input"]; ok {
+		return ec.unmarshalOString2ᚖstring(ctx, tmp)
+	}
+
+	var zeroVal *string
 	return zeroVal, nil
 }
 
@@ -14328,6 +14394,77 @@ func (ec *executionContext) fieldContext_Mutation_finishFlow(ctx context.Context
 	}()
 	ctx = graphql.WithFieldContext(ctx, fc)
 	if fc.Args, err = ec.field_Mutation_finishFlow_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+		ec.Error(ctx, err)
+		return fc, err
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _Mutation_resumeFlow(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
+	fc, err := ec.fieldContext_Mutation_resumeFlow(ctx, field)
+	if err != nil {
+		return graphql.Null
+	}
+	ctx = graphql.WithFieldContext(ctx, fc)
+	defer func() {
+		if r := recover(); r != nil {
+			ec.Error(ctx, ec.Recover(ctx, r))
+			ret = graphql.Null
+		}
+	}()
+	resTmp, err := ec.ResolverMiddleware(ctx, func(rctx context.Context) (interface{}, error) {
+		ctx = rctx // use context from middleware stack in children
+		return ec.resolvers.Mutation().ResumeFlow(rctx, fc.Args["flowId"].(int64), fc.Args["input"].(*string))
+	})
+	if err != nil {
+		ec.Error(ctx, err)
+		return graphql.Null
+	}
+	if resTmp == nil {
+		if !graphql.HasFieldError(ctx, fc) {
+			ec.Errorf(ctx, "must not be null")
+		}
+		return graphql.Null
+	}
+	res := resTmp.(*model.Flow)
+	fc.Result = res
+	return ec.marshalNFlow2ᚖpentagiᚋpkgᚋgraphᚋmodelᚐFlow(ctx, field.Selections, res)
+}
+
+func (ec *executionContext) fieldContext_Mutation_resumeFlow(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Mutation",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			switch field.Name {
+			case "id":
+				return ec.fieldContext_Flow_id(ctx, field)
+			case "title":
+				return ec.fieldContext_Flow_title(ctx, field)
+			case "status":
+				return ec.fieldContext_Flow_status(ctx, field)
+			case "terminals":
+				return ec.fieldContext_Flow_terminals(ctx, field)
+			case "provider":
+				return ec.fieldContext_Flow_provider(ctx, field)
+			case "createdAt":
+				return ec.fieldContext_Flow_createdAt(ctx, field)
+			case "updatedAt":
+				return ec.fieldContext_Flow_updatedAt(ctx, field)
+			}
+			return nil, fmt.Errorf("no field named %q was found under type Flow", field.Name)
+		},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = ec.Recover(ctx, r)
+			ec.Error(ctx, err)
+		}
+	}()
+	ctx = graphql.WithFieldContext(ctx, fc)
+	if fc.Args, err = ec.field_Mutation_resumeFlow_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
 		ec.Error(ctx, err)
 		return fc, err
 	}
@@ -30589,6 +30726,13 @@ func (ec *executionContext) _Mutation(ctx context.Context, sel ast.SelectionSet)
 		case "finishFlow":
 			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
 				return ec._Mutation_finishFlow(ctx, field)
+			})
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "resumeFlow":
+			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
+				return ec._Mutation_resumeFlow(ctx, field)
 			})
 			if out.Values[i] == graphql.Null {
 				out.Invalids++

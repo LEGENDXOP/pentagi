@@ -28,6 +28,7 @@ const (
 	PerplexityToolName        = "perplexity"
 	SearxngToolName           = "searxng"
 	SploitusToolName          = "sploitus"
+	NucleiToolName            = "nuclei_scan"
 	SearchToolName            = "search"
 	SearchResultToolName      = "search_result"
 	EnricherResultToolName    = "enricher_result"
@@ -39,6 +40,17 @@ const (
 	SearchCodeToolName        = "search_code"
 	StoreCodeToolName         = "store_code"
 	GraphitiSearchToolName    = "graphiti_search"
+	InteractshGetURLToolName  = "interactsh_url"
+	InteractshPollToolName    = "interactsh_poll"
+	InteractshStatusToolName  = "interactsh_status"
+	BrowserNavigateToolName   = "browser_navigate"
+	BrowserClickToolName      = "browser_click"
+	BrowserFillToolName       = "browser_fill"
+	BrowserScreenshotToolName = "browser_screenshot"
+	BrowserEvaluateToolName   = "browser_evaluate"
+	BrowserCookiesToolName    = "browser_cookies"
+	RaceConditionToolName      = "race_condition_test"
+	AttackPathAnalyzeToolName  = "attack_path_analyze"
 	ReportResultToolName      = "report_result"
 	SubtaskListToolName       = "subtask_list"
 	SubtaskPatchToolName      = "subtask_patch"
@@ -108,6 +120,7 @@ var toolsTypeMapping = map[string]ToolType{
 	PerplexityToolName:        SearchNetworkToolType,
 	SearxngToolName:           SearchNetworkToolType,
 	SploitusToolName:          SearchNetworkToolType,
+	NucleiToolName:            EnvironmentToolType,
 	SearchToolName:            AgentToolType,
 	SearchResultToolName:      StoreAgentResultToolType,
 	EnricherResultToolName:    StoreAgentResultToolType,
@@ -119,6 +132,22 @@ var toolsTypeMapping = map[string]ToolType{
 	SearchCodeToolName:        SearchVectorDbToolType,
 	StoreCodeToolName:         StoreVectorDbToolType,
 	GraphitiSearchToolName:    SearchVectorDbToolType,
+	RaceConditionToolName:     EnvironmentToolType,
+	AttackPathAnalyzeToolName: EnvironmentToolType,
+	InteractshGetURLToolName:  EnvironmentToolType,
+	InteractshPollToolName:    EnvironmentToolType,
+	InteractshStatusToolName:  EnvironmentToolType,
+	BrowserNavigateToolName:   EnvironmentToolType,
+	BrowserClickToolName:      EnvironmentToolType,
+	BrowserFillToolName:       EnvironmentToolType,
+	BrowserScreenshotToolName: EnvironmentToolType,
+	BrowserEvaluateToolName:   EnvironmentToolType,
+	BrowserCookiesToolName:    EnvironmentToolType,
+	AuthLoginToolName:         EnvironmentToolType,
+	AuthStatusToolName:        EnvironmentToolType,
+	AuthInjectToolName:        EnvironmentToolType,
+	AuthRefreshToolName:       EnvironmentToolType,
+	AuthLogoutToolName:        EnvironmentToolType,
 	ReportResultToolName:      StoreAgentResultToolType,
 	SubtaskListToolName:       StoreAgentResultToolType,
 	SubtaskPatchToolName:      StoreAgentResultToolType,
@@ -134,6 +163,10 @@ var reflector = &jsonschema.Reflector{
 var allowedSummarizingToolsResult = []string{
 	TerminalToolName,
 	BrowserToolName,
+	NucleiToolName,
+	RaceConditionToolName,
+	BrowserNavigateToolName,
+	BrowserEvaluateToolName,
 }
 
 var allowedStoringInMemoryTools = []string{
@@ -147,10 +180,18 @@ var allowedStoringInMemoryTools = []string{
 	PerplexityToolName,
 	SearxngToolName,
 	SploitusToolName,
+	NucleiToolName,
+	RaceConditionToolName,
+	AuthLoginToolName,
+	AuthStatusToolName,
 	MaintenanceToolName,
 	CoderToolName,
 	PentesterToolName,
 	AdviceToolName,
+	BrowserNavigateToolName,
+	BrowserEvaluateToolName,
+	BrowserCookiesToolName,
+	AttackPathAnalyzeToolName,
 }
 
 var registryDefinitions = map[string]llms.FunctionDefinition{
@@ -246,6 +287,27 @@ var registryDefinitions = map[string]llms.FunctionDefinition{
 			"'CVE-2021-44228'). Returns exploit URLs, CVSS scores, CVE references, and publication dates.",
 		Parameters: reflector.Reflect(&SploitusAction{}),
 	},
+	NucleiToolName: {
+		Name: NucleiToolName,
+		Description: "Run ProjectDiscovery's Nuclei vulnerability scanner against a target URL or host. " +
+			"Nuclei uses community-maintained templates to detect CVEs, misconfigurations, default credentials, " +
+			"exposed panels, and other security issues. Specify template tags (e.g. 'cve,sqli,xss,lfi') and " +
+			"severity filters (critical,high,medium,low,info) to focus the scan. Returns structured findings " +
+			"with vulnerability type, severity, matched URL, and auto-tagged [VULN_TYPE] for compliance mapping. " +
+			"Findings are deduplicated against previously discovered vulnerabilities in the current engagement. " +
+			"Use this for broad automated vulnerability detection before deeper manual testing.",
+		Parameters: reflector.Reflect(&NucleiScanAction{}),
+	},
+	RaceConditionToolName: {
+		Name: RaceConditionToolName,
+		Description: "Execute race condition / TOCTOU (Time-of-Check-to-Time-of-Use) tests by sending concurrent " +
+			"HTTP requests to a target endpoint. Tests for duplicate transactions, balance manipulation, " +
+			"coupon reuse, double-spend, and other time-of-check-to-time-of-use vulnerabilities. " +
+			"Analyses response status codes, timing differences, body length variations, and detects anomalies " +
+			"that indicate state inconsistencies under concurrency. Use on state-changing endpoints " +
+			"(transfers, purchases, votes, coupon redemptions) that should be idempotent.",
+		Parameters: reflector.Reflect(&RaceConditionAction{}),
+	},
 	EnricherResultToolName: {
 		Name:        EnricherResultToolName,
 		Description: "Send the enriched user's question with additional information to the user",
@@ -309,6 +371,115 @@ var registryDefinitions = map[string]llms.FunctionDefinition{
 			"Use this to avoid repeating failed approaches, reuse successful exploitation techniques, understand entity relationships, " +
 			"and build on previous findings within the same penetration testing engagement.",
 		Parameters: reflector.Reflect(&GraphitiSearchAction{}),
+	},
+	AuthLoginToolName: {
+		Name: AuthLoginToolName,
+		Description: "Authenticate to a target application or API. Supports form-login (POST credentials), " +
+			"oauth2-cc (client_credentials grant), api-key (static key storage), and custom flows. " +
+			"Creates a named session that can be referenced by auth_inject to get curl flags for authenticated requests. " +
+			"Use this when you need to authenticate before testing protected endpoints.",
+		Parameters: reflector.Reflect(&AuthLoginAction{}),
+	},
+	AuthStatusToolName: {
+		Name:        AuthStatusToolName,
+		Description: "Check the status of authentication sessions including token expiry, active cookies, and CSRF tokens. Shows all sessions or a specific one by flow_id.",
+		Parameters:  reflector.Reflect(&AuthStatusAction{}),
+	},
+	AuthInjectToolName: {
+		Name: AuthInjectToolName,
+		Description: "Get curl command-line flags for making authenticated requests using a previously created auth session. " +
+			"Returns -H, -b flags ready to paste into curl commands. Automatically refreshes tokens nearing expiry.",
+		Parameters: reflector.Reflect(&AuthInjectAction{}),
+	},
+	AuthRefreshToolName: {
+		Name:        AuthRefreshToolName,
+		Description: "Force a token refresh for an authenticated session. Use when a token has expired or is about to expire. For oauth2-cc flows, re-executes the client_credentials grant.",
+		Parameters:  reflector.Reflect(&AuthRefreshAction{}),
+	},
+	AuthLogoutToolName: {
+		Name:        AuthLogoutToolName,
+		Description: "Clear an authentication session, removing all cookies, tokens, and session state. Use when switching users or cleaning up after testing.",
+		Parameters:  reflector.Reflect(&AuthLogoutAction{}),
+	},
+	AttackPathAnalyzeToolName: {
+		Name: AttackPathAnalyzeToolName,
+		Description: "Analyse all findings discovered in the current flow and compute attack paths. " +
+			"Builds a directed graph where nodes represent assets (endpoints, services, credentials, admin access) " +
+			"and edges represent attack steps (exploitable vulnerabilities). Uses Dijkstra's algorithm to find " +
+			"the shortest/easiest attack paths from external attacker to high-value targets. " +
+			"Returns a structured report with computed paths, step counts, feasibility ratings, " +
+			"and a full graph (nodes + edges) suitable for visualization. " +
+			"Use this AFTER discovery/scanning phases when you have accumulated findings with [FINDING] markers.",
+		Parameters: reflector.Reflect(&AttackPathAnalyzeAction{}),
+	},
+	InteractshGetURLToolName: {
+		Name: InteractshGetURLToolName,
+		Description: "Get a unique Out-of-Band (OOB) callback URL for detecting blind vulnerabilities. " +
+			"Use this when testing for blind SSRF, blind XSS, blind SQLi, blind RCE, blind XXE, or any vulnerability " +
+			"where the server makes an external request that you cannot observe directly. " +
+			"The generated URL will detect DNS, HTTP, and SMTP callbacks. " +
+			"After injecting the URL into your payload, use interactsh_poll to check for received callbacks.",
+		Parameters: reflector.Reflect(&InteractshGetURLAction{}),
+	},
+	InteractshPollToolName: {
+		Name: InteractshPollToolName,
+		Description: "Check for received OOB (Out-of-Band) interactions/callbacks. " +
+			"Use this after injecting OOB URLs (from interactsh_url) into attack payloads. " +
+			"Returns any DNS, HTTP, or SMTP callbacks that were received, correlated back to their attack IDs. " +
+			"Detected interactions confirm blind vulnerabilities (blind SSRF, blind XSS, blind RCE, etc.).",
+		Parameters: reflector.Reflect(&InteractshPollAction{}),
+	},
+	InteractshStatusToolName: {
+		Name: InteractshStatusToolName,
+		Description: "Check the status of the OOB (Out-of-Band) detection system, " +
+			"including whether interactsh is running, the base URL, and all registered attack probes.",
+		Parameters: reflector.Reflect(&InteractshStatusAction{}),
+	},
+	BrowserNavigateToolName: {
+		Name: BrowserNavigateToolName,
+		Description: "Navigate the headless Playwright browser to a URL. Use this for JS-heavy SPAs, " +
+			"Cloudflare-protected sites, or any page that requires JavaScript execution to render. " +
+			"Returns the page title, HTTP status, response headers, and rendered text content. " +
+			"The browser uses stealth mode to bypass WAF/bot detection. Browser state (cookies, sessions) " +
+			"persists across calls within the same flow.",
+		Parameters: reflector.Reflect(&BrowserNavigateAction{}),
+	},
+	BrowserClickToolName: {
+		Name: BrowserClickToolName,
+		Description: "Click an element on the current page in the headless Playwright browser. " +
+			"Use CSS selectors (e.g., '#submit-btn'), text selectors (e.g., 'button:has-text(\"Login\")'), " +
+			"or XPath. Waits for the element to be visible before clicking. " +
+			"Must call browser_navigate first to load a page.",
+		Parameters: reflector.Reflect(&BrowserClickAction{}),
+	},
+	BrowserFillToolName: {
+		Name: BrowserFillToolName,
+		Description: "Fill an input field on the current page in the headless Playwright browser. " +
+			"Use CSS selectors to target the input (e.g., '#username', 'input[name=\"email\"]'). " +
+			"Clears existing content before typing. Combine with browser_click to submit forms.",
+		Parameters: reflector.Reflect(&BrowserFillAction{}),
+	},
+	BrowserScreenshotToolName: {
+		Name: BrowserScreenshotToolName,
+		Description: "Take a screenshot of the current page in the headless Playwright browser. " +
+			"Screenshots are saved to /work/evidence/screenshots/ with timestamps. " +
+			"Use this to capture visual evidence of vulnerabilities, error pages, or application state.",
+		Parameters: reflector.Reflect(&BrowserScreenshotAction{}),
+	},
+	BrowserEvaluateToolName: {
+		Name: BrowserEvaluateToolName,
+		Description: "Execute JavaScript in the current page context of the headless Playwright browser. " +
+			"Use this to extract data from the DOM, read localStorage/sessionStorage tokens, " +
+			"check for client-side vulnerabilities, or interact with JavaScript APIs. " +
+			"Returns the evaluation result as JSON.",
+		Parameters: reflector.Reflect(&BrowserEvaluateAction{}),
+	},
+	BrowserCookiesToolName: {
+		Name: BrowserCookiesToolName,
+		Description: "Get all cookies from the current browser session. Returns cookie name, value, domain, " +
+			"path, secure flag, httpOnly flag, sameSite policy, and expiration. " +
+			"Use this to extract session tokens, analyze cookie security, or verify authentication state.",
+		Parameters: reflector.Reflect(&BrowserCookiesAction{}),
 	},
 	MemoristToolName: {
 		Name:        MemoristToolName,
@@ -375,6 +546,19 @@ func getMessageType(name string) database.MsglogType {
 		return database.MsglogTypeFile
 	case BrowserToolName:
 		return database.MsglogTypeBrowser
+	case BrowserNavigateToolName, BrowserClickToolName, BrowserFillToolName,
+		BrowserScreenshotToolName, BrowserEvaluateToolName, BrowserCookiesToolName:
+		return database.MsglogTypeBrowser
+	case NucleiToolName:
+		return database.MsglogTypeTerminal
+	case RaceConditionToolName:
+		return database.MsglogTypeTerminal
+	case InteractshGetURLToolName, InteractshPollToolName, InteractshStatusToolName:
+		return database.MsglogTypeTerminal
+	case AuthLoginToolName, AuthStatusToolName, AuthInjectToolName, AuthRefreshToolName, AuthLogoutToolName:
+		return database.MsglogTypeTerminal
+	case AttackPathAnalyzeToolName:
+		return database.MsglogTypeSearch
 	case MemoristToolName, SearchToolName, GoogleToolName, DuckDuckGoToolName, TavilyToolName, TraversaalToolName,
 		PerplexityToolName, SearxngToolName, SploitusToolName,
 		SearchGuideToolName, SearchAnswerToolName, SearchCodeToolName, SearchInMemoryToolName, GraphitiSearchToolName:
@@ -394,7 +578,9 @@ func getMessageResultFormat(name string) database.MsglogResultFormat {
 	switch name {
 	case TerminalToolName:
 		return database.MsglogResultFormatTerminal
-	case FileToolName, BrowserToolName:
+	case FileToolName, BrowserToolName,
+		BrowserNavigateToolName, BrowserClickToolName, BrowserFillToolName,
+		BrowserScreenshotToolName, BrowserEvaluateToolName, BrowserCookiesToolName:
 		return database.MsglogResultFormatPlain
 	default:
 		return database.MsglogResultFormatMarkdown

@@ -60,7 +60,7 @@ SELECT
 FROM subtasks s
 INNER JOIN tasks t ON s.task_id = t.id
 INNER JOIN flows f ON t.flow_id = f.id
-WHERE s.task_id = $1 AND (s.status != 'created' AND s.status != 'waiting') AND f.deleted_at IS NULL
+WHERE s.task_id = $1 AND s.status IN ('finished', 'failed') AND f.deleted_at IS NULL
 ORDER BY s.id ASC;
 
 -- name: GetSubtask :one
@@ -118,6 +118,11 @@ SET context = $1
 WHERE id = $2
 RETURNING *;
 
+-- name: UpdateSubtaskContextWithTimestamp :exec
+UPDATE subtasks
+SET context = $2, updated_at = NOW()
+WHERE id = $1;
+
 -- name: DeleteSubtask :exec
 DELETE FROM subtasks
 WHERE id = $1;
@@ -125,3 +130,16 @@ WHERE id = $1;
 -- name: DeleteSubtasks :exec
 DELETE FROM subtasks
 WHERE id = ANY(@ids::BIGINT[]);
+
+-- name: GetRecentCrossFlowFindings :many
+SELECT s.id, s.title, s.result, s.task_id, t.input as task_input, f.id as flow_id
+FROM subtasks s
+INNER JOIN tasks t ON s.task_id = t.id
+INNER JOIN flows f ON t.flow_id = f.id
+WHERE f.id != @current_flow_id
+AND f.deleted_at IS NULL
+AND s.status = 'finished'
+AND s.result LIKE '%FINDING%'
+AND s.updated_at > NOW() - INTERVAL '24 hours'
+ORDER BY s.updated_at DESC
+LIMIT 10;

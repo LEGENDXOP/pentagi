@@ -1,0 +1,75 @@
+## ATTACK STRATEGY PLANNER
+
+Before beginning execution, analyze the target and develop a structured attack strategy. This strategy will be used to manage time and effort budgets across different attack phases.
+
+<target_info>
+{{.TaskInput}}
+</target_info>
+
+<budget_constraints>
+  <recon_budget_minutes>{{.ReconMinutes}}</recon_budget_minutes>
+  <attack_budget_minutes_per_vector>{{.AttackMinutes}}</attack_budget_minutes_per_vector>
+  <post_exploit_budget_minutes>{{.PostExploitMinutes}}</post_exploit_budget_minutes>
+  <max_consecutive_failures_per_vector>{{.FailureLimit}}</max_consecutive_failures_per_vector>
+</budget_constraints>
+
+<planning_instructions>
+Develop an attack strategy considering the following:
+
+1. **Reconnaissance Phase** (budget: {{.ReconMinutes}} minutes)
+   - Identify attack surface: ports, services, technologies
+   - Map application structure and entry points
+   - Gather intelligence about the target environment
+   - Run nuclei_scan for automated vulnerability detection as first pass
+
+2. **Attack Phase** (budget: {{.AttackMinutes}} minutes per vector)
+   - Prioritize attack vectors based on reconnaissance findings
+   - Each vector gets its own time budget — if it stalls, the system will auto-pivot
+   - After {{.FailureLimit}} consecutive failures on any vector, you will be redirected to the next
+
+3. **Post-Exploitation Phase** (budget: {{.PostExploitMinutes}} minutes)
+   - Leverage any successful exploits for deeper access
+   - Document findings and evidence
+   - Identify additional attack paths from compromised positions
+
+**Key Principle:** Do not rabbit-hole on a single approach. The budget system will enforce pivots, but proactively switching approaches when progress stalls will yield better results.
+
+Plan your attack vectors in priority order so that when one is exhausted, the next one is ready.
+</planning_instructions>
+
+<vector_prioritization>
+After recon, prioritize attack vectors by likelihood and impact:
+
+**By Discovery (prioritize what you found):**
+1. Known CVEs detected by nuclei_scan → exploit immediately
+2. Default/weak credentials on exposed panels → quick wins
+3. Exposed admin panels, debug endpoints, .env files → information disclosure chains
+4. Authentication weaknesses (JWT none algorithm, no rate limiting, password reset flaws)
+5. Injection points (SQLi, XSS, SSTI, command injection) identified in forms/parameters
+6. Business logic flaws (IDOR, price manipulation, race conditions)
+7. Infrastructure weaknesses (open ports, outdated services, misconfigurations)
+
+**By Target Type:**
+- **SPA / API target** → Focus on: IDOR, auth bypass, mass assignment, API abuse, broken object-level auth
+- **WordPress / CMS** → Focus on: wpscan, XMLRPC abuse, user enumeration, plugin/theme vulns
+- **E-commerce** → Focus on: price manipulation, coupon abuse, race conditions, payment bypass
+- **Cloud-backed (Firebase/Supabase)** → Focus on: database rules, storage bucket access, cloud metadata
+- **GraphQL** → Focus on: introspection query, mutation abuse, nested query DoS, field-level auth bypass
+- **Multi-service / infrastructure** → Focus on: service enumeration, lateral movement, shared credentials
+
+**Tool-Aware Planning:**
+- Plan `nuclei_scan` as first automated pass on every web target
+- Plan OOB testing (interactsh) for blind vulnerability classes (blind SSRF, blind XSS, blind SQLi)
+- Plan browser automation for JS-heavy/SPA targets and Cloudflare-protected sites
+- Plan auth store sessions early — authenticated testing requires login setup before attack phase
+</vector_prioritization>
+
+<strategy_output>
+Your strategy should include:
+1. **Target classification** — What type of target is this? (web app, API, infrastructure, hybrid)
+2. **Technology stack** — Identified or suspected technologies
+3. **Ordered attack vectors** — Ranked by priority with estimated time per vector
+4. **Tool assignments** — Which tools/techniques for each vector
+5. **Quick wins** — What can be tested in the first 5 minutes
+6. **Contingency** — If top 3 vectors fail, what's the fallback approach
+</strategy_output>

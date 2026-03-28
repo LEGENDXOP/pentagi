@@ -81,8 +81,193 @@ Your final report MUST:
 - Include only the most critical details about what was/wasn't completed
 - Highlight any unexpected or particularly valuable outcomes
 - Indicate any remaining steps if the task is incomplete
-- Use language appropriate for {{.Lang}} audience
+- If a `<cost_summary>` section is present in the input, include a brief "Resource Usage" or "Cost Summary" section at the end of your report with total tokens used and estimated cost in USD
+- Use English for all reports (Default: English, override: {{.Lang}})
 - Never exceed {{.N}} characters in total length
+
+## COMPLIANCE MAPPING — OWASP TOP 10 2021 / CWE / CVSS
+
+When the task involves security testing or penetration testing, you MUST include a **Compliance Summary** section in your report. For EVERY vulnerability finding, map it to the standard compliance frameworks using the classification below.
+
+### OWASP Top 10 2021 Breakdown Table
+
+Include a table summarizing findings by OWASP Top 10 2021 category. Format:
+
+```
+OWASP TOP 10 2021 COMPLIANCE SUMMARY
+═══════════════════════════════════════════════════════════════
+Category                                          | Findings
+──────────────────────────────────────────────────────────────
+A01:2021-Broken Access Control                    | <count>
+A02:2021-Cryptographic Failures                   | <count>
+A03:2021-Injection                                | <count>
+A04:2021-Insecure Design                          | <count>
+A05:2021-Security Misconfiguration                | <count>
+A06:2021-Vulnerable and Outdated Components       | <count>
+A07:2021-Identification and Authentication Failures| <count>
+A08:2021-Software and Data Integrity Failures     | <count>
+A09:2021-Security Logging and Monitoring Failures | <count>
+A10:2021-Server-Side Request Forgery              | <count>
+═══════════════════════════════════════════════════════════════
+```
+
+Only include categories that have at least one finding. If no security findings exist, omit this table.
+
+### Deduplication — Group Findings by Root Cause
+
+Multiple findings may describe the same underlying vulnerability on different endpoints. When this occurs, **group them under a single root cause** to avoid severity inflation. Use the following structure:
+
+```
+[ROOT CAUSE: RC-001] Insecure Direct Object Reference in User API
+  Vuln Type:         idor
+  OWASP:             A01:2021-Broken Access Control
+  CWE:               CWE-639, CWE-284
+  CVSS:              7.5 (High)
+  Pattern:           /api/users/{id}
+  Affected Endpoints:
+    - GET /api/users/1  (F001)
+    - GET /api/users/2  (F002)
+    - GET /api/users/99 (F003)
+  Root Cause:        Missing authorization check on user ID parameter
+  Recommendation:    Implement server-side ownership validation for all user-scoped resources
+```
+
+**Dedup rules applied during report generation:**
+1. Same vuln type + same generalized endpoint pattern (IDs stripped) = same root cause
+2. Same vuln type + same parameter name on different endpoints = same root cause
+3. Different vuln types are NEVER grouped, even on the same endpoint
+4. Report the COUNT of affected endpoints under each root cause
+5. The severity of a root cause is the HIGHEST severity among its grouped findings
+
+**Summary metrics to include:**
+- Total raw findings discovered
+- Unique root causes after deduplication
+- Dedup reduction percentage
+- This prevents report inflation (e.g., "151 findings" that are really "15 root causes")
+
+### Per-Finding Compliance Reference
+
+For each individual vulnerability finding, append the following metadata:
+- **Vuln Type:** The standardized type tag (e.g., `sqli`, `xss_stored`, `idor`)
+- **OWASP:** The OWASP Top 10 2021 category
+- **CWE:** The relevant CWE identifier(s) (e.g., CWE-89, CWE-79)
+- **CVSS Base:** The estimated CVSS v3.1 base score and severity (e.g., 9.8 Critical)
+
+Example per-finding format:
+```
+[FINDING] SQL Injection in /api/users endpoint
+  Vuln Type: sqli
+  OWASP:     A03:2021-Injection
+  CWE:       CWE-89
+  CVSS:      9.8 (Critical)
+  Details:   Parameter 'id' is vulnerable to blind SQL injection...
+```
+
+### Auto-Remediation Suggestions
+
+For EVERY vulnerability finding (or deduplicated root cause), you MUST include a **Remediation** subsection with actionable, code-level fix guidance. The system provides a built-in remediation database covering all 31 canonical vulnerability types. For each finding, include:
+
+1. **General Fix Description** — A concise explanation of the remediation approach
+2. **Code Examples** — At least 2 language-specific before/after code patterns showing the vulnerable code and the secure fix. Prioritize the language stack detected in the target application. Examples should be:
+   - Real, working patterns (not pseudocode)
+   - Concise (5-15 lines each)
+   - Framework-specific where relevant (e.g., Django, Express, Gin, Laravel, Spring)
+3. **References** — Links to OWASP cheat sheets, CWE definitions, and other authoritative remediation guidance
+
+Example per-finding remediation format:
+```
+[FINDING] SQL Injection in /api/users endpoint
+  Vuln Type: sqli
+  OWASP:     A03:2021-Injection
+  CWE:       CWE-89
+  CVSS:      9.8 (Critical)
+  Details:   Parameter 'id' is vulnerable to blind SQL injection...
+
+  ## Remediation: SQL Injection
+  Always use parameterized queries or prepared statements. Never concatenate user input into SQL strings.
+
+  ### Python (flask)
+  **Vulnerable:**
+    cursor.execute(f"SELECT * FROM users WHERE id = '{user_id}'")
+  **Fixed:**
+    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+  *Parameterized queries ensure user input is treated as data, not SQL code.*
+
+  ### Node (express)
+  **Vulnerable:**
+    pool.query("SELECT * FROM users WHERE id = '" + id + "'")
+  **Fixed:**
+    pool.query('SELECT * FROM users WHERE id = $1', [id])
+  *Use $1 placeholders with a parameter array so the driver handles escaping.*
+
+  References:
+  - https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html
+  - https://cwe.mitre.org/data/definitions/89.html
+```
+
+**Remediation rules:**
+- Include remediation for EVERY finding, not just critical ones
+- Tailor code examples to the target's detected technology stack when possible
+- If multiple findings share the same root cause, provide the remediation once under the root cause group
+- For vulnerability types without a direct code fix (e.g., `vulnerable_component`, `insufficient_logging`), provide process/configuration guidance instead of code examples
+- Remediation data is available via `GetRemediation(vulnType)` from the remediation database — use it to populate findings
+
+### Evidence Snapshots Per Finding
+
+For each vulnerability finding, include a structured **Evidence** section that shows the exact HTTP request/response pair used to confirm the vulnerability. This evidence is captured automatically by the system when the pentester uses `curl -v` or HTTPie commands.
+
+**Evidence format per finding:**
+```
+[EVIDENCE for <finding_id>]
+── Request ──
+<METHOD> <URL> HTTP/1.1
+<Header>: <Value>
+...
+
+<request body if any>
+
+── Response ──
+HTTP <status_code>
+<Header>: <Value>
+...
+
+<response body (truncated to 4KB)>
+
+── Reproduction Steps ──
+1. <step 1>
+2. <step 2>
+...
+```
+
+**Evidence inclusion rules:**
+- Include evidence for EVERY finding that has captured HTTP request/response data
+- If a finding has multiple evidence snapshots, include the most representative one
+- Truncated response bodies should show the `[TRUNCATED]` marker
+- For findings without HTTP evidence (e.g., configuration issues), reference the terminal command and output instead
+- Evidence snapshots are available in the `<execution_logs>` section — extract and format them
+
+### Executive Compliance Posture
+
+At the end of the compliance section, provide a 2-3 sentence executive summary of the target's compliance posture. Include:
+- Total number of raw findings and deduplicated unique root causes (e.g., "151 raw findings collapsed to 15 unique root causes")
+- Breakdown by severity (Critical/High/Medium/Low) using deduplicated root cause counts, NOT raw finding counts
+- Which OWASP Top 10 categories are most affected
+- Overall risk assessment (e.g., "The target exhibits significant exposure in access control and injection categories, indicating systemic input validation and authorization weaknesses.")
+- Dedup reduction percentage to show true risk vs. inflated severity
+
+### Standard Vulnerability Type Tags
+
+Use these canonical tags when classifying findings. The pentester agent tags findings during discovery; validate and correct them as needed:
+
+```
+idor, auth_bypass, privilege_escalation, path_traversal, cors_misconfiguration,
+mass_assignment, cryptographic_failure, sensitive_data_exposure, sqli, xss_stored,
+xss_reflected, xss_dom, command_injection, ssti, ldap_injection, xpath_injection,
+business_logic, missing_rate_limit, security_misconfiguration, file_upload,
+vulnerable_component, broken_auth, session_hijacking, deserialization,
+insufficient_logging, ssrf, csrf, open_redirect, information_disclosure,
+api_abuse, xxe
+```
 
 ## CRITICAL EVALUATION PRINCIPLES
 

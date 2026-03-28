@@ -78,6 +78,7 @@ type Querier interface {
 	GetFlowStats(ctx context.Context, id int64) (GetFlowStatsRow, error)
 	GetFlowSubtask(ctx context.Context, arg GetFlowSubtaskParams) (Subtask, error)
 	GetFlowSubtasks(ctx context.Context, flowID int64) ([]Subtask, error)
+	GetRecentCrossFlowFindings(ctx context.Context, currentFlowID int64) ([]GetRecentCrossFlowFindingsRow, error)
 	GetFlowTask(ctx context.Context, arg GetFlowTaskParams) (Task, error)
 	GetFlowTaskSubtasks(ctx context.Context, arg GetFlowTaskSubtasksParams) ([]Subtask, error)
 	GetFlowTaskTypeLastMsgChain(ctx context.Context, arg GetFlowTaskTypeLastMsgChainParams) (Msgchain, error)
@@ -233,6 +234,7 @@ type Querier interface {
 	UpdatePrompt(ctx context.Context, arg UpdatePromptParams) (Prompt, error)
 	UpdateProvider(ctx context.Context, arg UpdateProviderParams) (Provider, error)
 	UpdateSubtaskContext(ctx context.Context, arg UpdateSubtaskContextParams) (Subtask, error)
+	UpdateSubtaskContextWithTimestamp(ctx context.Context, arg UpdateSubtaskContextWithTimestampParams) error
 	UpdateSubtaskFailedResult(ctx context.Context, arg UpdateSubtaskFailedResultParams) (Subtask, error)
 	UpdateSubtaskFinishedResult(ctx context.Context, arg UpdateSubtaskFinishedResultParams) (Subtask, error)
 	UpdateSubtaskResult(ctx context.Context, arg UpdateSubtaskResultParams) (Subtask, error)

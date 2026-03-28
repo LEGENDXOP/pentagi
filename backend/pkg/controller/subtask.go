@@ -29,6 +29,8 @@ type SubtaskWorker interface {
 	SetStatus(ctx context.Context, status database.SubtaskStatus) error
 	GetResult(ctx context.Context) (string, error)
 	SetResult(ctx context.Context, result string) error
+	GetContext(ctx context.Context) (string, error)
+	SetContext(ctx context.Context, data string) error
 	PutInput(ctx context.Context, input string) error
 	Run(ctx context.Context) error
 	Finish(ctx context.Context) error
@@ -181,36 +183,60 @@ func (stw *subtaskWorker) GetStatus(ctx context.Context) (database.SubtaskStatus
 }
 
 func (stw *subtaskWorker) SetStatus(ctx context.Context, status database.SubtaskStatus) error {
+	// Acquire lock FIRST to prevent race between DB write and in-memory state read
+	stw.mx.Lock()
+
 	_, err := stw.subtaskCtx.DB.UpdateSubtaskStatus(ctx, database.UpdateSubtaskStatusParams{
 		Status: status,
 		ID:     stw.subtaskCtx.SubtaskID,
 	})
 	if err != nil {
+		stw.mx.Unlock()
 		return fmt.Errorf("failed to set subtask %d status: %w", stw.subtaskCtx.SubtaskID, err)
 	}
 
-	stw.mx.Lock()
-	defer stw.mx.Unlock()
-
+	// Update in-memory state while holding the lock
+	var parentStatus database.TaskStatus
+	var propagate bool
 	switch status {
+	case database.SubtaskStatusCreated:
+		// Reset for retry — subtask goes back to initial state
+		stw.completed = false
+		stw.waiting = false
+		// Clear persisted execution state on retry so agent gets a fresh tool call budget.
+		// Without this, the restored ToolCallCount would immediately hit the limit again.
+		_ = stw.subtaskCtx.DB.UpdateSubtaskContextWithTimestamp(ctx, database.UpdateSubtaskContextWithTimestampParams{
+			ID:      stw.subtaskCtx.SubtaskID,
+			Context: "",
+		})
+		// Don't propagate to parent — task is managing the retry
 	case database.SubtaskStatusRunning:
 		stw.completed = false
 		stw.waiting = false
-		err = stw.updater.SetStatus(ctx, database.TaskStatusRunning)
+		parentStatus = database.TaskStatusRunning
+		propagate = true
 	case database.SubtaskStatusWaiting:
 		stw.completed = false
 		stw.waiting = true
-		err = stw.updater.SetStatus(ctx, database.TaskStatusWaiting)
+		parentStatus = database.TaskStatusWaiting
+		propagate = true
 	case database.SubtaskStatusFinished, database.SubtaskStatusFailed:
 		stw.completed = true
 		stw.waiting = false
 		// statuses Finished and Failed will be produced by stack from Run function call
 	default:
-		// status Created is not possible to set by this call
+		stw.mx.Unlock()
 		return fmt.Errorf("unsupported subtask status: %s", status)
 	}
-	if err != nil {
-		return fmt.Errorf("failed to set task status in back propagation: %w", err)
+
+	// Release lock BEFORE calling updater to prevent deadlock in the
+	// Subtask→Task→Flow status propagation chain
+	stw.mx.Unlock()
+
+	if propagate {
+		if err := stw.updater.SetStatus(ctx, parentStatus); err != nil {
+			return fmt.Errorf("failed to set task status in back propagation: %w", err)
+		}
 	}
 
 	return nil
@@ -232,6 +258,27 @@ func (stw *subtaskWorker) SetResult(ctx context.Context, result string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("failed to set subtask %d result: %w", stw.subtaskCtx.SubtaskID, err)
+	}
+
+	return nil
+}
+
+func (stw *subtaskWorker) GetContext(ctx context.Context) (string, error) {
+	subtask, err := stw.subtaskCtx.DB.GetSubtask(ctx, stw.subtaskCtx.SubtaskID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get subtask %d context: %w", stw.subtaskCtx.SubtaskID, err)
+	}
+
+	return subtask.Context, nil
+}
+
+func (stw *subtaskWorker) SetContext(ctx context.Context, data string) error {
+	err := stw.subtaskCtx.DB.UpdateSubtaskContextWithTimestamp(ctx, database.UpdateSubtaskContextWithTimestampParams{
+		ID:      stw.subtaskCtx.SubtaskID,
+		Context: data,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to set subtask %d context: %w", stw.subtaskCtx.SubtaskID, err)
 	}
 
 	return nil
@@ -293,13 +340,23 @@ func (stw *subtaskWorker) Run(ctx context.Context) error {
 	performResult, err := stw.subtaskCtx.Provider.PerformAgentChain(ctx, taskID, subtaskID, msgChainID)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
+			// Cancellation means the user stopped the task or context expired.
+			// Set to Waiting so the user can resume with new input.
 			ctx = context.Background()
+			errChainConsistency := stw.subtaskCtx.Provider.EnsureChainConsistency(ctx, msgChainID)
+			if errChainConsistency != nil {
+				err = errors.Join(err, errChainConsistency)
+			}
+			_ = stw.SetStatus(ctx, database.SubtaskStatusWaiting)
+		} else {
+			// Permanent failure (API key expired, model error, schema error, etc.)
+			// Set to Failed — this needs investigation, not user input.
+			errChainConsistency := stw.subtaskCtx.Provider.EnsureChainConsistency(ctx, msgChainID)
+			if errChainConsistency != nil {
+				err = errors.Join(err, errChainConsistency)
+			}
+			_ = stw.SetStatus(ctx, database.SubtaskStatusFailed)
 		}
-		errChainConsistency := stw.subtaskCtx.Provider.EnsureChainConsistency(ctx, msgChainID)
-		if errChainConsistency != nil {
-			err = errors.Join(err, errChainConsistency)
-		}
-		_ = stw.SetStatus(ctx, database.SubtaskStatusWaiting)
 		return fmt.Errorf("failed to perform agent chain for subtask %d: %w", subtaskID, err)
 	}
 

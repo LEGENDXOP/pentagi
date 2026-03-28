@@ -11,6 +11,7 @@ import (
 	"pentagi/pkg/cast"
 	"pentagi/pkg/csum"
 	"pentagi/pkg/database"
+	"pentagi/pkg/docker"
 	"pentagi/pkg/graphiti"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/observability/langfuse"
@@ -25,6 +26,11 @@ import (
 	"github.com/vxcontrol/langchaingo/llms/reasoning"
 	"github.com/vxcontrol/langchaingo/llms/streaming"
 )
+
+// FlowControlCheckpoint is a function called at each iteration of the agent loop.
+// It returns a steer message (if any) and an error if the flow was aborted.
+// The function blocks while the flow is paused.
+type FlowControlCheckpoint func(ctx context.Context, flowID int64) (steerMessage string, err error)
 
 const ToolPlaceholder = "Always use your function calling functionality, instead of returning a text result."
 
@@ -85,6 +91,7 @@ type FlowProvider interface {
 	SetTitle(title string)
 	SetAgentLogProvider(agentLog tools.AgentLogProvider)
 	SetMsgLogProvider(msgLog tools.MsgLogProvider)
+	SetFlowControlCheckpoint(checkpoint FlowControlCheckpoint)
 
 	GetTaskTitle(ctx context.Context, input string) (string, error)
 	GenerateSubtasks(ctx context.Context, taskID int64) ([]tools.SubtaskInfo, error)
@@ -126,8 +133,10 @@ type flowProvider struct {
 	db database.Querier
 	mx *sync.RWMutex
 
-	embedder       embeddings.Embedder
-	graphitiClient *graphiti.Client
+	embedder          embeddings.Embedder
+	graphitiClient    *graphiti.Client
+	interactshEnabled bool
+	authStoreEnabled  bool
 
 	flowID   int64
 	publicIP string
@@ -141,15 +150,23 @@ type flowProvider struct {
 
 	tcIDTemplate string
 
-	prompter templates.Prompter
-	executor tools.FlowToolsExecutor
-	agentLog tools.AgentLogProvider
-	msgLog   tools.MsgLogProvider
-	streamCb StreamMessageHandler
+	prompter     templates.Prompter
+	executor     tools.FlowToolsExecutor
+	agentLog     tools.AgentLogProvider
+	msgLog       tools.MsgLogProvider
+	streamCb     StreamMessageHandler
+	flowControl  FlowControlCheckpoint
 
 	summarizer csum.Summarizer
 
 	provider.Provider
+}
+
+func (fp *flowProvider) SetFlowControlCheckpoint(checkpoint FlowControlCheckpoint) {
+	fp.mx.Lock()
+	defer fp.mx.Unlock()
+
+	fp.flowControl = checkpoint
 }
 
 func (fp *flowProvider) SetAgentLogProvider(agentLog tools.AgentLogProvider) {
@@ -285,11 +302,29 @@ func (fp *flowProvider) GenerateSubtasks(ctx context.Context, taskID int64) ([]t
 		return nil, fmt.Errorf("failed to get tasks info: %w", err)
 	}
 
+	// Collect workspace files so the generator knows what already exists in /work/
+	var workspaceFiles []tools.FileInfo
+	if files, err := fp.executor.ListWorkspaceFiles(ctx); err != nil {
+		logger.WithError(err).Warn("failed to list workspace files for generator context, continuing without them")
+	} else {
+		workspaceFiles = files
+	}
+
+	// Render the strategy planner template to inject budget awareness into subtask generation.
+	budgetCfg := LoadAttackBudgetConfigFromEnv()
+	strategyContext, strategyErr := RenderStrategyPlanner(fp.prompter, tasksInfo.Task.Input, budgetCfg)
+	if strategyErr != nil {
+		logger.WithError(strategyErr).Warn("failed to render strategy planner template, continuing without it")
+		strategyContext = ""
+	}
+
 	generatorContext := map[string]map[string]any{
 		"user": {
-			"Task":     tasksInfo.Task,
-			"Tasks":    tasksInfo.Tasks,
-			"Subtasks": tasksInfo.Subtasks,
+			"Task":           tasksInfo.Task,
+			"Tasks":          tasksInfo.Tasks,
+			"Subtasks":       tasksInfo.Subtasks,
+			"WorkspaceFiles": workspaceFiles,
+			"Cwd":            docker.WorkFolderPathInContainer,
 		},
 		"system": {
 			"SubtaskListToolName":     tools.SubtaskListToolName,
@@ -305,6 +340,11 @@ func (fp *flowProvider) GenerateSubtasks(ctx context.Context, taskID int64) ([]t
 			"N":                       TasksNumberLimit,
 			"ToolPlaceholder":         ToolPlaceholder,
 		},
+	}
+
+	// Inject strategy planner context into the user context for budget-aware subtask generation.
+	if strategyContext != "" {
+		generatorContext["user"]["ExecutionState"] = strategyContext
 	}
 
 	ctx, observation := obs.Observer.NewObservation(ctx)
@@ -472,12 +512,17 @@ func (fp *flowProvider) GetTaskResult(ctx context.Context, taskID int64) (*tools
 	}
 
 	subtasksInfo := fp.getSubtasksInfo(taskID, tasksInfo.Subtasks)
+
+	// Collect cost summary from the flow-level usage stats in the database.
+	costSummaryText := fp.buildFlowCostSummary(ctx, taskID)
+
 	reporterContext := map[string]map[string]any{
 		"user": {
 			"Task":              tasksInfo.Task,
 			"Tasks":             tasksInfo.Tasks,
 			"CompletedSubtasks": subtasksInfo.Completed,
 			"PlannedSubtasks":   subtasksInfo.Planned,
+			"CostSummary":       costSummaryText,
 		},
 		"system": {
 			"ReportResultToolName":    tools.ReportResultToolName,
@@ -648,6 +693,24 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 		return PerformResultError, fmt.Errorf("failed to unmarshal primary agent msg chain %d: %w", msgChainID, err)
 	}
 
+	// Validate chain integrity on load. Even though PrepareAgentChain uses
+	// restoreChain (which parses via NewChainAST with force=true), there could
+	// be corruption from race conditions or interrupted DB writes.
+	if repairedChain, repairCount := validateAndRepairChain(chain); repairCount > 0 {
+		chain = repairedChain
+		logger.WithField("repaired_tool_results", repairCount).
+			Warn("repaired orphaned tool_use blocks on chain load in PerformAgentChain")
+		// Persist the repaired chain back to DB
+		if chainBlob, err := json.Marshal(chain); err == nil {
+			if _, err := fp.db.UpdateMsgChain(ctx, database.UpdateMsgChainParams{
+				Chain: chainBlob,
+				ID:    msgChainID,
+			}); err != nil {
+				logger.WithError(err).Error("failed to persist repaired chain to DB")
+			}
+		}
+	}
+
 	adviser, err := fp.GetAskAdviceHandler(ctx, &taskID, &subtaskID)
 	if err != nil {
 		logger.WithError(err).Error("failed to get ask advice handler")
@@ -707,7 +770,12 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 	)
 	ctx, _ = executorAgent.Observation(ctx)
 
-	performResult := PerformResultError
+	var performResultVal atomic.Int32
+	performResultVal.Store(int32(PerformResultError))
+	var endAgentOnce sync.Once
+	endAgent := func(opts ...langfuse.AgentOption) {
+		endAgentOnce.Do(func() { executorAgent.End(opts...) })
+	}
 	cfg := tools.PrimaryExecutorConfig{
 		TaskID:    taskID,
 		SubtaskID: subtaskID,
@@ -740,17 +808,17 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 					langfuse.WithAgentOutput(done.Result),
 				}
 				defer func() {
-					executorAgent.End(opts...)
+					endAgent(opts...)
 				}()
 
 				if !done.Success {
-					performResult = PerformResultError
+					performResultVal.Store(int32(PerformResultError))
 					opts = append(opts,
 						langfuse.WithAgentStatus("done handler: failed"),
 						langfuse.WithAgentLevel(langfuse.ObservationLevelWarning),
 					)
 				} else {
-					performResult = PerformResultDone
+					performResultVal.Store(int32(PerformResultDone))
 					opts = append(opts,
 						langfuse.WithAgentStatus("done handler: success"),
 					)
@@ -801,7 +869,7 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 				}
 
 			case tools.AskUserToolName:
-				performResult = PerformResultWaiting
+				performResultVal.Store(int32(PerformResultWaiting))
 
 				var askUser tools.AskUser
 				if err := json.Unmarshal(args, &askUser); err != nil {
@@ -809,7 +877,7 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 					return "", fmt.Errorf("failed to unmarshal ask user result: %w", err)
 				}
 
-				executorAgent.End(
+				endAgent(
 					langfuse.WithAgentOutput(askUser.Message),
 					langfuse.WithAgentStatus("ask user handler"),
 				)
@@ -825,22 +893,57 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 		return PerformResultError, wrapErrorEndAgentSpan(ctx, executorAgent, "failed to get primary executor", err)
 	}
 
+	// Create a global execution budget if one doesn't exist yet (top-level entry).
+	// Sub-agents inherit the budget from their parent via context.
+	if GetBudget(ctx) == nil {
+		ctx = WithBudget(ctx, NewExecutionBudget(getGlobalMaxToolCalls(), getGlobalMaxDuration()))
+	}
+
+	// Create a CostTracker for this flow if one doesn't exist yet.
+	// Sub-agents inherit the tracker from their parent via context, so all
+	// costs within a single user request accumulate in one place.
+	if GetCostTracker(ctx) == nil {
+		ctx = WithCostTracker(ctx, NewCostTracker(fp.Model(optAgentType)))
+	}
+
+	// Create an AttackBudgetManager if one doesn't exist yet.
+	// This tracks per-phase/vector time and failure budgets to prevent rabbit-holing.
+	// Sub-agents inherit the manager from their parent via context.
+	if GetAttackBudget(ctx) == nil {
+		ctx = WithAttackBudget(ctx, NewAttackBudgetManager(LoadAttackBudgetConfigFromEnv()))
+	}
+
 	ctx = tools.PutAgentContext(ctx, msgChainType)
 	err = fp.performAgentChain(
 		ctx, optAgentType, msgChain.ID, &taskID, &subtaskID, chain, executor, fp.summarizer,
 	)
 	if err != nil {
-		return PerformResultError, wrapErrorEndAgentSpan(ctx, executorAgent, "failed to perform primary agent chain", err)
+		logrus.WithContext(ctx).WithError(err).Error("failed to perform primary agent chain")
+		endAgent(
+			langfuse.WithAgentStatus(err.Error()),
+			langfuse.WithAgentLevel(langfuse.ObservationLevelError),
+		)
+		return PerformResultError, fmt.Errorf("failed to perform primary agent chain: %w", err)
 	}
 
-	executorAgent.End()
+	endAgent()
 
-	return performResult, nil
+	return PerformResult(performResultVal.Load()), nil
 }
+
+const maxUserInputSize = 32 * 1024 // 32KB maximum user input size
 
 func (fp *flowProvider) PutInputToAgentChain(ctx context.Context, msgChainID int64, input string) error {
 	ctx, span := obs.Observer.NewSpan(ctx, obs.SpanKindInternal, "providers.flowProvider.PutInputToAgentChain")
 	defer span.End()
+
+	if len(input) == 0 {
+		return fmt.Errorf("user input is empty")
+	}
+
+	if len(input) > maxUserInputSize {
+		return fmt.Errorf("user input exceeds maximum size (%d > %d bytes)", len(input), maxUserInputSize)
+	}
 
 	logger := logrus.WithContext(ctx).WithFields(logrus.Fields{
 		"provider":     fp.Type(),
@@ -921,4 +1024,55 @@ func (fp *flowProvider) putAgentLog(
 	}
 
 	return agentLog.PutLog(ctx, initiator, executor, task, result, taskID, subtaskID)
+}
+
+// buildFlowCostSummary queries the database for flow-level usage stats and
+// returns a formatted cost summary string for inclusion in reporter context.
+// It also supplements with in-memory CostTracker data if available.
+// Returns empty string on error (non-fatal).
+func (fp *flowProvider) buildFlowCostSummary(ctx context.Context, taskID int64) string {
+	logger := logrus.WithContext(ctx).WithFields(logrus.Fields{
+		"flow_id": fp.flowID,
+		"task_id": taskID,
+	})
+
+	// Primary source: database aggregation (most accurate, includes all historical calls)
+	flowStats, err := fp.db.GetFlowUsageStats(ctx, fp.flowID)
+	if err != nil {
+		logger.WithError(err).Warn("failed to get flow usage stats for cost summary")
+		// Fall back to in-memory tracker if DB query fails
+		if ct := GetCostTracker(ctx); ct != nil {
+			return ct.FormatCostSummary(0)
+		}
+		return ""
+	}
+
+	totalCost := flowStats.TotalUsageCostIn + flowStats.TotalUsageCostOut
+	if flowStats.TotalUsageIn == 0 && flowStats.TotalUsageOut == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Total Input Tokens: %d\n", flowStats.TotalUsageIn))
+	sb.WriteString(fmt.Sprintf("Total Output Tokens: %d\n", flowStats.TotalUsageOut))
+	if flowStats.TotalUsageCacheIn > 0 || flowStats.TotalUsageCacheOut > 0 {
+		sb.WriteString(fmt.Sprintf("Cache Read Tokens: %d\n", flowStats.TotalUsageCacheIn))
+		sb.WriteString(fmt.Sprintf("Cache Write Tokens: %d\n", flowStats.TotalUsageCacheOut))
+	}
+	sb.WriteString(fmt.Sprintf("Total Estimated Cost: $%.4f USD\n", totalCost))
+
+	// Add per-agent-type breakdown
+	typeStats, err := fp.db.GetUsageStatsByTypeForFlow(ctx, fp.flowID)
+	if err != nil {
+		logger.WithError(err).Warn("failed to get usage stats by type for cost summary")
+	} else if len(typeStats) > 0 {
+		sb.WriteString("\nCost by Agent Type:\n")
+		for _, ts := range typeStats {
+			typeCost := ts.TotalUsageCostIn + ts.TotalUsageCostOut
+			sb.WriteString(fmt.Sprintf("  %-20s  in: %-10d  out: %-10d  cost: $%.4f\n",
+				ts.Type, ts.TotalUsageIn, ts.TotalUsageOut, typeCost))
+		}
+	}
+
+	return sb.String()
 }

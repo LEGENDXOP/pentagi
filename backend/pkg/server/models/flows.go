@@ -96,7 +96,7 @@ func (cf CreateFlow) Valid() error {
 // PatchFlow is model to contain flow patching paylaod
 // nolint:lll
 type PatchFlow struct {
-	Action string  `form:"action" json:"action" validate:"required,oneof=stop finish input rename" enums:"stop,finish,input,rename" default:"stop"`
+	Action string  `form:"action" json:"action" validate:"required,oneof=stop finish input rename resume" enums:"stop,finish,input,rename,resume" default:"stop"`
 	Input  *string `form:"input,omitempty" json:"input,omitempty" validate:"required_if=Action input" example:"user input for waiting flow"`
 	Name   *string `form:"name,omitempty" json:"name,omitempty" validate:"required_if=Action rename" example:"new flow name"`
 }

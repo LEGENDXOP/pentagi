@@ -1,5 +1,5 @@
 import { zodResolver } from '@hookform/resolvers/zod';
-import { ArrowUpIcon, Check, ChevronDown, Square, X } from 'lucide-react';
+import { ArrowUpIcon, Check, ChevronDown, Play, Square, X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
@@ -39,8 +39,10 @@ export interface FlowFormProps {
     isDisabled?: boolean;
     isLoading?: boolean;
     isProviderDisabled?: boolean;
+    isResuming?: boolean;
     isSubmitting?: boolean;
     onCancel?: () => Promise<void> | void;
+    onResume?: (values?: FlowFormValues) => Promise<void> | void;
     onSubmit: (values: FlowFormValues) => Promise<void> | void;
     placeholder?: string;
     type: 'assistant' | 'automation';
@@ -54,8 +56,10 @@ export const FlowForm = ({
     isDisabled,
     isLoading,
     isProviderDisabled,
+    isResuming,
     isSubmitting,
     onCancel,
+    onResume,
     onSubmit,
     placeholder = 'Describe what you would like PentAGI to test...',
     type,
@@ -297,7 +301,22 @@ export const FlowForm = ({
                                             )}
                                         />
                                     )}
-                                    {!isLoading || isSubmitting ? (
+                                    {onResume ? (
+                                        <InputGroupButton
+                                            className="ml-auto"
+                                            disabled={isResuming}
+                                            onClick={() => {
+                                                const message = form.getValues('message')?.trim();
+                                                onResume(message ? form.getValues() : undefined);
+                                                resetField('message');
+                                            }}
+                                            size="icon-xs"
+                                            type="button"
+                                            variant="default"
+                                        >
+                                            {isResuming ? <Spinner variant="circle" /> : <Play />}
+                                        </InputGroupButton>
+                                    ) : !isLoading || isSubmitting ? (
                                         <InputGroupButton
                                             className="ml-auto"
                                             disabled={isSubmitting || !isValid}

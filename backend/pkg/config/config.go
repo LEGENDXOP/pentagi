@@ -172,10 +172,59 @@ type Config struct {
 	LangfusePublicKey string `env:"LANGFUSE_PUBLIC_KEY"`
 	LangfuseSecretKey string `env:"LANGFUSE_SECRET_KEY"`
 
+	// Nuclei vulnerability scanner
+	NucleiEnabled       bool   `env:"NUCLEI_ENABLED" envDefault:"true"`
+	NucleiRateLimit     int    `env:"NUCLEI_RATE_LIMIT" envDefault:"100"`
+	NucleiTemplatesPath string `env:"NUCLEI_TEMPLATES_PATH" envDefault:"/root/nuclei-templates"`
+
 	// Graphiti knowledge graph
 	GraphitiEnabled bool   `env:"GRAPHITI_ENABLED" envDefault:"false"`
 	GraphitiTimeout int    `env:"GRAPHITI_TIMEOUT" envDefault:"30"`
 	GraphitiURL     string `env:"GRAPHITI_URL"`
+
+	// Graphiti circuit breaker
+	GraphitiCBEnabled    bool `env:"GRAPHITI_CB_ENABLED" envDefault:"true"`
+	GraphitiCBThreshold  int  `env:"GRAPHITI_CB_THRESHOLD" envDefault:"3"`
+	GraphitiCBTimeout    int  `env:"GRAPHITI_CB_TIMEOUT" envDefault:"120"`
+	GraphitiCBMaxRetries int  `env:"GRAPHITI_CB_MAX_RETRIES" envDefault:"3"`
+
+	// Auth Store session management for pentester agent
+	AuthStoreEnabled bool `env:"AUTH_STORE_ENABLED" envDefault:"true"`
+
+	// Playwright browser automation (headless browser inside container)
+	BrowserPlaywrightEnabled bool `env:"BROWSER_PLAYWRIGHT_ENABLED" envDefault:"true"`
+	BrowserPlaywrightTimeout int  `env:"BROWSER_PLAYWRIGHT_TIMEOUT" envDefault:"30"`
+
+	// Interactsh OOB (Out-of-Band) detection for blind vulnerability testing
+	InteractshEnabled      bool   `env:"INTERACTSH_ENABLED" envDefault:"false"`
+	InteractshServer       string `env:"INTERACTSH_SERVER" envDefault:"oast.fun"`
+	InteractshPollInterval int    `env:"INTERACTSH_POLL_INTERVAL" envDefault:"10"`
+
+	// Attack budget configuration for time-boxed auto-pivot
+	BudgetReconMinutes       int `env:"BUDGET_RECON_MINUTES" envDefault:"30"`
+	BudgetAttackMinutes      int `env:"BUDGET_ATTACK_MINUTES" envDefault:"45"`
+	BudgetPostExploitMinutes int `env:"BUDGET_POST_EXPLOIT_MINUTES" envDefault:"20"`
+	BudgetFailureLimit       int `env:"BUDGET_FAILURE_LIMIT" envDefault:"5"`
+
+	// Nesting depth limit — prevents nested agent chains from exhausting shared timeout
+	MaxNestingDepth int `env:"MAX_NESTING_DEPTH" envDefault:"2"`
+
+	// Subtask retry configuration — automatic retry on transient failures
+	SubtaskMaxRetries int `env:"SUBTASK_MAX_RETRIES" envDefault:"2"`
+
+	// Maximum tool calls per subtask before forced stop (default 50)
+	MaxToolCallsPerSubtask int `env:"MAX_TOOL_CALLS_PER_SUBTASK" envDefault:"50"`
+
+	// Flow watchdog — auto-resumes stalled flows
+	FlowWatchdogEnabled    bool `env:"FLOW_WATCHDOG_ENABLED" envDefault:"true"`
+	FlowWatchdogInterval   int  `env:"FLOW_WATCHDOG_INTERVAL" envDefault:"300"`    // seconds
+	FlowWatchdogMaxResumes int  `env:"FLOW_WATCHDOG_MAX_RESUMES" envDefault:"5"`
+
+	// Telegram notifications (optional)
+	TelegramBotToken      string `env:"TELEGRAM_BOT_TOKEN"`
+	TelegramChatID        string `env:"TELEGRAM_CHAT_ID"`
+	TelegramNotify        bool   `env:"TELEGRAM_NOTIFY" envDefault:"false"`
+	TelegramQuietTZOffset int    `env:"TELEGRAM_QUIET_TZ_OFFSET" envDefault:"0"` // hours offset from UTC for quiet hours
 }
 
 func NewConfig() (*Config, error) {

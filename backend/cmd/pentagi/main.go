@@ -18,6 +18,7 @@ import (
 	"pentagi/pkg/database"
 	"pentagi/pkg/docker"
 	"pentagi/pkg/graph/subscriptions"
+	"pentagi/pkg/notifications"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/providers"
 	router "pentagi/pkg/server"
@@ -106,8 +107,28 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize providers: %v", err)
 	}
+
+	// Initialize optional Telegram notifications
+	var notifier *notifications.NotificationManager
+	logrus.WithFields(logrus.Fields{
+		"telegram_notify":  cfg.TelegramNotify,
+		"has_bot_token":    cfg.TelegramBotToken != "",
+		"has_chat_id":      cfg.TelegramChatID != "",
+		"quiet_tz_offset":  cfg.TelegramQuietTZOffset,
+	}).Info("Telegram notification config loaded")
+
+	if cfg.TelegramNotify && cfg.TelegramBotToken != "" && cfg.TelegramChatID != "" {
+		tg := notifications.NewTelegramNotifier(cfg.TelegramBotToken, cfg.TelegramChatID)
+		notifier = notifications.NewNotificationManager(tg, true, cfg.TelegramQuietTZOffset)
+		logrus.WithField("chat_id", cfg.TelegramChatID).Info("Telegram bot initialized, sending test ping")
+		tg.Send("🔔 PentAGI notifications active")
+	} else {
+		notifier = notifications.NewNotificationManager(nil, false, 0)
+		logrus.Warn("Telegram notifications disabled — check TELEGRAM_NOTIFY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+	}
+
 	subscriptions := subscriptions.NewSubscriptionsController()
-	controller := controller.NewFlowController(queries, cfg, client, providers, subscriptions)
+	controller := controller.NewFlowController(queries, cfg, client, providers, subscriptions, notifier)
 
 	if err := controller.LoadFlows(ctx); err != nil {
 		log.Fatalf("failed to load flows: %v", err)
@@ -131,6 +152,10 @@ func main() {
 	// Wait for termination signal
 	<-sigChan
 	log.Println("Shutting down...")
+
+	if notifier != nil {
+		notifier.Close()
+	}
 
 	log.Println("Shutdown complete")
 }

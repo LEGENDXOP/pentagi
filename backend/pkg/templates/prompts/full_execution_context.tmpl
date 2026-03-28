@@ -88,4 +88,11 @@ The summary should help the reader quickly understand the current state of the t
 <message>No planned subtasks for this task in the backlog. All subtasks are completed{{if .Subtask}} except the current one{{end}}.</message>
 {{end}}
 </planned_subtasks>
+{{if .ExecutionMetrics}}
+<execution_metrics>
+  <tool_calls_count>{{.ExecutionMetrics.ToolCallCount}}</tool_calls_count>
+  <elapsed_seconds>{{.ExecutionMetrics.ElapsedSeconds}}</elapsed_seconds>
+  <unique_commands>{{.ExecutionMetrics.UniqueCommands}}</unique_commands>
+</execution_metrics>
+{{end}}
 </execution_context>

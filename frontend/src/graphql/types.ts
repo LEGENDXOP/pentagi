@@ -368,6 +368,7 @@ export type Mutation = {
     finishFlow: ResultType;
     putUserInput: ResultType;
     renameFlow: ResultType;
+    resumeFlow: FlowFragmentFragment;
     stopAssistant: Assistant;
     stopFlow: ResultType;
     testAgent: AgentTestResult;
@@ -453,6 +454,11 @@ export type MutationPutUserInputArgs = {
 export type MutationRenameFlowArgs = {
     flowId: Scalars['ID']['input'];
     title: Scalars['String']['input'];
+};
+
+export type MutationResumeFlowArgs = {
+    flowId: Scalars['ID']['input'];
+    input?: InputMaybe<Scalars['String']['input']>;
 };
 
 export type MutationStopAssistantArgs = {
@@ -1654,6 +1660,13 @@ export type RenameFlowMutationVariables = Exact<{
 }>;
 
 export type RenameFlowMutation = { renameFlow: ResultType };
+
+export type ResumeFlowMutationVariables = Exact<{
+    flowId: Scalars['ID']['input'];
+    input?: InputMaybe<Scalars['String']['input']>;
+}>;
+
+export type ResumeFlowMutation = { resumeFlow: FlowFragmentFragment };
 
 export type CreateAssistantMutationVariables = Exact<{
     flowId: Scalars['ID']['input'];
@@ -4528,6 +4541,45 @@ export function useRenameFlowMutation(
 export type RenameFlowMutationHookResult = ReturnType<typeof useRenameFlowMutation>;
 export type RenameFlowMutationResult = Apollo.MutationResult<RenameFlowMutation>;
 export type RenameFlowMutationOptions = Apollo.BaseMutationOptions<RenameFlowMutation, RenameFlowMutationVariables>;
+export const ResumeFlowDocument = gql`
+    mutation resumeFlow($flowId: ID!, $input: String) {
+        resumeFlow(flowId: $flowId, input: $input) {
+            ...flowFragment
+        }
+    }
+    ${FlowFragmentFragmentDoc}
+    ${TerminalFragmentFragmentDoc}
+    ${ProviderFragmentFragmentDoc}
+`;
+export type ResumeFlowMutationFn = Apollo.MutationFunction<ResumeFlowMutation, ResumeFlowMutationVariables>;
+
+/**
+ * __useResumeFlowMutation__
+ *
+ * To run a mutation, you first call `useResumeFlowMutation` within a React component and pass it any options that fit your needs.
+ * When your component renders, `useResumeFlowMutation` returns a tuple that includes:
+ * - A mutate function that you can call at any time to execute the mutation
+ * - An object with fields that represent the current status of the mutation's execution
+ *
+ * @param baseOptions options that will be passed into the mutation, supported options are listed on: https://www.apollographql.com/docs/react/api/react-hooks/#options-2;
+ *
+ * @example
+ * const [resumeFlowMutation, { data, loading, error }] = useResumeFlowMutation({
+ *   variables: {
+ *      flowId: // value for 'flowId'
+ *      input: // value for 'input'
+ *   },
+ * });
+ */
+export function useResumeFlowMutation(
+    baseOptions?: Apollo.MutationHookOptions<ResumeFlowMutation, ResumeFlowMutationVariables>,
+) {
+    const options = { ...defaultOptions, ...baseOptions };
+    return Apollo.useMutation<ResumeFlowMutation, ResumeFlowMutationVariables>(ResumeFlowDocument, options);
+}
+export type ResumeFlowMutationHookResult = ReturnType<typeof useResumeFlowMutation>;
+export type ResumeFlowMutationResult = Apollo.MutationResult<ResumeFlowMutation>;
+export type ResumeFlowMutationOptions = Apollo.BaseMutationOptions<ResumeFlowMutation, ResumeFlowMutationVariables>;
 export const CreateAssistantDocument = gql`
     mutation createAssistant($flowId: ID!, $modelProvider: String!, $input: String!, $useAgents: Boolean!) {
         createAssistant(flowId: $flowId, modelProvider: $modelProvider, input: $input, useAgents: $useAgents) {

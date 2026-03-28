@@ -21,6 +21,7 @@ import { UserProvider } from '@/providers/user-provider';
 import { SystemSettingsProvider } from './providers/system-settings-provider';
 
 const Flow = lazy(() => import('@/pages/flows/flow'));
+const FlowDashboard = lazy(() => import('@/pages/flows/flow-dashboard'));
 const FlowReport = lazy(() => import('@/pages/flows/flow-report'));
 const Flows = lazy(() => import('@/pages/flows/flows'));
 const NewFlow = lazy(() => import('@/pages/flows/new-flow'));
@@ -156,6 +157,18 @@ const App = () => {
                                             </ProtectedRoute>
                                         }
                                         path="flows/:flowId/report"
+                                    />
+
+                                    {/* dashboard route */}
+                                    <Route
+                                        element={
+                                            <ProtectedRoute>
+                                                <SystemSettingsProvider>
+                                                    <FlowDashboard />
+                                                </SystemSettingsProvider>
+                                            </ProtectedRoute>
+                                        }
+                                        path="flows/:flowId/dashboard"
                                     />
 
                                     {/* public routes */}

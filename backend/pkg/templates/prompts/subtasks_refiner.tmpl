@@ -67,4 +67,60 @@
   {{.ExecutionLogs}}
   </execution_logs>
   {{end}}
+
+  <deduplication_guidance>
+  IMPORTANT: Before finalizing your refined plan, compare each planned subtask against ALL completed subtask results above:
+  - If a planned subtask's objective is FULLY achieved by completed results → REMOVE it
+  - If a planned subtask is PARTIALLY covered by completed results → MODIFY it to cover only the remaining gap
+  - Never create new subtasks that duplicate work already successfully completed
+  - When checking for overlap, compare the semantic intent, not just the title — a completed "port scan" covers a planned "network reconnaissance" if ports were already scanned
+  </deduplication_guidance>
+
+  <subtask_scope_enforcement>
+  CRITICAL: Review each planned subtask for scope. REJECT and SPLIT any subtask that:
+  - Lists more than 3 attack categories or techniques (e.g., "Test XSS, SQLi, SSRF, IDOR, and path traversal" = 5 categories → MUST be split)
+  - Would require more than 15 tool calls to complete
+  - Combines recon + auth + triage into one subtask
+
+  When replanning a FAILED subtask:
+  - INCLUDE any partial findings mentioned in its result in the new subtask's description
+  - Example: "Continue from partial findings: F-001 (XSS on /api/users), F-002 (IDOR on /api/orders). Focus on: remaining untested categories."
+  - Split the failed subtask into smaller, focused subtasks if it was too broad
+  </subtask_scope_enforcement>
+
+  <attack_chain_reasoning>
+  CRITICAL: When reviewing completed subtask results, look for DISCOVERED VULNERABILITIES (tagged with [VULN_TYPE: ...]).
+  Each finding unlocks follow-up attacks that should be prioritized in the refined plan.
+
+  Apply these chain rules when adding or reordering subtasks:
+
+  1. **Chain-driven prioritization:** If a completed subtask discovered a vulnerability, add follow-up subtasks based on attack chains:
+     - idor → Test privilege escalation (change ID to admin), enumerate all IDs for bulk data extraction, test write operations (PUT/DELETE) with other user IDs
+     - auth_bypass → Access admin endpoints with bypass, test all API endpoints without auth, access data export endpoints
+     - sqli → Dump credentials table, attempt OS command execution via stacked queries, extract full DB schema
+     - xss_stored → Steal sessions via cookie exfiltration, craft admin-targeted payload for privilege escalation, bypass CSRF protections
+     - ssrf → Fetch cloud metadata (169.254.169.254), scan internal services (Redis, Elasticsearch), try file:// for local file read
+     - command_injection → Enumerate sudo/SUID for privesc, map internal network, dump env vars and config files for secrets
+     - path_traversal → Read config files for credentials, extract source code for hidden endpoints, read /etc/shadow
+     - file_upload → Upload web shell for RCE, upload HTML/SVG for stored XSS, test filename traversal for arbitrary file write
+     - broken_auth → Test vertical privilege escalation, analyze session token entropy, test IDOR with multiple sessions
+     - information_disclosure → Use leaked credentials/keys, research CVEs for disclosed versions, map internal architecture from leaked IPs
+     - security_misconfiguration → Try default credentials on admin panels, check for exposed .git/.env/backup files, access debug endpoints
+     - csrf → Target role-management endpoints for privesc, chain with password change for account takeover
+     - missing_rate_limit → Brute-force credentials, enumerate valid usernames/emails, test business logic abuse (coupon reuse, voting)
+     - open_redirect → Chain with OAuth flows to steal tokens, test javascript: URI for XSS escalation
+     - mass_assignment → Add admin role fields to requests, set verification bypass flags, modify financial fields
+     - ssti → Escalate to OS command execution via engine gadgets, read application config from template context
+     - deserialization → Use ysoserial/pickle payloads for RCE, forge serialized admin user objects
+     - xxe → Read local files via file:// entities, SSRF via http:// entities, attempt OOB exfiltration
+     - cors_misconfiguration → Cross-origin data theft of authenticated responses, defeat CSRF protections
+     - vulnerable_component → Search exploit-db for version-specific RCE, test known injection CVEs
+     - session_hijacking → Use hijacked session for privilege escalation, test horizontal access with different sessions
+
+  2. **Priority ordering:** Chain follow-ups (especially from Critical/High findings) should be placed BEFORE generic scanning subtasks. A confirmed SQLi chain to credential dump is more valuable than scanning a new endpoint.
+
+  3. **Cascading chains:** If a chain follow-up itself discovers a new vuln type, add chains for THAT finding too. Example: SSRF → cloud metadata → leaked IAM credentials → privilege escalation in cloud console.
+
+  4. **Don't duplicate chain work:** If a chain follow-up was already tested (check completed subtask results), don't add it again.
+  </attack_chain_reasoning>
 </refinement_context>

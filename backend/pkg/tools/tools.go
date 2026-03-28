@@ -286,6 +286,7 @@ type FlowToolsExecutor interface {
 
 	Prepare(ctx context.Context) error
 	Release(ctx context.Context) error
+	ListWorkspaceFiles(ctx context.Context) ([]FileInfo, error)
 	GetCustomExecutor(cfg CustomExecutorConfig) (ContextToolsExecutor, error)
 	GetAssistantExecutor(cfg AssistantExecutorConfig) (ContextToolsExecutor, error)
 	GetPrimaryExecutor(cfg PrimaryExecutorConfig) (ContextToolsExecutor, error)
@@ -336,12 +337,16 @@ func (fte *flowToolsExecutor) SetEmbedder(embedder embeddings.Embedder) {
 	}
 
 	store, err := pgvector.New(
-		context.Background(),
+		context.TODO(), // Fix 42: TODO — pass ctx when SetEmbedder interface is updated
 		pgvector.WithConnectionURL(fte.cfg.DatabaseURL),
 		pgvector.WithEmbedder(embedder),
 	)
 	if err == nil {
 		fte.store = &store
+		// Wire up fallback pgvector store for Graphiti circuit breaker
+		if fte.graphitiClient != nil {
+			fte.graphitiClient.SetFallbackStore(fte.store)
+		}
 	}
 }
 
@@ -375,6 +380,10 @@ func (fte *flowToolsExecutor) SetVectorStoreLogProvider(vslp VectorStoreLogProvi
 
 func (fte *flowToolsExecutor) SetGraphitiClient(client *graphiti.Client) {
 	fte.graphitiClient = client
+	// Wire up fallback pgvector store for circuit breaker fallback
+	if client != nil && fte.store != nil {
+		client.SetFallbackStore(fte.store)
+	}
 }
 
 func (fte *flowToolsExecutor) Prepare(ctx context.Context) error {
@@ -423,13 +432,48 @@ func (fte *flowToolsExecutor) Release(ctx context.Context) error {
 		fte.store.Close()
 	}
 
-	// TODO: here better to get flow containers list and delete all of them
-	if err := fte.docker.DeleteContainer(ctx, fte.primaryLID, fte.primaryID); err != nil {
-		containerName := PrimaryTerminalName(fte.flowID)
-		return fmt.Errorf("failed to delete container '%s': %w", containerName, err)
+	// Fix 40: clean up ALL flow containers, not just primary
+	containers, err := fte.db.GetFlowContainers(ctx, fte.flowID)
+	if err != nil {
+		logrus.WithError(err).WithField("flow_id", fte.flowID).
+			Warn("failed to list flow containers for cleanup, falling back to primary only")
+		// Fallback: at least try to delete the primary container
+		if delErr := fte.docker.DeleteContainer(ctx, fte.primaryLID, fte.primaryID); delErr != nil {
+			containerName := PrimaryTerminalName(fte.flowID)
+			return fmt.Errorf("failed to delete container '%s': %w", containerName, delErr)
+		}
+		return nil
 	}
 
+	var errs []error
+	for _, cnt := range containers {
+		if err := fte.docker.DeleteContainer(ctx, cnt.LocalID.String, cnt.ID); err != nil {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"container_id":    cnt.ID,
+				"container_name":  cnt.Name,
+				"container_local": cnt.LocalID.String,
+			}).Warn("failed to delete flow container during release")
+			errs = append(errs, fmt.Errorf("container %s (ID %d): %w", cnt.Name, cnt.ID, err))
+		}
+	}
+
+	// If no containers were found in DB (edge case), still try primary
+	if len(containers) == 0 {
+		if err := fte.docker.DeleteContainer(ctx, fte.primaryLID, fte.primaryID); err != nil {
+			containerName := PrimaryTerminalName(fte.flowID)
+			errs = append(errs, fmt.Errorf("failed to delete primary container '%s': %w", containerName, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("errors during container cleanup: %v", errs)
+	}
 	return nil
+}
+
+func (fte *flowToolsExecutor) ListWorkspaceFiles(ctx context.Context) ([]FileInfo, error) {
+	containerName := PrimaryTerminalName(fte.flowID)
+	return ListWorkspaceFiles(ctx, fte.docker, containerName, fte.primaryLID, "")
 }
 
 func (fte *flowToolsExecutor) GetCustomExecutor(cfg CustomExecutorConfig) (ContextToolsExecutor, error) {
@@ -500,7 +544,7 @@ func (fte *flowToolsExecutor) GetAssistantExecutor(cfg AssistantExecutorConfig) 
 		return nil, fmt.Errorf("searcher handler is required")
 	}
 
-	container, err := fte.db.GetFlowPrimaryContainer(context.Background(), fte.flowID)
+	container, err := fte.db.GetFlowPrimaryContainer(context.TODO(), fte.flowID) // Fix 42: TODO — pass ctx when interface is updated
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container %d: %w", fte.flowID, err)
 	}
@@ -790,7 +834,7 @@ func (fte *flowToolsExecutor) GetInstallerExecutor(cfg InstallerExecutorConfig) 
 		return nil, fmt.Errorf("searcher handler is required")
 	}
 
-	container, err := fte.db.GetFlowPrimaryContainer(context.Background(), fte.flowID)
+	container, err := fte.db.GetFlowPrimaryContainer(context.TODO(), fte.flowID) // Fix 42: TODO — pass ctx when interface is updated
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container %d: %w", fte.flowID, err)
 	}
@@ -982,7 +1026,7 @@ func (fte *flowToolsExecutor) GetPentesterExecutor(cfg PentesterExecutorConfig) 
 		return nil, fmt.Errorf("searcher handler is required")
 	}
 
-	container, err := fte.db.GetFlowPrimaryContainer(context.Background(), fte.flowID)
+	container, err := fte.db.GetFlowPrimaryContainer(context.TODO(), fte.flowID) // Fix 42: TODO — pass ctx when interface is updated
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container %d: %w", fte.flowID, err)
 	}
@@ -1045,6 +1089,37 @@ func (fte *flowToolsExecutor) GetPentesterExecutor(cfg PentesterExecutorConfig) 
 		ce.handlers[BrowserToolName] = browser.Handle
 	}
 
+	// Playwright browser automation tools (headless browser inside container)
+	playwrightBrowser := NewBrowserPlaywrightTool(
+		fte.flowID,
+		cfg.TaskID,
+		cfg.SubtaskID,
+		fte.cfg.BrowserPlaywrightEnabled,
+		fte.cfg.BrowserPlaywrightTimeout,
+		container.ID,
+		container.LocalID.String,
+		fte.docker,
+		fte.tlp,
+		fte.scp,
+	)
+	if playwrightBrowser.IsAvailable() {
+		ce.definitions = append(ce.definitions,
+			registryDefinitions[BrowserNavigateToolName],
+			registryDefinitions[BrowserClickToolName],
+			registryDefinitions[BrowserFillToolName],
+			registryDefinitions[BrowserScreenshotToolName],
+			registryDefinitions[BrowserEvaluateToolName],
+			registryDefinitions[BrowserCookiesToolName],
+		)
+		pwHandler := playwrightBrowser.(*browserPlaywright).Handle
+		ce.handlers[BrowserNavigateToolName] = pwHandler
+		ce.handlers[BrowserClickToolName] = pwHandler
+		ce.handlers[BrowserFillToolName] = pwHandler
+		ce.handlers[BrowserScreenshotToolName] = pwHandler
+		ce.handlers[BrowserEvaluateToolName] = pwHandler
+		ce.handlers[BrowserCookiesToolName] = pwHandler
+	}
+
 	guide := &guide{
 		flowID:    fte.flowID,
 		taskID:    cfg.TaskID,
@@ -1081,6 +1156,98 @@ func (fte *flowToolsExecutor) GetPentesterExecutor(cfg PentesterExecutorConfig) 
 	if sploitus.IsAvailable() {
 		ce.definitions = append(ce.definitions, registryDefinitions[SploitusToolName])
 		ce.handlers[SploitusToolName] = sploitus.Handle
+	}
+
+	nucleiTool := NewNucleiTool(
+		fte.flowID,
+		cfg.TaskID,
+		cfg.SubtaskID,
+		fte.cfg.NucleiEnabled,
+		fte.cfg.NucleiRateLimit,
+		fte.cfg.NucleiTemplatesPath,
+		container.ID,
+		container.LocalID.String,
+		fte.docker,
+		fte.tlp,
+	)
+	if nucleiTool.IsAvailable() {
+		ce.definitions = append(ce.definitions, registryDefinitions[NucleiToolName])
+		ce.handlers[NucleiToolName] = nucleiTool.Handle
+	}
+
+	// Race condition / TOCTOU testing tool
+	raceTool := NewRaceConditionTool(
+		fte.flowID,
+		cfg.TaskID,
+		cfg.SubtaskID,
+		container.ID,
+		container.LocalID.String,
+		fte.docker,
+		fte.tlp,
+	)
+	if raceTool.IsAvailable() {
+		ce.definitions = append(ce.definitions, registryDefinitions[RaceConditionToolName])
+		ce.handlers[RaceConditionToolName] = raceTool.Handle
+	}
+
+	// Interactsh OOB detection tools
+	if fte.cfg.InteractshEnabled {
+		interactsh := NewInteractshTool(
+			fte.flowID,
+			cfg.TaskID,
+			cfg.SubtaskID,
+			container.ID,
+			container.LocalID.String,
+			fte.docker,
+			fte.tlp,
+			fte.cfg.InteractshServer,
+		)
+		if interactsh.IsAvailable() {
+			ce.definitions = append(ce.definitions,
+				registryDefinitions[InteractshGetURLToolName],
+				registryDefinitions[InteractshPollToolName],
+				registryDefinitions[InteractshStatusToolName],
+			)
+			ce.handlers[InteractshGetURLToolName] = interactsh.Handle
+			ce.handlers[InteractshPollToolName] = interactsh.Handle
+			ce.handlers[InteractshStatusToolName] = interactsh.Handle
+		}
+	}
+
+	// Auth store session management tools
+	if fte.cfg.AuthStoreEnabled {
+		authTool := NewAuthStoreTool(
+			fte.flowID,
+			cfg.TaskID,
+			cfg.SubtaskID,
+			true,
+		)
+		if authTool.IsAvailable() {
+			ce.definitions = append(ce.definitions,
+				registryDefinitions[AuthLoginToolName],
+				registryDefinitions[AuthStatusToolName],
+				registryDefinitions[AuthInjectToolName],
+				registryDefinitions[AuthRefreshToolName],
+				registryDefinitions[AuthLogoutToolName],
+			)
+			ce.handlers[AuthLoginToolName] = authTool.Handle
+			ce.handlers[AuthStatusToolName] = authTool.Handle
+			ce.handlers[AuthInjectToolName] = authTool.Handle
+			ce.handlers[AuthRefreshToolName] = authTool.Handle
+			ce.handlers[AuthLogoutToolName] = authTool.Handle
+		}
+	}
+
+	// Attack path analysis tool — always available (needs only DB).
+	attackPathTool := NewAttackPathTool(
+		fte.flowID,
+		cfg.TaskID,
+		cfg.SubtaskID,
+		fte.db,
+	)
+	if attackPathTool.IsAvailable() {
+		ce.definitions = append(ce.definitions, registryDefinitions[AttackPathAnalyzeToolName])
+		ce.handlers[AttackPathAnalyzeToolName] = attackPathTool.Handle
 	}
 
 	return ce, nil
@@ -1264,7 +1431,7 @@ func (fte *flowToolsExecutor) GetGeneratorExecutor(cfg GeneratorExecutorConfig) 
 		return nil, fmt.Errorf("memorist handler is required")
 	}
 
-	container, err := fte.db.GetFlowPrimaryContainer(context.Background(), fte.flowID)
+	container, err := fte.db.GetFlowPrimaryContainer(context.TODO(), fte.flowID) // Fix 42: TODO — pass ctx when interface is updated
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container %d: %w", fte.flowID, err)
 	}
@@ -1327,7 +1494,7 @@ func (fte *flowToolsExecutor) GetRefinerExecutor(cfg RefinerExecutorConfig) (Con
 		return nil, fmt.Errorf("memorist handler is required")
 	}
 
-	container, err := fte.db.GetFlowPrimaryContainer(context.Background(), fte.flowID)
+	container, err := fte.db.GetFlowPrimaryContainer(context.TODO(), fte.flowID) // Fix 42: TODO — pass ctx when interface is updated
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container %d: %w", fte.flowID, err)
 	}
@@ -1386,7 +1553,7 @@ func (fte *flowToolsExecutor) GetMemoristExecutor(cfg MemoristExecutorConfig) (C
 		return nil, fmt.Errorf("search result handler is required")
 	}
 
-	container, err := fte.db.GetFlowPrimaryContainer(context.Background(), fte.flowID)
+	container, err := fte.db.GetFlowPrimaryContainer(context.TODO(), fte.flowID) // Fix 42: TODO — pass ctx when interface is updated
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container %d: %w", fte.flowID, err)
 	}

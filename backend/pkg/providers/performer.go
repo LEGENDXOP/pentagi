@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,7 +34,133 @@ const (
 	maxRetriesToCallFunction    = 3
 	maxReflectorCallsPerChain   = 3
 	delayBetweenRetries         = 5 * time.Second
+	defaultMaxToolCallsPerSubtask = 100              // hard cap per subtask (configurable via MAX_TOOL_CALLS_PER_SUBTASK)
+	defaultSubtaskDuration      = 60 * time.Minute   // default hard time limit per subtask
+	defaultMaxNestingDepth      = 4                   // primary_agent(0) → pentester(1) → coder(2) → installer(3) all allowed
+	nestedTimeoutDepth1         = 25 * time.Minute    // timeout for depth-1 nested agents
+	nestedTimeoutDepth2         = 20 * time.Minute    // timeout for depth-2 nested agents
+	nestedTimeoutDepth3         = 15 * time.Minute    // timeout for depth-3 nested agents
+
+	// toolCallLimitWarningBuffer is how many calls before the limit we inject
+	// a "wrap up" warning into the chain, giving the agent a chance to save findings.
+	toolCallLimitWarningBuffer  = 10
 )
+
+// getSubtaskMaxDuration returns the subtask timeout, configurable via
+// SUBTASK_MAX_DURATION env var (value in minutes). Defaults to 60 min.
+func getSubtaskMaxDuration() time.Duration {
+	if v := os.Getenv("SUBTASK_MAX_DURATION"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Minute
+		}
+	}
+	return defaultSubtaskDuration
+}
+
+// getMaxToolCallsPerSubtask returns the maximum tool calls per subtask,
+// configurable via MAX_TOOL_CALLS_PER_SUBTASK env var. Defaults to 100.
+func getMaxToolCallsPerSubtask() int {
+	if v := os.Getenv("MAX_TOOL_CALLS_PER_SUBTASK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxToolCallsPerSubtask
+}
+
+// getMaxNestingDepth returns the maximum allowed agent delegation depth,
+// configurable via MAX_NESTING_DEPTH env var. Defaults to 4.
+func getMaxNestingDepth() int {
+	if v := os.Getenv("MAX_NESTING_DEPTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxNestingDepth
+}
+
+// nestingDepthKey is a context key for tracking agent delegation depth.
+type nestingDepthKey struct{}
+
+// getNestingDepth extracts the current nesting depth from context. Returns 0 if unset.
+func getNestingDepth(ctx context.Context) int {
+	if v, ok := ctx.Value(nestingDepthKey{}).(int); ok {
+		return v
+	}
+	return 0
+}
+
+// withIncrementedDepth returns a new context with the nesting depth incremented by 1.
+func withIncrementedDepth(ctx context.Context) context.Context {
+	return context.WithValue(ctx, nestingDepthKey{}, getNestingDepth(ctx)+1)
+}
+
+// getNestedTimeout returns the appropriate timeout for a given nesting depth.
+// Nested agents get their own FRESH timeout to prevent parent deadline starvation.
+// Each level gets a generous timeout (minimum 10 minutes) to allow real work.
+func getNestedTimeout(depth int) time.Duration {
+	switch {
+	case depth <= 0:
+		return getSubtaskMaxDuration()
+	case depth == 1:
+		return nestedTimeoutDepth1
+	case depth == 2:
+		return nestedTimeoutDepth2
+	case depth == 3:
+		return nestedTimeoutDepth3
+	default:
+		// Even deeper nesting still gets minimum 10 minutes
+		return 10 * time.Minute
+	}
+}
+
+// mergedContext creates a context that inherits values from valueCtx but
+// cancels when EITHER the parent cancel context OR the timeout expires.
+// This ensures abort signals from the user still propagate to nested agents
+// while giving them a fresh deadline.
+type mergedContext struct {
+	context.Context // carries values + deadline from timeout context
+	parentCancel    context.Context
+}
+
+func (mc *mergedContext) Done() <-chan struct{} {
+	// We need a merged done channel. Use a goroutine to select on both.
+	// This is created lazily and cached — but for simplicity we use a goroutine approach.
+	// In practice, the timeout context's Done() is sufficient because we also
+	// check parentCancel in the Err() method.
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-mc.Context.Done():
+			close(done)
+		case <-mc.parentCancel.Done():
+			close(done)
+		}
+	}()
+	return done
+}
+
+func (mc *mergedContext) Err() error {
+	if err := mc.Context.Err(); err != nil {
+		return err
+	}
+	return mc.parentCancel.Err()
+}
+
+// newNestedContext creates a fresh timeout context for nested agent chains
+// that still respects parent cancellation (e.g., user abort).
+func newNestedContext(parentCtx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	// Detach from parent's deadline but keep all context values
+	freshCtx := context.WithoutCancel(parentCtx)
+	timeoutCtx, cancel := context.WithTimeout(freshCtx, timeout)
+
+	// Wrap so that parent cancellation also cancels us
+	merged := &mergedContext{
+		Context:      timeoutCtx,
+		parentCancel: parentCtx,
+	}
+	return merged, cancel
+}
 
 type callResult struct {
 	streamID  int64
@@ -54,10 +183,32 @@ func (fp *flowProvider) performAgentChain(
 	defer span.End()
 
 	var (
-		wantToStop        bool
-		detector          = &repeatingDetector{}
-		summarizerHandler = fp.GetSummarizeResultHandler(taskID, subtaskID)
+		wantToStop           bool
+		detector             = newRepeatingDetector()
+		nTracker             = newNucleiTracker()
+		summarizerHandler    = fp.GetSummarizeResultHandler(taskID, subtaskID)
+		toolCallCount        int
+		summarizerFailures   int
+		metrics              = &ExecutionMetrics{}
+		metricsStartTime     = time.Now()
+		toolHistory          = NewToolHistory(defaultToolHistorySize)
+		execState            = NewExecutionState()
+		ctxManager           = NewContextManager(defaultMaxContextTokens)
+
+		// Sprint 2 module instances — wired into the loop below.
+		industryDetected         bool
+		halfwayAlertSent         bool
+		findingTracker           = NewFindingTracker()
+		categoryTracker          = NewCategoryTracker(int(getSubtaskMaxDuration().Minutes()))
 	)
+
+	// Silence unused variable warnings for guard booleans (set inside loop).
+	_ = industryDetected
+	_ = halfwayAlertSent
+
+	// Async state writer — batches DB writes so the agent loop isn't blocked.
+	stateWriter := NewAsyncStateWriter(fp.db)
+	defer stateWriter.Close()
 
 	fields := logrus.Fields{
 		"provider":     fp.Type(),
@@ -74,6 +225,30 @@ func (fp *flowProvider) performAgentChain(
 
 	logger := logrus.WithContext(ctx).WithFields(fields)
 
+	// --- Post-chain restore for tracked state files ---
+	// When the agent chain finishes (success or failure), check if any tracked
+	// state files were truncated to 0 bytes while a .bak exists with content.
+	// This catches the case where `cat > FILE << 'EOF'` truncated the file but
+	// the write was killed by context deadline before content was written.
+	defer func() {
+		restoreCmd := buildRestoreCheckCommand()
+		restoreArgs, _ := json.Marshal(map[string]interface{}{
+			"input":   restoreCmd,
+			"timeout": 5,
+		})
+		// Use a detached context since the original may be expired (that's the
+		// whole reason we need this restore — the context deadline killed the write).
+		restoreCtx := context.WithoutCancel(ctx)
+		restoreCtx, restoreCancel := context.WithTimeout(restoreCtx, 10*time.Second)
+		defer restoreCancel()
+		result, restoreErr := executor.Execute(restoreCtx, 0, "", "terminal", "", restoreArgs)
+		if restoreErr != nil {
+			logger.WithError(restoreErr).Debug("post-chain state file restore check failed (non-fatal)")
+		} else if strings.Contains(result, "restored:") {
+			logger.WithField("restore_result", result).Warn("auto-restored truncated state files from backup")
+		}
+	}()
+
 	// Track execution time for duration calculation
 	lastUpdateTime := time.Now()
 	rollLastUpdateTime := func() float64 {
@@ -88,10 +263,243 @@ func (fp *flowProvider) performAgentChain(
 		return fmt.Errorf("failed to get execution context: %w", err)
 	}
 
+	// Sprint 2 wiring: Detect target industry from execution context and inject playbook.
+	industryProfile := DetectIndustry(executionContext)
+	if industryProfile.Type != "generic" && !industryDetected {
+		industryDetected = true
+		if playbook := FormatPlaybookForPrompt(industryProfile); playbook != "" {
+			// Inject industry-specific playbook into system prompt.
+			if len(chain) > 0 && chain[0].Role == llms.ChatMessageTypeSystem {
+				if text, ok := chain[0].Parts[0].(llms.TextContent); ok {
+					chain[0].Parts[0] = llms.TextContent{Text: text.Text + "\n\n" + playbook}
+				}
+			}
+			logger.WithField("industry", industryProfile.Type).
+				WithField("markers", industryProfile.Markers).
+				Info("detected target industry from execution context, injected playbook")
+		}
+	}
+
+	// Load persisted execution state from DB for resume (if any).
+	if subtaskID != nil {
+		if dbSubtask, err := fp.db.GetSubtask(ctx, *subtaskID); err == nil && dbSubtask.Context != "" {
+			if loaded := ParseExecutionState(dbSubtask.Context); loaded != nil {
+				execState = loaded
+				// Restore metrics from persisted state so the agent resumes
+				// with accurate counters instead of zero.
+				toolCallCount = loaded.ToolCallCount
+				metrics.ToolCallCount = loaded.ToolCallCount
+				metrics.ErrorCount = loaded.ErrorCount
+				for _, cmd := range loaded.AttacksDone {
+					metrics.AddCommand(cmd)
+				}
+				metrics.LastToolName = loaded.CurrentAttack
+				logger.WithFields(logrus.Fields{
+					"resumed_tool_calls": loaded.ToolCallCount,
+					"resumed_phase":      loaded.Phase,
+					"resumed_errors":     loaded.ErrorCount,
+				}).Info("resumed execution state from DB")
+			}
+		}
+	}
+
 	groupID := fmt.Sprintf("flow-%d", fp.flowID)
 	toolTypeMapping := tools.GetToolTypeMapping()
 
+	// Retrieve the attack budget manager from context (if attached by the flow).
+	attackBudget := GetAttackBudget(ctx)
+
+	// Track nesting depth: increment for this level of delegation.
+	depth := getNestingDepth(ctx)
+	ctx = withIncrementedDepth(ctx)
+
+	// Hard time limit per subtask to prevent infinite execution.
+	// For nested agents (depth > 0), use a FRESH timeout detached from the parent's
+	// deadline to prevent the shared-deadline starvation problem where each nesting
+	// level eats into a single 45-minute budget.
+	var timeoutCancel context.CancelFunc
+	if depth == 0 {
+		// Top-level: standard timeout inheriting parent context
+		ctx, timeoutCancel = context.WithTimeout(ctx, getSubtaskMaxDuration())
+	} else {
+		// Nested: fresh timeout that still respects parent cancellation
+		nestedTimeout := getNestedTimeout(depth)
+		ctx, timeoutCancel = newNestedContext(ctx, nestedTimeout)
+	}
+	defer timeoutCancel()
+
+	timeWarningInjected := false
+
 	for {
+		if err := ctx.Err(); err != nil {
+			logger.WithError(err).Warn("context cancelled/timed out in agent chain loop")
+			return fmt.Errorf("agent chain loop terminated: %w", err)
+		}
+
+		// Flow control checkpoint: pause/steer/abort
+		if fp.flowControl != nil {
+			steerMsg, fcErr := fp.flowControl(ctx, fp.flowID)
+			if fcErr != nil {
+				logger.WithError(fcErr).Warn("flow control: checkpoint returned error (abort or context cancel)")
+				return fmt.Errorf("flow control checkpoint: %w", fcErr)
+			}
+			if steerMsg != "" {
+				// Inject operator override as a system message into the chain
+				overrideContent := fmt.Sprintf("[OPERATOR OVERRIDE] %s", steerMsg)
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: overrideContent},
+					},
+				})
+				logger.WithField("steer_message", steerMsg).Info("flow control: operator steer message injected into chain")
+			}
+		}
+
+		// Attack budget auto-pivot: check if the current attack vector's budget is exhausted.
+		// If so, inject a pivot prompt directing the agent to switch vectors.
+		if attackBudget != nil && metrics.LastToolName != "" {
+			pivotAction := CheckAndBuildPivot(ctx, attackBudget, fp.prompter, metrics.LastToolName)
+			if pivotAction != nil && pivotAction.ShouldPivot {
+				logger.WithFields(logrus.Fields{
+					"pivot_phase":  pivotAction.Phase,
+					"pivot_vector": pivotAction.Vector,
+					"pivot_reason": pivotAction.Reason,
+				}).Info("attack budget exhausted, injecting pivot instruction")
+
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: pivotAction.PivotMessage},
+					},
+				})
+				if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+					logger.WithError(err).Error("failed to update msg chain after pivot injection")
+					return err
+				}
+			}
+		}
+
+		// Refresh system prompt with current execution metrics and time remaining.
+		if metrics.ToolCallCount > 0 && len(chain) > 0 {
+			if chain[0].Role == llms.ChatMessageTypeSystem && len(chain[0].Parts) > 0 {
+				if text, ok := chain[0].Parts[0].(llms.TextContent); ok {
+					// Compute time remaining from context deadline.
+					timeRemainingMinutes := -1 // -1 = omit from prompt
+					if deadline, ok := ctx.Deadline(); ok {
+						remaining := time.Until(deadline)
+						if remaining > 0 {
+							timeRemainingMinutes = int(remaining.Minutes())
+						} else {
+							timeRemainingMinutes = 0
+						}
+					}
+					updated := injectMetricsIntoSystemPrompt(text.Text, metrics.Snapshot(metricsStartTime), timeRemainingMinutes)
+					chain[0].Parts[0] = llms.TextContent{Text: updated}
+				}
+			}
+		}
+
+		// Context-aware pruning: before each LLM call, check if context
+		// manager tracks enough items to warrant pruning old tool results.
+		// This applies content-aware intelligence on top of the existing
+		// chain summarizer — findings are always preserved, noise is dropped.
+		if ctxManager.GetItemCount() > recentToolWindowSize {
+			ctxManager.ReclassifyByAge()
+			stats := ctxManager.Stats()
+			if stats.OverBudget {
+				prunedItems := ctxManager.Prune()
+				logger.WithField("context_stats", stats.FormatStats()).
+					WithField("pruned_items", len(prunedItems)).
+					Debug("context manager pruned items before LLM call")
+			}
+		}
+
+		// Safety net: validate chain integrity before sending to the LLM.
+		// If orphaned tool_use blocks exist (from a previous interrupted execution),
+		// insert synthetic tool_result blocks to prevent Anthropic 400 errors.
+		if repairedChain, repairCount := validateAndRepairChain(chain); repairCount > 0 {
+			chain = repairedChain
+			logger.WithField("repaired_tool_results", repairCount).
+				Warn("repaired orphaned tool_use blocks in message chain before LLM call")
+			if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+				logger.WithError(err).Error("failed to update msg chain after repair")
+				return err
+			}
+		}
+
+		// Proactive time-based delegation warning: inject explicit human-role message
+		// when time is running low. Uses boolean flag to prevent re-injection after
+		// chain summarization (reviewer recommendation: don't scan chain content).
+		if !timeWarningInjected && metrics.ToolCallCount > 0 {
+			if deadline, hasDL := ctx.Deadline(); hasDL {
+				remaining := time.Until(deadline)
+				if remaining > 0 && remaining < 20*time.Minute {
+					timeWarningInjected = true
+					remainingMin := int(remaining.Minutes())
+					var warningMsg string
+					if remainingMin < 10 {
+						warningMsg = fmt.Sprintf(
+							"[TIME WARNING — CRITICAL: %d minutes remaining]\n"+
+								"⛔ DO NOT delegate to coder, installer, or maintenance — delegation is BLOCKED.\n"+
+								"Write any remaining files DIRECTLY using terminal heredoc or file tool.\n"+
+								"Call the result/report tool NOW to save your work.",
+							remainingMin,
+						)
+					} else {
+						warningMsg = fmt.Sprintf(
+							"[TIME WARNING: %d minutes remaining]\n"+
+								"⚠ Do NOT delegate to coder, installer, or maintenance — there is not enough time.\n"+
+								"If you need to write files (reports, findings), use terminal heredoc directly:\n"+
+								"  cat > /work/REPORT.md << 'EOF'\n"+
+								"  [content]\n"+
+								"  EOF\n"+
+								"Focus on saving your findings and completing the report.",
+							remainingMin,
+						)
+					}
+					chain = append(chain, llms.MessageContent{
+						Role: llms.ChatMessageTypeHuman,
+						Parts: []llms.ContentPart{
+							llms.TextContent{Text: warningMsg},
+						},
+					})
+					if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+						logger.WithError(err).Error("failed to update msg chain after time warning")
+					}
+					logger.WithFields(logrus.Fields{
+						"remaining_minutes": remainingMin,
+						"tool_call_count":   metrics.ToolCallCount,
+					}).Warn("injected proactive time warning into agent chain")
+				}
+			}
+		}
+
+		// Sprint 2 wiring: P0 coverage gate — fire at 50% of subtask budget.
+		if !halfwayAlertSent && metrics.ToolCallCount > 0 {
+			if deadline, hasDL := ctx.Deadline(); hasDL {
+				elapsed := time.Since(metricsStartTime)
+				totalBudget := time.Until(deadline) + elapsed
+				if alert := categoryTracker.CheckP0Coverage(elapsed, totalBudget); alert != nil {
+					halfwayAlertSent = true
+					chain = append(chain, llms.MessageContent{
+						Role: llms.ChatMessageTypeHuman,
+						Parts: []llms.ContentPart{
+							llms.TextContent{Text: alert.FormattedMsg},
+						},
+					})
+					if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+						logger.WithError(err).Error("failed to update msg chain after P0 coverage alert")
+					}
+					logger.WithFields(logrus.Fields{
+						"missing_p0": alert.MissingP0,
+						"tested_p0":  alert.TestedP0,
+						"elapsed_pct": alert.ElapsedPercent,
+					}).Info("injected P0 coverage alert at 50% time mark")
+				}
+			}
+		}
+
 		result, err := fp.callWithRetries(ctx, chain, optAgentType, executor)
 		if err != nil {
 			logger.WithError(err).Error("failed to call agent chain")
@@ -116,7 +524,8 @@ func (fp *flowProvider) performAgentChain(
 				result, err = fp.performReflector(
 					ctx, optAgentType, chainID, taskID, subtaskID,
 					append(chain, reflectorMsg),
-					fp.getLastHumanMessage(chain), result.content, executionContext, executor, 1)
+					fp.getLastHumanMessage(chain), result.content, executionContext, executor, 1,
+					metrics.Snapshot(metricsStartTime), toolHistory)
 				if err != nil {
 					fields := make(logrus.Fields)
 					if result != nil {
@@ -128,6 +537,10 @@ func (fp *flowProvider) performAgentChain(
 					}
 					logger.WithError(err).WithFields(fields).Error("failed to perform reflector")
 					return err
+				}
+				// Filter out reflector suggestions that are just state-file reads
+				if result != nil && len(result.funcCalls) > 0 {
+					result.funcCalls = filterReflectorSuggestions(result.funcCalls)
 				}
 			}
 		}
@@ -155,7 +568,35 @@ func (fp *flowProvider) performAgentChain(
 			}
 
 			funcName := toolCall.FunctionCall.Name
-			response, err := fp.execToolCall(ctx, chainID, idx, result, detector, executor)
+			metrics.AddCommand(funcName)
+			metrics.LastToolName = funcName
+
+			response, err := fp.execToolCall(ctx, chainID, idx, result, detector, executor, nTracker)
+
+			// Track repeated tool calls detected by the repeating detector
+			isRepeating := strings.HasPrefix(response, "tool call '") && strings.HasSuffix(response, "' is repeating, please try another tool")
+			if isRepeating {
+				metrics.RepeatedCalls++
+			}
+
+			isError := err != nil || isRepeating
+
+			// Record in tool history for loop analysis
+			toolHistory.Add(ToolHistoryEntry{
+				Name:      funcName,
+				Arguments: toolCall.FunctionCall.Arguments,
+				Result:    response,
+				IsError:   isError,
+				Timestamp: time.Now(),
+			})
+
+			// Record attempt in attack budget tracker for auto-pivot decisions.
+			if attackBudget != nil && toolTypeMapping[funcName] != tools.AgentToolType {
+				phase := ClassifyToolPhase(funcName)
+				vector := ClassifyToolVector(funcName)
+				success := IsToolCallSuccess(response, isRepeating)
+				attackBudget.RecordAttempt(phase, vector, success)
+			}
 
 			if toolTypeMapping[funcName] != tools.AgentToolType {
 				fp.storeToolExecutionToGraphiti(
@@ -164,10 +605,51 @@ func (fp *flowProvider) performAgentChain(
 			}
 
 			if err != nil {
+				metrics.ErrorCount++
 				logger.WithError(err).WithFields(logrus.Fields{
 					"func_name": funcName,
 					"func_args": toolCall.FunctionCall.Arguments,
 				}).Error("failed to exec tool call")
+
+				// CRITICAL: Before returning, insert synthetic tool_result for the
+				// current failed tool call AND all remaining tool calls in the batch.
+				// Without this, the chain in DB would have orphaned tool_use blocks
+				// that cause Anthropic 400 errors on resume/retry.
+				errMsg := fmt.Sprintf("Error: tool execution failed: %s", err.Error())
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeTool,
+					Parts: []llms.ContentPart{
+						llms.ToolCallResponse{
+							ToolCallID: toolCall.ID,
+							Name:       funcName,
+							Content:    errMsg,
+						},
+					},
+				})
+				// Add synthetic results for remaining tool calls in this batch
+				for remainIdx := idx + 1; remainIdx < len(result.funcCalls); remainIdx++ {
+					remainTC := result.funcCalls[remainIdx]
+					if remainTC.FunctionCall == nil {
+						continue
+					}
+					chain = append(chain, llms.MessageContent{
+						Role: llms.ChatMessageTypeTool,
+						Parts: []llms.ContentPart{
+							llms.ToolCallResponse{
+								ToolCallID: remainTC.ID,
+								Name:       remainTC.FunctionCall.Name,
+								Content:    "Error: tool execution was interrupted. Result unavailable.",
+							},
+						},
+					})
+				}
+				// Best-effort save of the repaired chain to DB.
+				// Use a fresh context since the original may be cancelled.
+				saveCtx := context.WithoutCancel(ctx)
+				if updateErr := fp.updateMsgChain(saveCtx, chainID, chain, rollLastUpdateTime()); updateErr != nil {
+					logger.WithError(updateErr).Error("failed to save repaired chain after tool execution error")
+				}
+
 				return err
 			}
 
@@ -186,8 +668,157 @@ func (fp *flowProvider) performAgentChain(
 				return err
 			}
 
+			// Track tool result in context manager for intelligent pruning.
+			// The context manager classifies the result by content keywords
+			// and tracks it for priority-based pruning decisions.
+			ctxManager.Add(response, funcName)
+
+			// If the tool call arguments reference content from previous results,
+			// mark those results as referenced (bumps their priority).
+			if toolCall.FunctionCall != nil {
+				ctxManager.MarkReferenced(toolCall.FunctionCall.Arguments)
+			}
+
+			// Sprint 2 wiring: Record finding for attack chain detection.
+			findingTracker.RecordFinding(response)
+			if findingTracker.HasNewHighFindings() {
+				if suggestion := findingTracker.GetChainSuggestions(); suggestion != nil {
+					chain = append(chain, llms.MessageContent{
+						Role: llms.ChatMessageTypeHuman,
+						Parts: []llms.ContentPart{
+							llms.TextContent{Text: suggestion.FormattedMsg},
+						},
+					})
+					if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+						logger.WithError(err).Error("failed to update msg chain after chain suggestion")
+					}
+					logger.WithField("trigger_vulns", suggestion.TriggerVulns).
+						Info("injected attack chain suggestion into agent chain")
+				}
+			}
+
+			// Also check standalone chain opportunity from raw tool output keywords.
+			if chainOpp := CheckForChainOpportunity(response); chainOpp != nil && findingTracker.GetInjectionCount() < 3 {
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: chainOpp.FormattedMsg},
+					},
+				})
+				if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+					logger.WithError(err).Error("failed to update msg chain after chain opportunity")
+				}
+				logger.WithField("chain_name", chainOpp.TriggerVulns).
+					Info("injected chain opportunity from tool output keywords")
+			}
+
+			// Sprint 2 wiring: Record tool call for category tracking and P0 coverage.
+			categoryTracker.RecordToolCall(funcName, toolCall.FunctionCall.Arguments)
+
 			if executor.IsBarrierFunction(funcName) {
 				wantToStop = true
+			}
+		}
+
+		toolCallCount += len(result.funcCalls)
+		metrics.ToolCallCount = toolCallCount
+
+		// Persist execution state to DB asynchronously after each tool call batch.
+		if subtaskID != nil {
+			phase := "executing"
+			if wantToStop {
+				phase = "finishing"
+			}
+			execState.Update(metrics, phase)
+
+			// Every 10 tool calls, generate and persist resume context so that
+			// if the subtask times out and resumes, the agent has a summary of
+			// what was already done and doesn't waste time re-bootstrapping.
+			if toolCallCount > 0 && toolCallCount%10 == 0 {
+				resumeContent := buildResumeContent(toolHistory, metrics)
+				if resumeContent != "" {
+					execState.ResumeContext = resumeContent
+					logger.WithField("tool_call_count", toolCallCount).
+						Debug("persisted resume context to execution state")
+				}
+			}
+
+			if stateJSON, err := execState.ToJSON(); err == nil {
+				stateWriter.Write(*subtaskID, stateJSON)
+			}
+		}
+
+		maxToolCalls := getMaxToolCallsPerSubtask()
+
+		// Inject approaching-limit warning to give the agent time for graceful completion
+		if toolCallCount >= maxToolCalls-toolCallLimitWarningBuffer && toolCallCount < maxToolCalls {
+			warningMsg := fmt.Sprintf(
+				"[URGENT — APPROACHING TOOL CALL LIMIT: %d/%d calls used, only %d remaining]\n"+
+					"You are about to reach the maximum tool call limit. "+
+					"Please IMMEDIATELY save your findings using the result/report tool. "+
+					"Summarize all discoveries, evidence, and recommendations NOW before the limit is reached.",
+				toolCallCount, maxToolCalls, maxToolCalls-toolCallCount,
+			)
+			chain = append(chain, llms.MessageContent{
+				Role: llms.ChatMessageTypeHuman,
+				Parts: []llms.ContentPart{
+					llms.TextContent{Text: warningMsg},
+				},
+			})
+			if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+				logger.WithError(err).Error("failed to update msg chain after limit warning")
+			}
+			logger.WithFields(logrus.Fields{
+				"tool_call_count": toolCallCount,
+				"max_tool_calls":  maxToolCalls,
+				"remaining":       maxToolCalls - toolCallCount,
+			}).Warn("approaching tool call limit, injected warning to agent")
+		}
+
+		if toolCallCount >= maxToolCalls {
+			logger.WithField("tool_call_count", toolCallCount).
+				Warn("reached max tool calls per subtask, forcing stop")
+
+			// Save partial results before failing so findings are not lost.
+			if subtaskID != nil {
+				partialResult := fmt.Sprintf("[PARTIAL — tool call limit reached at %d/%d calls]\n", toolCallCount, maxToolCalls)
+				if execState != nil {
+					partialResult += fmt.Sprintf("Phase: %s\nAttacks done: %v\nError count: %d\n",
+						execState.Phase, execState.AttacksDone, execState.ErrorCount)
+				}
+				// Collect last few tool results from chain as evidence of work done
+				partialResult += "\nTool call summary (last 10):\n"
+				toolResultCount := 0
+				for i := len(chain) - 1; i >= 0 && toolResultCount < 10; i-- {
+					if chain[i].Role == llms.ChatMessageTypeTool {
+						for _, part := range chain[i].Parts {
+							if resp, ok := part.(llms.ToolCallResponse); ok {
+								snippet := resp.Content
+								if len(snippet) > 200 {
+									snippet = snippet[:200] + "..."
+								}
+								partialResult += fmt.Sprintf("- %s: %s\n", resp.Name, snippet)
+								toolResultCount++
+							}
+						}
+					}
+				}
+				if _, err := fp.db.UpdateSubtaskResult(ctx, database.UpdateSubtaskResultParams{
+					Result: partialResult,
+					ID:     *subtaskID,
+				}); err != nil {
+					logger.WithError(err).Error("failed to save partial results on tool call limit")
+				}
+			}
+
+			return fmt.Errorf("subtask tool call limit reached (%d calls)", toolCallCount)
+		}
+
+		// Check global budget across entire delegation tree
+		if budget := GetBudget(ctx); budget != nil {
+			if err := budget.Consume(len(result.funcCalls)); err != nil {
+				logger.WithError(err).Warn("global execution budget exceeded")
+				return err
 			}
 		}
 
@@ -195,10 +826,61 @@ func (fp *flowProvider) performAgentChain(
 			return nil
 		}
 
+		// Proactive reflector: check if tool history signals a behavioral loop
+		if shouldTrigger, reason := toolHistory.ShouldTriggerProactiveReflector(toolCallCount); shouldTrigger {
+			// Mark the reflector as fired to start the cooldown period.
+			// This prevents the reflector storm where the same condition
+			// fires the reflector on every consecutive tool call.
+			toolHistory.MarkReflectorFired()
+
+			logger.WithFields(logrus.Fields{
+				"trigger_reason":  reason,
+				"tool_call_count": toolCallCount,
+				"pattern_score":   toolHistory.GetPatternScore(),
+				"error_rate_5":    toolHistory.GetErrorRate(5),
+			}).Info("proactive reflector triggered")
+
+			// Build a synthetic "status report" content for the reflector
+			proactiveContent := fmt.Sprintf(
+				"[PROACTIVE LOOP CHECK — triggered by: %s]\n\n"+
+					"The agent has been executing tool calls. Review the execution history below "+
+					"and determine if the agent should CONTINUE, CHANGE_APPROACH, or STOP.\n\n%s",
+				reason, toolHistory.FormatForPrompt())
+
+			proactiveMsg := llms.MessageContent{Role: llms.ChatMessageTypeAI}
+			proactiveMsg.Parts = append(proactiveMsg.Parts, llms.TextContent{Text: proactiveContent})
+
+			proactiveResult, proactiveErr := fp.performReflector(
+				ctx, optAgentType, chainID, taskID, subtaskID,
+				append(chain, proactiveMsg),
+				fp.getLastHumanMessage(chain), proactiveContent, executionContext, executor, 1,
+				metrics.Snapshot(metricsStartTime), toolHistory)
+			if proactiveErr != nil {
+				// Proactive reflector failure is non-fatal; log and continue
+				logger.WithError(proactiveErr).Warn("proactive reflector failed, continuing execution")
+			} else if proactiveResult != nil && len(proactiveResult.funcCalls) > 0 {
+				// Filter out read-only state file checks from reflector suggestions.
+				// The reflector often suggests "check STATE.json" or "review FINDINGS.md"
+				// which causes the agent to enter an infinite read loop.
+				filtered := filterReflectorSuggestions(proactiveResult.funcCalls)
+				if len(filtered) > 0 {
+					proactiveResult.funcCalls = filtered
+					// Reflector provided a corrective tool call — inject it as the next result
+					result = proactiveResult
+					// Re-process the corrective tool calls by continuing the loop
+					// The next iteration will pick up result.funcCalls from the reflector
+					logger.Info("proactive reflector provided corrective tool calls")
+				} else {
+					logger.Info("proactive reflector suggestions were all state-reads, skipping injection")
+				}
+			}
+		}
+
 		if summarizer != nil {
 			// it returns the same chain state if error occurs
 			chain, err = summarizer.SummarizeChain(ctx, summarizerHandler, chain, fp.tcIDTemplate)
 			if err != nil {
+				summarizerFailures++
 				// log swallowed error
 				_, observation := obs.Observer.NewObservation(ctx)
 				observation.Event(
@@ -207,15 +889,23 @@ func (fp *flowProvider) performAgentChain(
 					langfuse.WithEventStatus(err.Error()),
 					langfuse.WithEventLevel(langfuse.ObservationLevelWarning),
 					langfuse.WithEventMetadata(langfuse.Metadata{
-						"tc_id_template": fp.tcIDTemplate,
-						"msg_chain_id":   chainID,
-						"error":          err.Error(),
+						"tc_id_template":      fp.tcIDTemplate,
+						"msg_chain_id":        chainID,
+						"error":               err.Error(),
+						"consecutive_failures": summarizerFailures,
 					}),
 				)
-				logger.WithError(err).Warn("failed to summarize chain")
-			} else if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
-				logger.WithError(err).Error("failed to update msg chain")
-				return err
+				logger.WithError(err).WithField("consecutive_failures", summarizerFailures).
+					Warn("failed to summarize chain")
+				if summarizerFailures >= 3 {
+					return fmt.Errorf("chain summarization repeatedly failed (%d times): %w", summarizerFailures, err)
+				}
+			} else {
+				summarizerFailures = 0 // reset on success
+				if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+					logger.WithError(err).Error("failed to update msg chain")
+					return err
+				}
 			}
 		}
 	}
@@ -228,6 +918,7 @@ func (fp *flowProvider) execToolCall(
 	result *callResult,
 	detector *repeatingDetector,
 	executor tools.ContextToolsExecutor,
+	nTracker *nucleiTracker,
 ) (string, error) {
 	var (
 		streamID int64
@@ -255,6 +946,58 @@ func (fp *flowProvider) execToolCall(
 		"msg_chain_id": chainID,
 	})
 
+	// --- Read-Only Soft Cap: check BEFORE repeat detection ---
+	// The existing isReadOnlyCall() exemption in detect() remains untouched.
+	// This is an ADDITIONAL guard that caps how many times the same file can
+	// be read in a single subtask, preventing infinite STATE.json/HANDOFF.md loops.
+	var readCapWarning string
+	if toolCall.FunctionCall != nil {
+		blocked, readCapMsg := detector.checkReadCap(*toolCall.FunctionCall)
+		if blocked {
+			logger.WithField("read_cap_msg", readCapMsg).Warn("read-only soft cap blocked tool call")
+			return readCapMsg, nil
+		}
+		// If warning (not blocked), store it to prepend to the response after execution.
+		readCapWarning = readCapMsg
+	}
+
+	// --- Nuclei Dedup: block redundant nuclei scans ---
+	if nTracker != nil && toolCall.FunctionCall != nil {
+		var nucleiTarget string
+
+		if funcName == "nuclei_scan" {
+			nucleiTarget = extractNucleiTarget(string(funcArgs))
+		} else if funcName == "terminal" {
+			var termArgs map[string]interface{}
+			if err := json.Unmarshal(funcArgs, &termArgs); err == nil {
+				if input, ok := termArgs["input"].(string); ok && strings.Contains(input, "nuclei") {
+					nucleiTarget = extractNucleiTargetFromCmd(input)
+				}
+			}
+		}
+
+		if nucleiTarget != "" {
+			if blocked, msg := nTracker.Check(nucleiTarget); blocked {
+				logger.WithField("nuclei_target", nucleiTarget).Warn("nuclei dedup blocked scan")
+				return msg, nil
+			}
+		}
+	}
+
+	// --- Browser Automation Install Blocker ---
+	// Prevent the agent from installing playwright, puppeteer, chromium, etc.
+	// These are unnecessary because browser tools (browser_navigate, browser_click, etc.)
+	// are already available as built-in agent tools backed by Playwright.
+	if funcName == "terminal" {
+		var termArgs map[string]interface{}
+		if err := json.Unmarshal(funcArgs, &termArgs); err == nil {
+			if input, ok := termArgs["input"].(string); ok && isBrowserAutomationInstall(input) {
+				logger.WithField("blocked_cmd", input).Warn("blocked browser automation package install attempt")
+				return blockedBrowserInstallMessage, nil
+			}
+		}
+	}
+
 	if detector.detect(toolCall) {
 		response := fmt.Sprintf("tool call '%s' is repeating, please try another tool", funcName)
 
@@ -276,6 +1019,26 @@ func (fp *flowProvider) execToolCall(
 		return response, nil
 	}
 
+	// --- Pre-write backup for tracked state files ---
+	// When a terminal or file tool call writes to FINDINGS.md, STATE.json, or HANDOFF.md,
+	// back up the file BEFORE execution. This protects against `cat > FILE << 'EOF'`
+	// truncating the file to 0 bytes when the context deadline kills the write mid-stream.
+	if trackedFile := isTrackedFileWrite(funcName, funcArgs); trackedFile != "" {
+		backupCmd := buildBackupCommand(trackedFile)
+		backupArgs, _ := json.Marshal(map[string]interface{}{
+			"input":   backupCmd,
+			"timeout": 5,
+		})
+		// Execute backup with a short timeout; failures are silently ignored.
+		_, backupErr := executor.Execute(ctx, 0, "", "terminal", "", backupArgs)
+		if backupErr != nil {
+			logger.WithError(backupErr).WithField("tracked_file", trackedFile).
+				Debug("pre-write backup failed (non-fatal, continuing with original command)")
+		} else {
+			logger.WithField("tracked_file", trackedFile).Debug("pre-write backup created")
+		}
+	}
+
 	var (
 		err      error
 		response string
@@ -292,6 +1055,16 @@ func (fp *flowProvider) execToolCall(
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return "", err
+			}
+
+			// Short-circuit: if context deadline is >80% expired, skip the fix attempt
+			// (which would make another LLM call that will also likely timeout)
+			if deadline, ok := ctx.Deadline(); ok {
+				remaining := time.Until(deadline)
+				if remaining < getSubtaskMaxDuration()/5 {
+					logger.WithError(err).Warn("skipping fixToolCallArgs: context nearly expired")
+					return "", fmt.Errorf("tool execution failed (timeout imminent): %w", err)
+				}
 			}
 
 			logger.WithError(err).Warn("failed to exec function")
@@ -311,6 +1084,37 @@ func (fp *flowProvider) execToolCall(
 		} else {
 			break
 		}
+	}
+
+	// --- Post-execution: record nuclei scan results for dedup ---
+	if nTracker != nil && toolCall.FunctionCall != nil {
+		if funcName == "nuclei_scan" {
+			target := extractNucleiTarget(string(funcArgs))
+			tags, severity := extractNucleiScanDetails(string(funcArgs))
+			// Count findings: crude heuristic based on response lines containing "[" (nuclei output format).
+			findCount := 0
+			for _, line := range strings.Split(response, "\n") {
+				if strings.Contains(line, "[") && strings.Contains(line, "]") {
+					findCount++
+				}
+			}
+			nTracker.Record(target, tags, severity, findCount)
+		} else if funcName == "terminal" {
+			var termArgs map[string]interface{}
+			if err := json.Unmarshal(funcArgs, &termArgs); err == nil {
+				if input, ok := termArgs["input"].(string); ok && strings.Contains(input, "nuclei") {
+					target := extractNucleiTargetFromCmd(input)
+					if target != "" {
+						nTracker.Record(target, "", "", 0)
+					}
+				}
+			}
+		}
+	}
+
+	// --- Prepend read cap warning if present ---
+	if readCapWarning != "" {
+		response = readCapWarning + "\n\n" + response
 	}
 
 	return response, nil
@@ -388,7 +1192,20 @@ func (fp *flowProvider) callWithRetries(
 
 		var streamCb streaming.Callback
 		if fp.streamCb != nil {
+			// Close abandoned stream from previous retry attempt
+			if result.streamID != 0 {
+				_ = fp.streamCb(ctx, &StreamMessageChunk{
+					Type:     StreamMessageChunkTypeFlush,
+					MsgType:  msgType,
+					StreamID: result.streamID,
+				})
+			}
 			result.streamID = fp.callCounter.Add(1)
+			// Reset result state for retry to avoid accumulating stale data
+			result.funcCalls = nil
+			result.content = ""
+			result.info = nil
+			result.thinking = nil
 			streamCb = func(ctx context.Context, chunk streaming.Chunk) error {
 				switch chunk.Type {
 				case streaming.ChunkTypeReasoning:
@@ -431,7 +1248,18 @@ func (fp *flowProvider) callWithRetries(
 			errs = append(errs, err)
 		}
 
-		ticker.Reset(delayBetweenRetries)
+		// Exponential backoff: 5s → 15s → 45s with ±20% jitter
+		backoff := delayBetweenRetries
+		for i := 0; i < idx; i++ {
+			backoff *= 3
+		}
+		jitter := time.Duration(rand.Int63n(int64(backoff) / 5)) //nolint:gosec
+		if rand.Intn(2) == 0 {                                   //nolint:gosec
+			backoff += jitter
+		} else {
+			backoff -= jitter
+		}
+		ticker.Reset(backoff)
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
@@ -466,6 +1294,8 @@ func (fp *flowProvider) performReflector(
 	humanMessage, content, executionContext string,
 	executor tools.ContextToolsExecutor,
 	iteration int,
+	metrics ExecutionMetrics,
+	toolHistory *ToolHistory,
 ) (*callResult, error) {
 	ctx, span := obs.Observer.NewSpan(ctx, obs.SpanKindInternal, "providers.flowProvider.performReflector")
 	defer span.End()
@@ -514,14 +1344,32 @@ func (fp *flowProvider) performReflector(
 			"BarrierToolNames": executor.GetBarrierToolNames(),
 		},
 		"system": {
-			"BarrierTools":     executor.GetBarrierTools(),
-			"CurrentTime":      getCurrentTime(),
-			"ExecutionContext": executionContext,
+			"BarrierTools":      executor.GetBarrierTools(),
+			"CurrentTime":       getCurrentTime(),
+			"ExecutionContext":   executionContext,
+			"ExecutionMetrics":  &metrics,
 		},
 	}
 
 	if humanMessage != "" {
 		reflectorContext["system"]["Request"] = humanMessage
+	}
+
+	// Inject tool history summary when available
+	if toolHistory != nil && toolHistory.Len() > 0 {
+		reflectorContext["system"]["ToolHistorySummary"] = toolHistory.FormatForPrompt()
+
+		// Pre-compute loop detection signals for template
+		patternScore := toolHistory.GetPatternScore()
+		errorRate := toolHistory.GetErrorRate(5)
+		mostFreqName, mostFreqCount := toolHistory.GetMostFrequentInLast(repeatingWindowSize)
+		reflectorContext["system"]["LoopDetection"] = map[string]any{
+			"PatternScore":        fmt.Sprintf("%.2f", patternScore),
+			"ErrorRate":           fmt.Sprintf("%.0f%%", errorRate*100),
+			"MostFrequentTool":    mostFreqName,
+			"MostFrequentCount":   mostFreqCount,
+			"IsLoopLikely":        patternScore > 0.7 || errorRate > 0.5 || mostFreqCount > 3,
+		}
 	}
 
 	ctx, observation := obs.Observer.NewObservation(ctx)
@@ -610,7 +1458,7 @@ func (fp *flowProvider) performReflector(
 	chain = append(chain, reflectorMsg)
 	if len(result.funcCalls) == 0 {
 		return fp.performReflector(ctx, optOriginType, chainID, taskID, subtaskID, chain,
-			humanMessage, result.content, executionContext, executor, iteration+1)
+			humanMessage, result.content, executionContext, executor, iteration+1, metrics, toolHistory)
 	}
 
 	opts = append(opts, langfuse.WithAgentStatus("success"))
@@ -742,6 +1590,11 @@ func (fp *flowProvider) updateMsgChainUsage(
 	price := fp.GetPriceInfo(optAgentType)
 	if price != nil {
 		usage.UpdateCost(price)
+	}
+
+	// Feed usage to the in-memory CostTracker if one is attached to the context.
+	if ct := GetCostTracker(ctx); ct != nil {
+		ct.AddUsage(string(optAgentType), usage)
 	}
 
 	_, err := fp.db.UpdateMsgChainUsage(ctx, database.UpdateMsgChainUsageParams{
