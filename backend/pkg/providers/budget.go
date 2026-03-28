@@ -78,6 +78,19 @@ func WithBudget(ctx context.Context, b *ExecutionBudget) context.Context {
 	return context.WithValue(ctx, budgetKey{}, b)
 }
 
+// TimeRemaining returns the time left in the global budget.
+// If the budget is already expired it returns 0.
+func (b *ExecutionBudget) TimeRemaining() time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	remaining := b.maxDuration - time.Since(b.startTime)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
 // GetBudget retrieves the ExecutionBudget from a context, or nil if none is set.
 func GetBudget(ctx context.Context) *ExecutionBudget {
 	if b, ok := ctx.Value(budgetKey{}).(*ExecutionBudget); ok {

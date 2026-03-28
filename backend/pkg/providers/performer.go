@@ -384,9 +384,15 @@ func (fp *flowProvider) performAgentChain(
 		if metrics.ToolCallCount > 0 && len(chain) > 0 {
 			if chain[0].Role == llms.ChatMessageTypeSystem && len(chain[0].Parts) > 0 {
 				if text, ok := chain[0].Parts[0].(llms.TextContent); ok {
-					// Compute time remaining from context deadline.
+					// Compute time remaining from global execution budget so the
+					// LLM sees the overall flow time left, not the per-subtask
+					// deadline which can be misleadingly short after long recon.
 					timeRemainingMinutes := -1 // -1 = omit from prompt
-					if deadline, ok := ctx.Deadline(); ok {
+					if budget := GetBudget(ctx); budget != nil {
+						remaining := budget.TimeRemaining()
+						timeRemainingMinutes = int(remaining.Minutes())
+					} else if deadline, ok := ctx.Deadline(); ok {
+						// Fallback: no global budget in context, use subtask deadline.
 						remaining := time.Until(deadline)
 						if remaining > 0 {
 							timeRemainingMinutes = int(remaining.Minutes())
