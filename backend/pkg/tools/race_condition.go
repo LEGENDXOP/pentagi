@@ -581,10 +581,3 @@ func (rc *raceConditionTool) parseAndFormatResults(output, targetURL, method str
 	return sb.String()
 }
 
-// truncate shortens a string to maxLen, appending "..." if truncated.
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
-}
