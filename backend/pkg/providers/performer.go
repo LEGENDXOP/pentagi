@@ -438,8 +438,16 @@ func (fp *flowProvider) performAgentChain(
 		// when time is running low. Uses boolean flag to prevent re-injection after
 		// chain summarization (reviewer recommendation: don't scan chain content).
 		if !timeWarningInjected && metrics.ToolCallCount > 0 {
-			if deadline, hasDL := ctx.Deadline(); hasDL {
-				remaining := time.Until(deadline)
+			var remaining time.Duration
+			var hasDL bool
+			if b := GetBudget(ctx); b != nil {
+				remaining = b.TimeRemaining()
+				hasDL = remaining > 0
+			} else if deadline, ok := ctx.Deadline(); ok {
+				remaining = time.Until(deadline)
+				hasDL = true
+			}
+			if hasDL {
 				if remaining > 0 && remaining < 20*time.Minute {
 					timeWarningInjected = true
 					remainingMin := int(remaining.Minutes())
@@ -481,11 +489,20 @@ func (fp *flowProvider) performAgentChain(
 			}
 		}
 
-		// Sprint 2 wiring: P0 coverage gate — fire at 50% of subtask budget.
+		// Sprint 2 wiring: P0 coverage gate — fire at 50% of global budget.
 		if !halfwayAlertSent && metrics.ToolCallCount > 0 {
-			if deadline, hasDL := ctx.Deadline(); hasDL {
+			var p0Remaining time.Duration
+			var p0HasDL bool
+			if b := GetBudget(ctx); b != nil {
+				p0Remaining = b.TimeRemaining()
+				p0HasDL = p0Remaining > 0
+			} else if deadline, ok := ctx.Deadline(); ok {
+				p0Remaining = time.Until(deadline)
+				p0HasDL = true
+			}
+			if p0HasDL {
 				elapsed := time.Since(metricsStartTime)
-				totalBudget := time.Until(deadline) + elapsed
+				totalBudget := p0Remaining + elapsed
 				if alert := categoryTracker.CheckP0Coverage(elapsed, totalBudget); alert != nil {
 					halfwayAlertSent = true
 					chain = append(chain, llms.MessageContent{
