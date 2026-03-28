@@ -111,15 +111,15 @@ func main() {
 	// Initialize optional Telegram notifications
 	var notifier *notifications.NotificationManager
 	logrus.WithFields(logrus.Fields{
-		"telegram_notify":  cfg.TelegramNotify,
-		"has_bot_token":    cfg.TelegramBotToken != "",
-		"has_chat_id":      cfg.TelegramChatID != "",
-		"quiet_tz_offset":  cfg.TelegramQuietTZOffset,
+		"telegram_notify":   cfg.TelegramNotify,
+		"has_bot_token":     cfg.TelegramBotToken != "",
+		"has_chat_id":       cfg.TelegramChatID != "",
+		"poll_interval_min": cfg.TelegramPollInterval,
 	}).Info("Telegram notification config loaded")
 
 	if cfg.TelegramNotify && cfg.TelegramBotToken != "" && cfg.TelegramChatID != "" {
 		tg := notifications.NewTelegramNotifier(cfg.TelegramBotToken, cfg.TelegramChatID)
-		notifier = notifications.NewNotificationManager(tg, true, cfg.TelegramQuietTZOffset)
+		notifier = notifications.NewNotificationManager(tg, true, cfg.TelegramPollInterval)
 		logrus.WithField("chat_id", cfg.TelegramChatID).Info("Telegram bot initialized, sending test ping")
 		tg.Send("🔔 PentAGI notifications active")
 	} else {

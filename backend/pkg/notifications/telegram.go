@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -13,11 +14,14 @@ import (
 )
 
 const (
-	telegramAPIBase    = "https://api.telegram.org/bot"
-	telegramRateLimit  = 3 * time.Second
-	telegramQueueSize  = 100
-	telegramMaxMsgLen  = 4096
-	telegramHTTPTimout = 10 * time.Second
+	telegramAPIBase     = "https://api.telegram.org/bot"
+	telegramRateLimit   = 3 * time.Second
+	telegramQueueSize   = 100
+	telegramMaxMsgLen   = 4096
+	telegramHTTPTimeout = 10 * time.Second
+	telegramMaxRetries  = 2
+	telegramDrainDelay  = 500 * time.Millisecond // delay between messages during drain
+	telegramMaxDrain    = 20                      // max messages to send during drain
 )
 
 // telegramSendRequest represents the JSON body for Telegram sendMessage API.
@@ -50,7 +54,7 @@ func NewTelegramNotifier(token, chatID string) *TelegramNotifier {
 	t := &TelegramNotifier{
 		token:  token,
 		chatID: chatID,
-		client: &http.Client{Timeout: telegramHTTPTimout},
+		client: &http.Client{Timeout: telegramHTTPTimeout},
 		queue:  make(chan string, telegramQueueSize),
 		done:   make(chan struct{}),
 	}
@@ -97,11 +101,11 @@ func (t *TelegramNotifier) worker() {
 	for {
 		select {
 		case <-t.done:
-			// Drain remaining messages
+			// Drain remaining messages with rate limiting
 			t.drainQueue()
 			return
 		case msg := <-t.queue:
-			t.sendMessage(msg)
+			t.sendMessageWithRetry(msg)
 			// Wait for rate limit before processing next message
 			select {
 			case <-ticker.C:
@@ -113,22 +117,72 @@ func (t *TelegramNotifier) worker() {
 	}
 }
 
-// drainQueue attempts to send remaining queued messages on shutdown.
+// drainQueue attempts to send remaining queued messages on shutdown with rate limiting.
 func (t *TelegramNotifier) drainQueue() {
+	sent := 0
 	for {
+		if sent >= telegramMaxDrain {
+			// Drop remaining messages to avoid long shutdown
+			remaining := len(t.queue)
+			if remaining > 0 {
+				logrus.WithField("dropped", remaining).Warn("telegram drain limit reached, dropping remaining messages")
+			}
+			return
+		}
 		select {
 		case msg := <-t.queue:
-			t.sendMessage(msg)
+			t.sendMessageWithRetry(msg)
+			sent++
+			if sent < telegramMaxDrain {
+				time.Sleep(telegramDrainDelay)
+			}
 		default:
 			return
 		}
 	}
 }
 
+// sendMessageWithRetry sends a message with retry logic for transient errors.
+func (t *TelegramNotifier) sendMessageWithRetry(text string) {
+	backoff := 1 * time.Second
+
+	for attempt := 0; attempt <= telegramMaxRetries; attempt++ {
+		retryAfter, err := t.sendMessage(text)
+		if err == nil {
+			return // success
+		}
+
+		if attempt >= telegramMaxRetries {
+			logrus.WithError(err).WithField("attempts", attempt+1).Error("telegram message failed after retries")
+			return
+		}
+
+		// Use Retry-After header value if provided (429), otherwise use exponential backoff
+		wait := backoff
+		if retryAfter > 0 {
+			wait = retryAfter
+		}
+
+		logrus.WithFields(logrus.Fields{
+			"attempt": attempt + 1,
+			"wait":    wait,
+		}).Warn("retrying telegram message")
+
+		time.Sleep(wait)
+		backoff *= 2
+	}
+}
+
 // sendMessage makes the HTTP POST to Telegram sendMessage API.
-func (t *TelegramNotifier) sendMessage(text string) {
-	logrus.WithField("chat_id", t.chatID).Debug("sending telegram message")
+// Returns the Retry-After duration (if any) and an error for retryable failures.
+func (t *TelegramNotifier) sendMessage(text string) (time.Duration, error) {
 	url := fmt.Sprintf("%s%s/sendMessage", telegramAPIBase, t.token)
+	return t.sendMessageURL(url, text)
+}
+
+// sendMessageURL makes the HTTP POST to a given URL (allows test injection).
+func (t *TelegramNotifier) sendMessageURL(url, text string) (time.Duration, error) {
+	logrus.WithField("chat_id", t.chatID).Debug("sending telegram message")
 
 	body := telegramSendRequest{
 		ChatID:    t.chatID,
@@ -139,33 +193,53 @@ func (t *TelegramNotifier) sendMessage(text string) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		logrus.WithError(err).Error("failed to marshal telegram message")
-		return
+		return 0, nil // non-retryable
 	}
 
 	resp, err := t.client.Post(url, "application/json", bytes.NewReader(jsonBody))
 	if err != nil {
 		logrus.WithError(err).Error("failed to send telegram message")
-		return
+		return 0, fmt.Errorf("http error: %w", err) // retryable
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		var tgResp telegramResponse
-		if json.Unmarshal(respBody, &tgResp) == nil {
-			logrus.WithFields(logrus.Fields{
-				"status":      resp.StatusCode,
-				"description": tgResp.Description,
-			}).Error("telegram API error")
-		} else {
-			logrus.WithFields(logrus.Fields{
-				"status": resp.StatusCode,
-				"body":   string(respBody),
-			}).Error("telegram API error")
-		}
-
-		return
+	if resp.StatusCode == http.StatusOK {
+		logrus.Debug("telegram notification sent successfully")
+		return 0, nil
 	}
 
-	logrus.Debug("telegram notification sent successfully")
+	respBody, _ := io.ReadAll(resp.Body)
+
+	// Parse Retry-After header for 429 responses
+	var retryAfter time.Duration
+	if resp.StatusCode == http.StatusTooManyRequests {
+		if ra := resp.Header.Get("Retry-After"); ra != "" {
+			if seconds, parseErr := strconv.Atoi(ra); parseErr == nil {
+				retryAfter = time.Duration(seconds) * time.Second
+			}
+		}
+		if retryAfter == 0 {
+			retryAfter = 5 * time.Second // default for 429
+		}
+	}
+
+	var tgResp telegramResponse
+	if json.Unmarshal(respBody, &tgResp) == nil {
+		logrus.WithFields(logrus.Fields{
+			"status":      resp.StatusCode,
+			"description": tgResp.Description,
+		}).Error("telegram API error")
+	} else {
+		logrus.WithFields(logrus.Fields{
+			"status": resp.StatusCode,
+			"body":   string(respBody),
+		}).Error("telegram API error")
+	}
+
+	// Retryable: 429, 5xx
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		return retryAfter, fmt.Errorf("telegram API error: status %d", resp.StatusCode)
+	}
+
+	return 0, nil // non-retryable (4xx client errors)
 }

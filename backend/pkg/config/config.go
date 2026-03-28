@@ -221,10 +221,10 @@ type Config struct {
 	FlowWatchdogMaxResumes int  `env:"FLOW_WATCHDOG_MAX_RESUMES" envDefault:"5"`
 
 	// Telegram notifications (optional)
-	TelegramBotToken      string `env:"TELEGRAM_BOT_TOKEN"`
-	TelegramChatID        string `env:"TELEGRAM_CHAT_ID"`
-	TelegramNotify        bool   `env:"TELEGRAM_NOTIFY" envDefault:"false"`
-	TelegramQuietTZOffset int    `env:"TELEGRAM_QUIET_TZ_OFFSET" envDefault:"0"` // hours offset from UTC for quiet hours
+	TelegramBotToken     string `env:"TELEGRAM_BOT_TOKEN"`
+	TelegramChatID       string `env:"TELEGRAM_CHAT_ID"`
+	TelegramNotify       bool   `env:"TELEGRAM_NOTIFY" envDefault:"false"`
+	TelegramPollInterval int    `env:"TELEGRAM_POLL_INTERVAL" envDefault:"2"` // minutes between FINDINGS.md polls
 }
 
 func NewConfig() (*Config, error) {
