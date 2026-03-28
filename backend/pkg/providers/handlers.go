@@ -286,7 +286,7 @@ func (fp *flowProvider) GetCoderHandler(ctx context.Context, taskID, subtaskID *
 	coderHandler := func(ctx context.Context, action tools.CoderAction) (string, error) {
 		if msg := checkDelegationAllowed(ctx, "coder"); msg != "" {
 			logrus.WithContext(ctx).WithField("depth", getNestingDepth(ctx)).Warn("coder delegation blocked: " + msg)
-			return "", fmt.Errorf("%s", msg)
+			return msg, nil
 		}
 
 		coderContext := map[string]map[string]any{
@@ -388,7 +388,7 @@ func (fp *flowProvider) GetInstallerHandler(ctx context.Context, taskID, subtask
 	installerHandler := func(ctx context.Context, action tools.MaintenanceAction) (string, error) {
 		if msg := checkDelegationAllowed(ctx, "installer"); msg != "" {
 			logrus.WithContext(ctx).WithField("depth", getNestingDepth(ctx)).Warn("installer delegation blocked: " + msg)
-			return "", fmt.Errorf("%s", msg)
+			return msg, nil
 		}
 
 		installerContext := map[string]map[string]any{
@@ -627,7 +627,7 @@ func (fp *flowProvider) GetPentesterHandler(ctx context.Context, taskID, subtask
 	pentesterHandler := func(ctx context.Context, action tools.PentesterAction) (string, error) {
 		if msg := checkDelegationAllowed(ctx, "pentester"); msg != "" {
 			logrus.WithContext(ctx).WithField("depth", getNestingDepth(ctx)).Warn("pentester delegation blocked: " + msg)
-			return "", fmt.Errorf("%s", msg)
+			return msg, nil
 		}
 
 		// Load persisted execution state for this subtask (if any).
