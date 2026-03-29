@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"pentagi/pkg/cast"
@@ -121,23 +122,29 @@ func getNestedTimeout(depth int) time.Duration {
 type mergedContext struct {
 	context.Context // carries values + deadline from timeout context
 	parentCancel    context.Context
+	done            chan struct{}
+	doneOnce        sync.Once
 }
 
-func (mc *mergedContext) Done() <-chan struct{} {
-	// We need a merged done channel. Use a goroutine to select on both.
-	// This is created lazily and cached — but for simplicity we use a goroutine approach.
-	// In practice, the timeout context's Done() is sufficient because we also
-	// check parentCancel in the Err() method.
-	done := make(chan struct{})
+func newMergedContext(timeoutCtx context.Context, parentCancel context.Context) *mergedContext {
+	mc := &mergedContext{
+		Context:      timeoutCtx,
+		parentCancel: parentCancel,
+		done:         make(chan struct{}),
+	}
+	// Single goroutine merges both done channels; created once at construction.
 	go func() {
 		select {
 		case <-mc.Context.Done():
-			close(done)
 		case <-mc.parentCancel.Done():
-			close(done)
 		}
+		mc.doneOnce.Do(func() { close(mc.done) })
 	}()
-	return done
+	return mc
+}
+
+func (mc *mergedContext) Done() <-chan struct{} {
+	return mc.done
 }
 
 func (mc *mergedContext) Err() error {
@@ -155,10 +162,7 @@ func newNestedContext(parentCtx context.Context, timeout time.Duration) (context
 	timeoutCtx, cancel := context.WithTimeout(freshCtx, timeout)
 
 	// Wrap so that parent cancellation also cancels us
-	merged := &mergedContext{
-		Context:      timeoutCtx,
-		parentCancel: parentCtx,
-	}
+	merged := newMergedContext(timeoutCtx, parentCtx)
 	return merged, cancel
 }
 
@@ -322,6 +326,15 @@ func (fp *flowProvider) performAgentChain(
 					completedWork.RestoreFromState(loaded.CompletedTasks)
 					logger.WithField("restored_completed_tasks", len(loaded.CompletedTasks)).
 						Info("restored completed work items from persisted state")
+				}
+
+				// v5: Restore loop detector alert count from persisted state
+				// so escalation level (info → warning → critical) continues
+				// from where it left off instead of resetting.
+				if loaded.LoopAlertCount > 0 && loopDetector != nil {
+					loopDetector.RestoreAlertCount(loaded.LoopAlertCount)
+					logger.WithField("restored_loop_alerts", loaded.LoopAlertCount).
+						Info("restored loop detector alert count from persisted state")
 				}
 			}
 		}
@@ -915,7 +928,12 @@ func (fp *flowProvider) performAgentChain(
 			}
 			// v5: Record file writes to invalidate semantic read cache.
 			if fileReadCache != nil && funcName == "terminal" {
-				fileReadCache.RecordFileWrite(toolCall.FunctionCall.Arguments)
+				var termWriteArgs map[string]interface{}
+				if jsonErr := json.Unmarshal(json.RawMessage(toolCall.FunctionCall.Arguments), &termWriteArgs); jsonErr == nil {
+					if writeInput, ok := termWriteArgs["input"].(string); ok {
+						fileReadCache.RecordFileWrite(writeInput)
+					}
+				}
 			}
 
 			if executor.IsBarrierFunction(funcName) {

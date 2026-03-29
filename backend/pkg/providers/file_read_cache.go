@@ -48,8 +48,10 @@ type fileReadEntry struct {
 
 const (
 	// fileReadCacheTTL controls how long a cached file read is valid.
-	// 5 minutes is conservative — most re-reads happen within 1-2 minutes.
-	fileReadCacheTTL = 5 * time.Minute
+	// 8 minutes covers the typical subtask execution window while still
+	// expiring naturally if data genuinely changes. Raised from 5 to 8 min
+	// to better cover complex subtasks that span longer execution periods.
+	fileReadCacheTTL = 8 * time.Minute
 
 	// maxFileReadEntries caps memory usage. 100 unique files is more than
 	// enough for any single subtask.
@@ -262,8 +264,13 @@ func (fc *FileReadCache) StoreFileRead(command, output string) {
 
 // RecordFileWrite marks a file as modified, invalidating any cached read.
 // Called for every terminal command — checks if it's a write operation.
+//
+// Handles both absolute and relative paths: a write to "FINDINGS.md" (relative)
+// will invalidate a cache entry for "/work/FINDINGS.md" (absolute) by also
+// checking base-name matches. This prevents stale cache hits after relative-path
+// writes, which are common in the /work directory.
 func (fc *FileReadCache) RecordFileWrite(command string) {
-	filepath, isWrite := extractWritePath(command)
+	writePath, isWrite := extractWritePath(command)
 	if !isWrite {
 		return
 	}
@@ -271,9 +278,26 @@ func (fc *FileReadCache) RecordFileWrite(command string) {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 
-	entry, exists := fc.entries[filepath]
-	if exists {
+	// Direct match — absolute path write matches absolute path cache key
+	if entry, exists := fc.entries[writePath]; exists {
 		entry.modifiedAt = time.Now()
+	}
+
+	// Relative path fallback: if the write path has no leading slash (relative),
+	// scan all cache entries for a basename match. This handles the common case
+	// of `echo >> FINDINGS.md` invalidating `/work/FINDINGS.md`.
+	if !strings.HasPrefix(writePath, "/") {
+		writeBase := strings.ToLower(writePath)
+		for key, entry := range fc.entries {
+			// Extract base name from the cached absolute path
+			cachedBase := key
+			if idx := strings.LastIndex(key, "/"); idx >= 0 {
+				cachedBase = key[idx+1:]
+			}
+			if strings.ToLower(cachedBase) == writeBase {
+				entry.modifiedAt = time.Now()
+			}
+		}
 	}
 }
 

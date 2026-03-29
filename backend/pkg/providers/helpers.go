@@ -54,7 +54,7 @@ func newRepeatingDetector() *repeatingDetector {
 	return &repeatingDetector{
 		threshold:      RepeatingToolCallThreshold,
 		readCounts:     make(map[string]int),
-		maxGlobalReads: 40,
+		maxGlobalReads: 60,
 	}
 }
 
@@ -368,9 +368,9 @@ var readOnlyCmdPatterns = []*regexp.Regexp{
 // but without a cap they can read the same file 20+ times in infinite loops.
 //
 // Returns (blocked, message):
-//   - ≤2 reads:  (false, "")         — free reads (initial + verify-after-write)
-//   - 3-4 reads: (false, "⚠️ ...")   — warning prepended to tool result
-//   - >4 reads:  (true, "BLOCKED...") — synthetic response, tool NOT executed
+//   - ≤3 reads:  (false, "")         — free reads (initial + verify-after-write + re-verify)
+//   - 4-5 reads: (false, "⚠️ ...")   — warning prepended to tool result
+//   - >5 reads:  (true, "BLOCKED...") — synthetic response, tool NOT executed
 func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, string) {
 	if !rd.isReadOnlyCall(funcCall) {
 		return false, ""
@@ -420,11 +420,11 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 	count := rd.readCounts[key]
 
 	switch {
-	case count <= 2:
-		// Free reads: initial bootstrap + verify-after-write (was: 1, now: 2)
+	case count <= 3:
+		// Free reads: initial bootstrap + verify-after-write + re-verify (was: 2, now: 3)
 		return false, ""
-	case count <= 4:
-		// Warning zone (was: 3, now: 4)
+	case count <= 5:
+		// Warning zone (was: 4, now: 5)
 		return false, fmt.Sprintf(
 			"⚠️ WARNING: You've read '%s' %d times. The content has NOT changed since your first read. "+
 				"STOP reading this file. Instead, you MUST now:\n"+
@@ -438,8 +438,8 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 		// Per-file block — also escalate totalBlocks
 		rd.totalBlocks++
 
-		// After 6 total blocks: engage hard block for ALL future reads (was: 5, now: 6)
-		if rd.totalBlocks >= 6 {
+		// After 8 total blocks: engage hard block for ALL future reads (was: 6, now: 8)
+		if rd.totalBlocks >= 8 {
 			rd.allReadsBlocked = true
 			return true, fmt.Sprintf(
 				"🛑 HARD BLOCK ENGAGED: Read of '%s' denied (read %d times). "+
@@ -451,8 +451,8 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 			)
 		}
 
-		// After 4 total blocks: critical escalation (was: 3, now: 4)
-		if rd.totalBlocks >= 4 {
+		// After 5 total blocks: critical escalation (was: 4, now: 5)
+		if rd.totalBlocks >= 5 {
 			return true, fmt.Sprintf(
 				"🛑 CRITICAL: You have been blocked from reading files %d times. STOP ALL FILE READS IMMEDIATELY. "+
 					"Read of '%s' denied (read %d times). "+

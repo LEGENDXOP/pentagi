@@ -37,11 +37,14 @@ const (
 	DefaultReconMaxDuration = 30 * time.Minute
 
 	// DefaultExploitMaxDuration is the maximum time for exploitation subtasks.
-	DefaultExploitMaxDuration = 25 * time.Minute
+	// Raised from 25 to 35 min: multi-step exploit chains (SSRF→internal→RCE)
+	// and retry-after-failure patterns need the extra headroom.
+	DefaultExploitMaxDuration = 35 * time.Minute
 
 	// DefaultGenericMaxDuration is the fallback for subtasks that don't match
 	// a known category (reporting, enumeration, etc.).
-	DefaultGenericMaxDuration = 20 * time.Minute
+	// Raised from 20 to 25 min: mixed recon/exploit subtasks need more room.
+	DefaultGenericMaxDuration = 25 * time.Minute
 
 	// TimeboxWarningBuffer is how many minutes before the deadline the
 	// "TIME WARNING: N minutes remaining" message is injected.

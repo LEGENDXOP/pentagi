@@ -394,8 +394,18 @@ var workItemPatterns = []workItemPattern{
 	},
 }
 
+// targetExtractPattern extracts a target host/IP/URL from tool arguments.
+// Used to differentiate work items that target different hosts (e.g., nmap host1
+// vs nmap host2 should be separate "port_scan" items).
+var targetExtractPattern = regexp.MustCompile(`(?:https?://)?([a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,}|(?:\d{1,3}\.){3}\d{1,3})`)
+
 // classifyWorkItem matches a tool execution against known work item patterns.
 // Returns (taskKey, description, outputFile) or ("", "", "") if no match.
+//
+// The taskKey includes target differentiation for scan/attack patterns so that
+// the same tool type targeting different hosts is NOT considered a re-run.
+// For example, "nmap host1" → "port_scan:host1" and "nmap host2" → "port_scan:host2"
+// are separate work items. This prevents blocking legitimate multi-target scanning.
 func classifyWorkItem(toolName, toolArgs, toolResult string) (string, string, string) {
 	for _, pattern := range workItemPatterns {
 		// Check tool name if specified
@@ -411,7 +421,14 @@ func classifyWorkItem(toolName, toolArgs, toolResult string) (string, string, st
 		// Check argument pattern
 		if pattern.argPattern != nil {
 			if pattern.argPattern.MatchString(toolArgs) {
-				return pattern.key, pattern.description, pattern.outputFile
+				key := pattern.key
+				// Append target host to key for scan/attack patterns to allow
+				// the same tool type on different targets. Without this, running
+				// nmap on host1 blocks nmap on host2.
+				if target := targetExtractPattern.FindString(toolArgs); target != "" {
+					key = key + ":" + strings.ToLower(target)
+				}
+				return key, pattern.description, pattern.outputFile
 			}
 		}
 
@@ -477,7 +494,7 @@ func MergeCompletedTasksIntoState(stateJSON string, tasks []CompletedTaskJSON) (
 		return stateJSON, fmt.Errorf("failed to parse state JSON: %w", err)
 	}
 
-	state["completedTasks"] = tasks
+	state["completed_tasks"] = tasks
 
 	out, err := json.Marshal(state)
 	if err != nil {
@@ -494,7 +511,7 @@ func ExtractCompletedTasksFromState(stateJSON string) []CompletedTaskJSON {
 		return nil
 	}
 
-	raw, ok := state["completedTasks"]
+	raw, ok := state["completed_tasks"]
 	if !ok {
 		return nil
 	}

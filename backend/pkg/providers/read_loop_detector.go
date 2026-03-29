@@ -70,9 +70,9 @@ type ReadLoopDetectorConfig struct {
 func DefaultReadLoopDetectorConfig() ReadLoopDetectorConfig {
 	config := ReadLoopDetectorConfig{
 		CycleMinLength:       3,
-		CycleRepeatThreshold: 3,
-		WindowSize:           30,
-		CooldownCalls:        5,
+		CycleRepeatThreshold: 4,
+		WindowSize:           40,
+		CooldownCalls:        8,
 	}
 
 	// Allow env var overrides for tuning in production
@@ -306,6 +306,16 @@ func (rld *ReadLoopDetector) formatAlertMessage(alert *LoopAlert) string {
 			alert.RepeatCount, fileList,
 		)
 	}
+}
+
+// RestoreAlertCount restores the total alerts counter from persisted state.
+// Call this after loading execution state on chain resume so the escalation
+// level (info → warning → critical) continues from where it left off instead
+// of resetting to 0.
+func (rld *ReadLoopDetector) RestoreAlertCount(count int) {
+	rld.mu.Lock()
+	defer rld.mu.Unlock()
+	rld.totalAlertsGenerated = count
 }
 
 // GetStats returns detection statistics for logging.

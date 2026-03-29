@@ -40,7 +40,12 @@ func newDelegationBlockTracker() *delegationBlockTracker {
 	}
 }
 
-const maxDelegationBlocksBeforeEscalation = 2
+// maxDelegationBlocksBeforeEscalation is the number of blocked delegation
+// attempts (per agent type) before the response escalates to PERMANENT BLOCK.
+// Raised from 2 to 3: two blocks could be legitimate (agent tries coder for
+// script writing, then for a different exploit script). Three blocks is a
+// clearer signal of a stuck loop.
+const maxDelegationBlocksBeforeEscalation = 3
 
 // recordBlock increments the block count and returns an escalated message if threshold exceeded.
 func (dt *delegationBlockTracker) recordBlock(agentName, baseMsg string) string {

@@ -88,16 +88,19 @@ func NewTerminalOutputCache() *TerminalOutputCache {
 // 5. jq parsing of stored files — deterministic
 var cacheablePatterns = []*regexp.Regexp{
 	// --- Token/credential file reads ---
-	// The #1 offender: agent reads token files 15-20x per subtask
-	regexp.MustCompile(`(?i)cat\s+/tmp/.*token`),
-	regexp.MustCompile(`(?i)cat\s+/tmp/.*jwt`),
-	regexp.MustCompile(`(?i)cat\s+/tmp/.*cookie`),
-	regexp.MustCompile(`(?i)cat\s+/tmp/.*auth`),
-	regexp.MustCompile(`(?i)cat\s+/tmp/.*access`),
-	regexp.MustCompile(`(?i)cat\s+/tmp/.*session`),
-	regexp.MustCompile(`(?i)cat\s+/tmp/.*cred`),
-	regexp.MustCompile(`(?i)cat\s+/tmp/.*secret`),
-	regexp.MustCompile(`(?i)cat\s+/tmp/.*key`),
+	// The #1 offender: agent reads token files 15-20x per subtask.
+	// Tightened from original `/tmp/.*token` to require the keyword as a
+	// meaningful path component (after / _ - .) to avoid false positives like
+	// `cat /tmp/monkey_data.txt` matching "key".
+	regexp.MustCompile(`(?i)cat\s+/tmp/\S*(?:^|[/_.-])token(?:[s._-]|\s|$)`),
+	regexp.MustCompile(`(?i)cat\s+/tmp/\S*(?:^|[/_.-])jwt(?:[._-]|\s|$)`),
+	regexp.MustCompile(`(?i)cat\s+/tmp/\S*(?:^|[/_.-])cookie(?:[s._-]|\s|$)`),
+	regexp.MustCompile(`(?i)cat\s+/tmp/\S*(?:^|[/_.-])auth(?:[._-]|\s|$)`),
+	regexp.MustCompile(`(?i)cat\s+/tmp/\S*(?:^|[/_.-])access(?:[._-]|\s|$)`),
+	regexp.MustCompile(`(?i)cat\s+/tmp/\S*(?:^|[/_.-])session(?:[._-]|\s|$)`),
+	regexp.MustCompile(`(?i)cat\s+/tmp/\S*(?:^|[/_.-])cred(?:[s._-]|\s|$)`),
+	regexp.MustCompile(`(?i)cat\s+/tmp/\S*(?:^|[/_.-])secret(?:[._-]|\s|$)`),
+	regexp.MustCompile(`(?i)cat\s+/tmp/\S*(?:^|[/_.-])(?:api[_-]?)?key(?:[._-]|\s|$)`),
 
 	// --- GraphQL introspection queries ---
 	// The #2 offender: agent introspects schema 4x per subtask.
