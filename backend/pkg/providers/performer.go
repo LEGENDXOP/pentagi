@@ -343,11 +343,13 @@ func (fp *flowProvider) performAgentChain(
 	// level eats into a single 45-minute budget.
 	var timeoutCancel context.CancelFunc
 	if depth == 0 {
-		// Top-level: use a FRESH context detached from any inherited deadline
-		// so that resumed flows (where the parent context's deadline has long
-		// passed) still get a full subtask budget. Parent cancellation is
-		// still respected via the merged context wrapper.
-		ctx, timeoutCancel = newNestedContext(ctx, getSubtaskMaxDuration())
+		// Top-level: create a fully fresh context with ONLY the values from
+		// the parent (span, delegation tracker, etc.) but NO inherited deadline
+		// and NO parent cancellation propagation. This is critical for resumed
+		// flows where the parent context is already cancelled/expired.
+		// User abort is handled at a higher level (flow control).
+		freshCtx := context.WithoutCancel(ctx)
+		ctx, timeoutCancel = context.WithTimeout(freshCtx, getSubtaskMaxDuration())
 	} else {
 		// Nested: fresh timeout that still respects parent cancellation
 		nestedTimeout := getNestedTimeout(depth)
