@@ -341,23 +341,12 @@ func (fp *flowProvider) performAgentChain(
 	// For nested agents (depth > 0), use a FRESH timeout detached from the parent's
 	// deadline to prevent the shared-deadline starvation problem where each nesting
 	// level eats into a single 45-minute budget.
-	var timeoutCancel context.CancelFunc
-	if depth == 0 {
-		// Top-level: create a fully fresh context with ONLY the values from
-		// the parent (span, delegation tracker, etc.) but NO inherited deadline
-		// and NO parent cancellation propagation. This is critical for resumed
-		// flows where the parent context is already cancelled/expired.
-		// User abort is handled at a higher level (flow control).
-		freshCtx := context.WithoutCancel(ctx)
-		ctx, timeoutCancel = context.WithTimeout(freshCtx, getSubtaskMaxDuration())
-	} else {
-		// Nested: fresh timeout that still respects parent cancellation
-		nestedTimeout := getNestedTimeout(depth)
-		ctx, timeoutCancel = newNestedContext(ctx, nestedTimeout)
-	}
-	defer timeoutCancel()
+	// Determine the effective timeout for this chain invocation.
+	// For top-level (depth==0), start with the generic subtask timeout,
+	// then potentially tighten it if timebox classifies the subtask shorter.
+	effectiveTimeout := getSubtaskMaxDuration()
 
-	// v5: Per-subtask-type time-boxing — override generic timeout with
+	// v5: Per-subtask-type time-boxing — classify the subtask and use a
 	// category-specific budget (recon=30min, exploit=25min, generic=20min).
 	var timebox *SubtaskTimebox
 	if depth == 0 && ShouldUseTimebox() {
@@ -368,13 +357,26 @@ func (fp *flowProvider) performAgentChain(
 				"timebox_max_duration": timebox.MaxDuration.String(),
 			}).Info("created subtask timebox")
 
-			// If the timebox is shorter than generic timeout, tighten the deadline.
-			if timebox.MaxDuration < getSubtaskMaxDuration() {
-				timeoutCancel() // cancel the generic timeout
-				ctx, timeoutCancel = context.WithTimeout(ctx, timebox.MaxDuration)
+			// Use the tighter of generic timeout vs timebox budget.
+			if timebox.MaxDuration < effectiveTimeout {
+				effectiveTimeout = timebox.MaxDuration
 			}
 		}
 	}
+
+	var timeoutCancel context.CancelFunc
+	if depth == 0 {
+		// Top-level: create a fully fresh context detached from any inherited
+		// deadline or cancellation. Critical for resumed flows where the parent
+		// context is already expired. User abort handled at flow control level.
+		freshCtx := context.WithoutCancel(ctx)
+		ctx, timeoutCancel = context.WithTimeout(freshCtx, effectiveTimeout)
+	} else {
+		// Nested: fresh timeout that still respects parent cancellation
+		nestedTimeout := getNestedTimeout(depth)
+		ctx, timeoutCancel = newNestedContext(ctx, nestedTimeout)
+	}
+	defer timeoutCancel()
 
 	timeWarningInjected := false
 
