@@ -330,6 +330,25 @@ func (fp *flowProvider) performAgentChain(
 
 	timeWarningInjected := false
 
+	// FIX: Create a per-chain delegation block tracker so that handlers can
+	// count consecutive blocked delegation attempts and escalate responses.
+	ctx = withDelegationTracker(ctx, newDelegationBlockTracker())
+
+	// FIX: Inject resume context into the message chain so the LLM knows
+	// what has already been done. Without this, chain summarization strips
+	// execution history and the agent restarts from scratch.
+	if execState != nil && execState.ToolCallCount > 0 {
+		resumeMsg := execState.BuildResumeInjectionMessage()
+		chain = append(chain, llms.MessageContent{
+			Role: llms.ChatMessageTypeHuman,
+			Parts: []llms.ContentPart{
+				llms.TextContent{Text: resumeMsg},
+			},
+		})
+		logger.WithField("tool_call_count", execState.ToolCallCount).
+			Info("injected resume context into chain from persisted execution state")
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			logger.WithError(err).Warn("context cancelled/timed out in agent chain loop")
@@ -768,6 +787,31 @@ func (fp *flowProvider) performAgentChain(
 
 			if stateJSON, err := execState.ToJSON(); err == nil {
 				stateWriter.Write(*subtaskID, stateJSON)
+
+				// FIX: Write STATE.json to container filesystem every 5 tool calls.
+				// The LLM reads /work/STATE.json on context reset but it never gets
+				// updated past "phase:recon" because the LLM loses context.
+				if toolCallCount > 0 && toolCallCount%5 == 0 {
+					writeStateArgs, _ := json.Marshal(map[string]interface{}{
+						"input":   fmt.Sprintf("cat > /work/STATE.json << 'STATE_EOF'\n%s\nSTATE_EOF", stateJSON),
+						"timeout": 5,
+					})
+					if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeStateArgs); writeErr != nil {
+						logger.WithError(writeErr).Debug("failed to update container STATE.json (non-fatal)")
+					}
+				}
+
+				// FIX: Write RESUME.md to container filesystem every 10 tool calls.
+				// The agent looks for /work/RESUME.md on restart but nobody writes it.
+				if toolCallCount > 0 && toolCallCount%10 == 0 && execState.ResumeContext != "" {
+					writeResumeArgs, _ := json.Marshal(map[string]interface{}{
+						"input":   fmt.Sprintf("cat > /work/RESUME.md << 'RESUME_EOF'\n%s\nRESUME_EOF", execState.ResumeContext),
+						"timeout": 5,
+					})
+					if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeResumeArgs); writeErr != nil {
+						logger.WithError(writeErr).Debug("failed to write RESUME.md to container (non-fatal)")
+					}
+				}
 			}
 		}
 

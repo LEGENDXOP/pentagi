@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"pentagi/pkg/cast"
@@ -21,6 +22,70 @@ import (
 
 	"github.com/sirupsen/logrus"
 )
+
+// ─── Delegation Block Tracker ───────────────────────────────────────────────
+// Tracks consecutive blocked delegation attempts per agent type within a single
+// performAgentChain execution. After maxBlocks attempts, the response escalates
+// from informational to imperative, breaking the doom loop where the LLM
+// rephrases the same delegation request 26+ times.
+
+type delegationBlockTracker struct {
+	counts map[string]int // agent_name → consecutive block count
+	mu     sync.Mutex
+}
+
+func newDelegationBlockTracker() *delegationBlockTracker {
+	return &delegationBlockTracker{
+		counts: make(map[string]int),
+	}
+}
+
+const maxDelegationBlocksBeforeEscalation = 2
+
+// recordBlock increments the block count and returns an escalated message if threshold exceeded.
+func (dt *delegationBlockTracker) recordBlock(agentName, baseMsg string) string {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	dt.counts[agentName]++
+	count := dt.counts[agentName]
+
+	if count > maxDelegationBlocksBeforeEscalation {
+		totalAttempts := 0
+		for _, c := range dt.counts {
+			totalAttempts += c
+		}
+		return fmt.Sprintf(
+			"DELEGATION PERMANENTLY BLOCKED (attempt %d for %s, %d total across all agents). "+
+				"The %s agent is NOT available — this will NOT change no matter how you rephrase the request. "+
+				"You MUST complete the remaining work DIRECTLY:\n"+
+				"- Use the terminal tool to run commands (curl, nmap, python3, etc.)\n"+
+				"- Use heredoc to write files: cat > /work/file.md << 'EOF' ... EOF\n"+
+				"- Use the file tool with action=update_file to create/update files\n"+
+				"If your current subtask objective requires delegation that is blocked, "+
+				"summarize what you've accomplished so far and call the result tool to finish.",
+			count, agentName, totalAttempts, agentName,
+		)
+	}
+	return baseMsg
+}
+
+// delegationTrackerKey is a context key for the per-chain delegation block tracker.
+type delegationTrackerKey struct{}
+
+// withDelegationTracker attaches a delegation tracker to the context.
+func withDelegationTracker(ctx context.Context, dt *delegationBlockTracker) context.Context {
+	return context.WithValue(ctx, delegationTrackerKey{}, dt)
+}
+
+// getDelegationTracker retrieves the delegation tracker from context.
+func getDelegationTracker(ctx context.Context) *delegationBlockTracker {
+	if dt, ok := ctx.Value(delegationTrackerKey{}).(*delegationBlockTracker); ok {
+		return dt
+	}
+	return newDelegationBlockTracker()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 func wrapError(ctx context.Context, msg string, err error) error {
 	if err == nil {
@@ -286,7 +351,8 @@ func (fp *flowProvider) GetCoderHandler(ctx context.Context, taskID, subtaskID *
 	coderHandler := func(ctx context.Context, action tools.CoderAction) (string, error) {
 		if msg := checkDelegationAllowed(ctx, "coder"); msg != "" {
 			logrus.WithContext(ctx).WithField("depth", getNestingDepth(ctx)).Warn("coder delegation blocked: " + msg)
-			return msg, nil
+			escalated := getDelegationTracker(ctx).recordBlock("coder", msg)
+			return escalated, nil
 		}
 
 		coderContext := map[string]map[string]any{
@@ -388,7 +454,8 @@ func (fp *flowProvider) GetInstallerHandler(ctx context.Context, taskID, subtask
 	installerHandler := func(ctx context.Context, action tools.MaintenanceAction) (string, error) {
 		if msg := checkDelegationAllowed(ctx, "installer"); msg != "" {
 			logrus.WithContext(ctx).WithField("depth", getNestingDepth(ctx)).Warn("installer delegation blocked: " + msg)
-			return msg, nil
+			escalated := getDelegationTracker(ctx).recordBlock("installer", msg)
+			return escalated, nil
 		}
 
 		installerContext := map[string]map[string]any{
@@ -627,7 +694,8 @@ func (fp *flowProvider) GetPentesterHandler(ctx context.Context, taskID, subtask
 	pentesterHandler := func(ctx context.Context, action tools.PentesterAction) (string, error) {
 		if msg := checkDelegationAllowed(ctx, "pentester"); msg != "" {
 			logrus.WithContext(ctx).WithField("depth", getNestingDepth(ctx)).Warn("pentester delegation blocked: " + msg)
-			return msg, nil
+			escalated := getDelegationTracker(ctx).recordBlock("pentester", msg)
+			return escalated, nil
 		}
 
 		// Load persisted execution state for this subtask (if any).

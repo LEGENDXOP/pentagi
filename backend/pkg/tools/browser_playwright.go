@@ -128,16 +128,27 @@ func (bp *browserPlaywright) ensureServer(ctx context.Context) error {
 		"component": "playwright",
 	})
 
-	// Check if Node.js is available
+	// Check if Node.js AND npm are available (vxcontrol/kali-linux has node but NOT npm)
 	nodeCheck, err := bp.execInContainer(ctx, containerName, "which node 2>/dev/null || echo 'NOT_FOUND'", 10*time.Second)
-	if err != nil || strings.Contains(nodeCheck, "NOT_FOUND") {
-		logger.Info("Node.js not found, installing...")
-		installCmd := "apt-get update -qq && apt-get install -y -qq nodejs npm > /dev/null 2>&1 && which node"
+	npmCheck, _ := bp.execInContainer(ctx, containerName, "which npm 2>/dev/null || echo 'NOT_FOUND'", 10*time.Second)
+
+	needsInstall := err != nil || strings.Contains(nodeCheck, "NOT_FOUND") || strings.Contains(npmCheck, "NOT_FOUND")
+	if needsInstall {
+		var missingPkgs []string
+		if err != nil || strings.Contains(nodeCheck, "NOT_FOUND") {
+			missingPkgs = append(missingPkgs, "nodejs")
+		}
+		if strings.Contains(npmCheck, "NOT_FOUND") {
+			missingPkgs = append(missingPkgs, "npm")
+		}
+		logger.WithField("missing", missingPkgs).Info("Installing missing packages for browser support...")
+		installCmd := fmt.Sprintf("apt-get update -qq && apt-get install -y -qq %s > /dev/null 2>&1 && which node && which npm",
+			strings.Join(missingPkgs, " "))
 		installResult, installErr := bp.execInContainer(ctx, containerName, installCmd, playwrightInstallTimeout)
 		if installErr != nil || !strings.Contains(installResult, "/node") {
-			return fmt.Errorf("failed to install Node.js: %v (output: %s)", installErr, installResult)
+			return fmt.Errorf("failed to install Node.js/npm: %v (output: %s)", installErr, installResult)
 		}
-		logger.Info("Node.js installed successfully")
+		logger.Info("Node.js/npm installed successfully")
 	}
 
 	// Create package.json and install dependencies
@@ -148,22 +159,34 @@ func (bp *browserPlaywright) ensureServer(ctx context.Context) error {
 		pkgJSON, playwrightPackageJSON,
 	)
 
-	// Check if node_modules already exists
-	checkModules, _ := bp.execInContainer(ctx, containerName, fmt.Sprintf("test -d %s && echo 'EXISTS' || echo 'MISSING'", playwrightNodeModulesDir), 5*time.Second)
-	if strings.Contains(checkModules, "MISSING") {
-		logger.Info("Installing Playwright dependencies...")
-		installResult, err := bp.execInContainer(ctx, containerName, setupCmd, playwrightInstallTimeout)
-		if err != nil {
-			return fmt.Errorf("failed to install Playwright dependencies: %v (output: %s)", err, installResult)
-		}
+	// Check for pre-installed modules first (custom pentagi-kali image)
+	preinstalledModules := "/opt/pentagi-browser/node_modules"
+	checkPreinstalled, _ := bp.execInContainer(ctx, containerName,
+		fmt.Sprintf("test -d %s/playwright-extra && echo 'EXISTS' || echo 'MISSING'", preinstalledModules), 5*time.Second)
 
-		// Install Chromium browser
-		chrInstall := "cd /work/.browser-pkg && npx playwright install chromium --with-deps 2>&1 | tail -5"
-		chrResult, err := bp.execInContainer(ctx, containerName, chrInstall, playwrightInstallTimeout)
-		if err != nil {
-			return fmt.Errorf("failed to install Chromium: %v (output: %s)", err, chrResult)
+	useNodeModulesDir := playwrightNodeModulesDir // default: /work/.browser-pkg/node_modules
+	if strings.Contains(checkPreinstalled, "EXISTS") {
+		logger.Info("Using pre-installed Playwright modules from image")
+		useNodeModulesDir = preinstalledModules
+	} else {
+		// Fall back to installing in work dir
+		checkModules, _ := bp.execInContainer(ctx, containerName,
+			fmt.Sprintf("test -d %s/playwright-extra && echo 'EXISTS' || echo 'MISSING'", playwrightNodeModulesDir), 5*time.Second)
+		if strings.Contains(checkModules, "MISSING") {
+			logger.Info("Installing Playwright dependencies...")
+			installResult, err := bp.execInContainer(ctx, containerName, setupCmd, playwrightInstallTimeout)
+			if err != nil {
+				return fmt.Errorf("failed to install Playwright dependencies: %v (output: %s)", err, installResult)
+			}
+
+			// Install Chromium browser
+			chrInstall := "cd /work/.browser-pkg && npx playwright install chromium --with-deps 2>&1 | tail -5"
+			chrResult, err := bp.execInContainer(ctx, containerName, chrInstall, playwrightInstallTimeout)
+			if err != nil {
+				return fmt.Errorf("failed to install Chromium: %v (output: %s)", err, chrResult)
+			}
+			logger.Info("Playwright dependencies installed successfully")
 		}
-		logger.Info("Playwright dependencies installed successfully")
 	}
 
 	// Write the browser server script into the container
@@ -172,14 +195,17 @@ func (bp *browserPlaywright) ensureServer(ctx context.Context) error {
 		return fmt.Errorf("failed to write browser server script: %w", err)
 	}
 
+	// Ensure screenshot dir exists
+	bp.execInContainer(ctx, containerName, fmt.Sprintf("mkdir -p %s", playwrightScreenshotDir), 5*time.Second)
+
 	// Kill any existing server
 	killCmd := fmt.Sprintf("kill $(cat %s 2>/dev/null) 2>/dev/null; rm -f %s", playwrightPidFile, playwrightPidFile)
 	bp.execInContainer(ctx, containerName, killCmd, 5*time.Second)
 
-	// Start the server
+	// Start the server with the resolved NODE_PATH
 	startCmd := fmt.Sprintf(
 		"cd /work/.browser-pkg && BROWSER_PORT=%d BROWSER_TIMEOUT=%d NODE_PATH=%s nohup node %s > %s 2>&1 & echo $! > %s && sleep 3 && cat %s",
-		playwrightServerPort, bp.timeout, playwrightNodeModulesDir,
+		playwrightServerPort, bp.timeout, useNodeModulesDir,
 		playwrightServerScript, playwrightLogFile, playwrightPidFile, playwrightLogFile,
 	)
 

@@ -429,6 +429,15 @@ func (rd *repeatingDetector) clearCallArguments(toolCall *llms.FunctionCall) llm
 
 	delete(v, "message")
 
+	// For delegation tools, strip the "question" field so that repeated
+	// delegation attempts (with different phrasings) hash to the same key.
+	// This allows the repeating detector to catch delegation loops where
+	// the agent retries with rephrased questions.
+	switch toolCall.Name {
+	case "coder", "installer", "maintenance", "pentester":
+		delete(v, "question")
+	}
+
 	canonical, err := json.Marshal(v)
 	if err != nil {
 		return *toolCall

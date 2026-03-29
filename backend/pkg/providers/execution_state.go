@@ -3,6 +3,8 @@ package providers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,6 +71,39 @@ func (es *ExecutionState) Update(metrics *ExecutionMetrics, phase string) {
 	if metrics.LastToolName != "" {
 		es.CurrentAttack = metrics.LastToolName
 	}
+}
+
+// BuildResumeInjectionMessage creates a human-role message that tells the LLM
+// exactly what has already been done, preventing it from re-running completed work.
+func (es *ExecutionState) BuildResumeInjectionMessage() string {
+	var sb strings.Builder
+	sb.WriteString("[EXECUTION RESUME — READ CAREFULLY]\n\n")
+	sb.WriteString("You are RESUMING a subtask that was interrupted. Here is your progress:\n\n")
+	sb.WriteString(fmt.Sprintf("  Phase: %s\n", es.Phase))
+	sb.WriteString(fmt.Sprintf("  Tool calls already made: %d\n", es.ToolCallCount))
+	sb.WriteString(fmt.Sprintf("  Errors encountered: %d\n", es.ErrorCount))
+	sb.WriteString(fmt.Sprintf("  Last update: %s\n", es.LastUpdate))
+
+	if len(es.AttacksDone) > 0 {
+		sb.WriteString(fmt.Sprintf("  Tools/attacks already executed: %s\n", strings.Join(es.AttacksDone, ", ")))
+	}
+	if es.CurrentAttack != "" {
+		sb.WriteString(fmt.Sprintf("  Last tool used: %s\n", es.CurrentAttack))
+	}
+
+	sb.WriteString("\n⚠️ CRITICAL INSTRUCTIONS:\n")
+	sb.WriteString("1. DO NOT re-run nmap, nuclei, subfinder, or any reconnaissance tool that was already executed\n")
+	sb.WriteString("2. DO NOT re-read STATE.json, FINDINGS.md, or HANDOFF.md — their content was already processed\n")
+	sb.WriteString("3. DO NOT re-install tools (jq, curl, nuclei, etc.) — they are already installed\n")
+	sb.WriteString("4. CONTINUE from where you left off — proceed to the next UNFINISHED phase\n")
+	sb.WriteString("5. If you completed reconnaissance, move to exploitation immediately\n")
+
+	if es.ResumeContext != "" {
+		sb.WriteString("\n--- Detailed Resume Context ---\n")
+		sb.WriteString(es.ResumeContext)
+	}
+
+	return sb.String()
 }
 
 // stateWriteRequest is sent to the async writer goroutine.
