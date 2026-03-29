@@ -753,6 +753,9 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 		return PerformResultError, fmt.Errorf("failed to get subtask: %w", err)
 	}
 
+	// v5: Inject subtask metadata into context for per-type time-boxing.
+	ctx = WithSubtaskMeta(ctx, subtask.Title, subtask.Description)
+
 	ctx, observation := obs.Observer.NewObservation(ctx)
 	executorAgent := observation.Agent(
 		langfuse.WithAgentName(fmt.Sprintf("primary agent for subtask %d: %s", subtaskID, subtask.Title)),
@@ -928,7 +931,22 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 
 	endAgent()
 
-	return PerformResult(performResultVal.Load()), nil
+	// v5: If the agent chain completed without calling the barrier function
+	// (e.g., timebox force-finish), promote to Done if partial results exist.
+	result := PerformResult(performResultVal.Load())
+	if result == PerformResultError {
+		if st, dbErr := fp.db.GetSubtask(ctx, subtaskID); dbErr == nil && st.Result != "" {
+			if strings.Contains(st.Result, "[TIMEBOX EXPIRED") {
+				result = PerformResultDone
+				logrus.WithContext(ctx).WithFields(logrus.Fields{
+					"subtask_id": subtaskID,
+					"task_id":    taskID,
+				}).Info("subtask timebox force-finished, promoting to Done")
+			}
+		}
+	}
+
+	return result, nil
 }
 
 const maxUserInputSize = 32 * 1024 // 32KB maximum user input size

@@ -15,15 +15,32 @@ import (
 
 // ExecutionState captures the agent's execution progress for crash recovery.
 // It is serialized to JSON and persisted in the subtask's Context column.
+//
+// V2 additions:
+//   - CompletedTasks: tracks which semantic work items (subdomain_enumeration,
+//     port_scan, etc.) have been completed. Prevents the agent from re-running
+//     reconnaissance tasks it already finished (Flow 23 problem).
+//   - LoopDetectorState: persists the loop detector's alert count so the
+//     escalation level survives context switches (Flow 24 problem).
 type ExecutionState struct {
-	Phase          string   `json:"phase"`
-	ToolCallCount  int      `json:"tool_call_count"`
-	FindingsCount  int      `json:"findings_count"`
-	AttacksDone    []string `json:"attacks_done"`
-	CurrentAttack  string   `json:"current_attack"`
-	ErrorCount     int      `json:"error_count"`
-	LastUpdate     string   `json:"last_update"`
-	ResumeContext  string   `json:"resume_context,omitempty"` // auto-generated resume instructions for crash recovery
+	Phase          string              `json:"phase"`
+	ToolCallCount  int                 `json:"tool_call_count"`
+	FindingsCount  int                 `json:"findings_count"`
+	AttacksDone    []string            `json:"attacks_done"`
+	CurrentAttack  string              `json:"current_attack"`
+	ErrorCount     int                 `json:"error_count"`
+	LastUpdate     string              `json:"last_update"`
+	ResumeContext  string              `json:"resume_context,omitempty"`
+
+	// V2: Completed work items — persists across context switches so the agent
+	// knows which recon/attack tasks are done even after chain summarization
+	// strips the execution history.
+	CompletedTasks []CompletedTaskJSON `json:"completed_tasks,omitempty"`
+
+	// V2: Loop detector alert count — persists escalation level across context
+	// switches. If the agent was already warned 2x about looping, the 3rd
+	// warning after resume will be CRITICAL, not informational.
+	LoopAlertCount int `json:"loop_alert_count,omitempty"`
 }
 
 // MarshalJSON serializes the execution state to JSON.
@@ -51,9 +68,10 @@ func ParseExecutionState(data string) *ExecutionState {
 // NewExecutionState creates a fresh execution state for a new subtask run.
 func NewExecutionState() *ExecutionState {
 	return &ExecutionState{
-		Phase:       "init",
-		AttacksDone: make([]string, 0),
-		LastUpdate:  time.Now().UTC().Format(time.RFC3339),
+		Phase:          "init",
+		AttacksDone:    make([]string, 0),
+		CompletedTasks: make([]CompletedTaskJSON, 0),
+		LastUpdate:     time.Now().UTC().Format(time.RFC3339),
 	}
 }
 
@@ -73,8 +91,30 @@ func (es *ExecutionState) Update(metrics *ExecutionMetrics, phase string) {
 	}
 }
 
+// UpdateCompletedTasks syncs the completed work tracker's state into the
+// execution state for persistence. Call this after Update() and before ToJSON().
+func (es *ExecutionState) UpdateCompletedTasks(tracker *CompletedWorkTracker) {
+	if tracker == nil {
+		return
+	}
+	es.CompletedTasks = tracker.ToJSON()
+}
+
+// UpdateLoopAlertCount syncs the loop detector's alert count into the
+// execution state for persistence.
+func (es *ExecutionState) UpdateLoopAlertCount(detector *ReadLoopDetector) {
+	if detector == nil {
+		return
+	}
+	_, alerts := detector.GetStats()
+	es.LoopAlertCount = alerts
+}
+
 // BuildResumeInjectionMessage creates a human-role message that tells the LLM
 // exactly what has already been done, preventing it from re-running completed work.
+//
+// V2 enhancement: includes the completed work items list so the agent knows
+// exactly which recon/attack tasks are already done and where their results are.
 func (es *ExecutionState) BuildResumeInjectionMessage() string {
 	var sb strings.Builder
 	sb.WriteString("[EXECUTION RESUME — READ CAREFULLY]\n\n")
@@ -91,12 +131,36 @@ func (es *ExecutionState) BuildResumeInjectionMessage() string {
 		sb.WriteString(fmt.Sprintf("  Last tool used: %s\n", es.CurrentAttack))
 	}
 
+	// V2: Include completed work items
+	if len(es.CompletedTasks) > 0 {
+		sb.WriteString("\n## COMPLETED WORK ITEMS (DO NOT RE-RUN):\n")
+		for _, task := range es.CompletedTasks {
+			sb.WriteString(fmt.Sprintf("  ✅ %s — completed at %s", task.Description, task.CompletedAt))
+			if task.ResultCount > 0 {
+				sb.WriteString(fmt.Sprintf(" (%d results)", task.ResultCount))
+			}
+			if task.OutputFile != "" {
+				sb.WriteString(fmt.Sprintf(" → saved to %s", task.OutputFile))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
 	sb.WriteString("\n⚠️ CRITICAL INSTRUCTIONS:\n")
 	sb.WriteString("1. DO NOT re-run nmap, nuclei, subfinder, or any reconnaissance tool that was already executed\n")
 	sb.WriteString("2. DO NOT re-read STATE.json, FINDINGS.md, or HANDOFF.md — their content was already processed\n")
 	sb.WriteString("3. DO NOT re-install tools (jq, curl, nuclei, etc.) — they are already installed\n")
 	sb.WriteString("4. CONTINUE from where you left off — proceed to the next UNFINISHED phase\n")
 	sb.WriteString("5. If you completed reconnaissance, move to exploitation immediately\n")
+
+	// V2: If loop alerts were generated before the context switch, warn more aggressively
+	if es.LoopAlertCount > 0 {
+		sb.WriteString(fmt.Sprintf(
+			"\n🔴 LOOP WARNING: Before the interruption, you were detected looping %d time(s). "+
+				"Do NOT fall back into the same pattern. Take DIRECT ACTION — do not re-read files.\n",
+			es.LoopAlertCount,
+		))
+	}
 
 	if es.ResumeContext != "" {
 		sb.WriteString("\n--- Detailed Resume Context ---\n")

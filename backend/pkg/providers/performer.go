@@ -212,6 +212,11 @@ func (fp *flowProvider) performAgentChain(
 		// has access to previously extracted data — even after chain summarization
 		// strips the literal values from tool results.
 		knownData = newKnownDataTracker()
+
+		// v5 fixes: amnesia prevention + semantic dedup + subtask time-boxing
+		completedWork = NewCompletedWorkTracker()
+		loopDetector  = NewDefaultReadLoopDetector()
+		fileReadCache = NewFileReadCache()
 	)
 
 	// Silence unused variable warnings for guard booleans (set inside loop).
@@ -311,6 +316,13 @@ func (fp *flowProvider) performAgentChain(
 					"resumed_phase":      loaded.Phase,
 					"resumed_errors":     loaded.ErrorCount,
 				}).Info("resumed execution state from DB")
+
+				// v5: Restore completed work items from persisted state
+				if len(loaded.CompletedTasks) > 0 {
+					completedWork.RestoreFromState(loaded.CompletedTasks)
+					logger.WithField("restored_completed_tasks", len(loaded.CompletedTasks)).
+						Info("restored completed work items from persisted state")
+				}
 			}
 		}
 	}
@@ -340,6 +352,25 @@ func (fp *flowProvider) performAgentChain(
 	}
 	defer timeoutCancel()
 
+	// v5: Per-subtask-type time-boxing — override generic timeout with
+	// category-specific budget (recon=30min, exploit=25min, generic=20min).
+	var timebox *SubtaskTimebox
+	if depth == 0 && ShouldUseTimebox() {
+		if meta := GetSubtaskMeta(ctx); meta != nil {
+			timebox = NewSubtaskTimebox(meta.Title, meta.Description)
+			logger.WithFields(logrus.Fields{
+				"timebox_category":     timebox.Category.String(),
+				"timebox_max_duration": timebox.MaxDuration.String(),
+			}).Info("created subtask timebox")
+
+			// If the timebox is shorter than generic timeout, tighten the deadline.
+			if timebox.MaxDuration < getSubtaskMaxDuration() {
+				timeoutCancel() // cancel the generic timeout
+				ctx, timeoutCancel = context.WithTimeout(ctx, timebox.MaxDuration)
+			}
+		}
+	}
+
 	timeWarningInjected := false
 
 	// FIX: Create a per-chain delegation block tracker so that handlers can
@@ -363,6 +394,34 @@ func (fp *flowProvider) performAgentChain(
 
 	for {
 		if err := ctx.Err(); err != nil {
+			// v5: If timebox is active and this is a deadline expiry (not user cancel),
+			// perform graceful force-finish instead of returning a hard error.
+			if timebox != nil && errors.Is(err, context.DeadlineExceeded) {
+				partialResult := timebox.BuildForceFinishResult(toolCallCount, execState)
+
+				// Save partial results to DB so findings aren't lost.
+				if subtaskID != nil {
+					bgCtx, bgCancel := context.WithTimeout(context.Background(), 10*time.Second)
+					if _, dbErr := fp.db.UpdateSubtaskResult(bgCtx, database.UpdateSubtaskResultParams{
+						Result: partialResult,
+						ID:     *subtaskID,
+					}); dbErr != nil {
+						logger.WithError(dbErr).Error("failed to save timebox force-finish result")
+					}
+					bgCancel()
+				}
+
+				logger.WithFields(logrus.Fields{
+					"timebox_category": timebox.Category.String(),
+					"timebox_elapsed":  timebox.Elapsed().Round(time.Second).String(),
+					"tool_call_count":  toolCallCount,
+				}).Warn("subtask time-boxed: force-finishing with partial results")
+
+				// Return nil (success) so controller treats it as Finished
+				// and advances to the next subtask.
+				return nil
+			}
+
 			logger.WithError(err).Warn("context cancelled/timed out in agent chain loop")
 			return fmt.Errorf("agent chain loop terminated: %w", err)
 		}
@@ -470,6 +529,25 @@ func (fp *flowProvider) performAgentChain(
 			if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
 				logger.WithError(err).Error("failed to update msg chain after repair")
 				return err
+			}
+		}
+
+		// v5: Per-subtask-type timebox warning injection (fires EARLIER than generic).
+		if timebox != nil {
+			if warningMsg := timebox.CheckWarning(); warningMsg != "" {
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: warningMsg},
+					},
+				})
+				if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+					logger.WithError(err).Error("failed to update msg chain after timebox warning")
+				}
+				logger.WithFields(logrus.Fields{
+					"timebox_category":  timebox.Category.String(),
+					"timebox_remaining": timebox.Remaining().Round(time.Second).String(),
+				}).Warn("injected timebox warning into agent chain")
 			}
 		}
 
@@ -633,7 +711,51 @@ func (fp *flowProvider) performAgentChain(
 			metrics.AddCommand(funcName)
 			metrics.LastToolName = funcName
 
-			response, err := fp.execToolCall(ctx, chainID, idx, result, detector, executor, nTracker, terminalCache, knownData)
+			// v5: Pre-execution checks — completed work re-run + file read cache.
+			var v5Intercepted bool
+			var v5Response string
+
+			// Check completed work tracker for semantic re-runs.
+			if completedWork != nil && toolCall.FunctionCall != nil {
+				if isReRun, msg := completedWork.CheckReRun(funcName, toolCall.FunctionCall.Arguments); isReRun {
+					logger.WithField("rerun_msg", msg).Warn("completed work tracker blocked re-run")
+					v5Intercepted = true
+					v5Response = msg
+				}
+			}
+
+			// Check semantic file-read cache (catches command variations on same file).
+			if !v5Intercepted && fileReadCache != nil && funcName == "terminal" {
+				var termArgs map[string]interface{}
+				if err := json.Unmarshal(json.RawMessage(toolCall.FunctionCall.Arguments), &termArgs); err == nil {
+					if input, ok := termArgs["input"].(string); ok {
+						if cached, hit := fileReadCache.CheckFileRead(input); hit {
+							logger.WithField("file_cache_hit", true).
+								Info("semantic file-read cache hit")
+							v5Intercepted = true
+							v5Response = cached
+						}
+					}
+				}
+			}
+
+			var response string
+			var err error
+			if v5Intercepted {
+				response = v5Response
+			} else {
+				response, err = fp.execToolCall(ctx, chainID, idx, result, detector, executor, nTracker, terminalCache, knownData)
+			}
+
+			// v5: Store file read results in semantic cache after successful execution.
+			if !v5Intercepted && err == nil && fileReadCache != nil && funcName == "terminal" {
+				var termArgs map[string]interface{}
+				if jsonErr := json.Unmarshal(json.RawMessage(toolCall.FunctionCall.Arguments), &termArgs); jsonErr == nil {
+					if input, ok := termArgs["input"].(string); ok {
+						fileReadCache.StoreFileRead(input, response)
+					}
+				}
+			}
 
 			// Track repeated tool calls detected by the repeating detector
 			isRepeating := strings.HasPrefix(response, "tool call '") && strings.HasSuffix(response, "' is repeating, please try another tool")
@@ -777,6 +899,18 @@ func (fp *flowProvider) performAgentChain(
 			// Sprint 2 wiring: Record tool call for category tracking and P0 coverage.
 			categoryTracker.RecordToolCall(funcName, toolCall.FunctionCall.Arguments)
 
+			// v5: Record execution in completed work tracker and loop detector.
+			if completedWork != nil {
+				completedWork.RecordExecution(funcName, toolCall.FunctionCall.Arguments, response, false)
+			}
+			if loopDetector != nil {
+				loopDetector.Record(funcName, toolCall.FunctionCall.Arguments)
+			}
+			// v5: Record file writes to invalidate semantic read cache.
+			if fileReadCache != nil && funcName == "terminal" {
+				fileReadCache.RecordFileWrite(toolCall.FunctionCall.Arguments)
+			}
+
 			if executor.IsBarrierFunction(funcName) {
 				wantToStop = true
 			}
@@ -785,6 +919,26 @@ func (fp *flowProvider) performAgentChain(
 		toolCallCount += len(result.funcCalls)
 		metrics.ToolCallCount = toolCallCount
 
+		// v5: Read loop detection — check for cyclic read patterns after each batch.
+		if loopDetector != nil {
+			if alert := loopDetector.Check(); alert != nil {
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: alert.Message},
+					},
+				})
+				if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+					logger.WithError(err).Error("failed to update msg chain after loop alert")
+				}
+				logger.WithFields(logrus.Fields{
+					"cycle_length": alert.CycleLength,
+					"repeat_count": alert.RepeatCount,
+					"total_alerts": alert.TotalAlerts,
+				}).Warn("injected loop detection alert into agent chain")
+			}
+		}
+
 		// Persist execution state to DB asynchronously after each tool call batch.
 		if subtaskID != nil {
 			phase := "executing"
@@ -792,6 +946,10 @@ func (fp *flowProvider) performAgentChain(
 				phase = "finishing"
 			}
 			execState.Update(metrics, phase)
+
+			// v5: Sync completed work and loop detector state before serialization.
+			execState.UpdateCompletedTasks(completedWork)
+			execState.UpdateLoopAlertCount(loopDetector)
 
 			// Every 10 tool calls, generate and persist resume context so that
 			// if the subtask times out and resumes, the agent has a summary of
