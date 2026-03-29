@@ -13,7 +13,7 @@ import (
 const (
 	fallbackVectorStoreThreshold   = 0.2
 	fallbackVectorStoreResultLimit = 10
-	fallbackNotFoundMessage        = "Graphiti is temporarily unavailable. No relevant results found via fallback vector search."
+	fallbackNotFoundMessage        = "Graphiti knowledge graph is unavailable and no relevant results found via fallback search. Do NOT retry — proceed with your task using other available tools."
 )
 
 // FallbackSearcher performs semantic search directly against pgvector

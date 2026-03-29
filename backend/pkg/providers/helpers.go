@@ -54,7 +54,7 @@ func newRepeatingDetector() *repeatingDetector {
 	return &repeatingDetector{
 		threshold:      RepeatingToolCallThreshold,
 		readCounts:     make(map[string]int),
-		maxGlobalReads: 30,
+		maxGlobalReads: 40,
 	}
 }
 
@@ -172,70 +172,171 @@ func isTerminalWriteCommand(args string) bool {
 	return false
 }
 
-// isReadOnlyCall returns true for tool calls that only read data (file reads,
-// cat commands, state checks). These should never be blocked by repeat detection
-// because agents need to re-read shared state files (HANDOFF.md, STATE.json,
-// FINDINGS.md) at the start of each subtask.
+// isReadOnlyCall returns true ONLY when the PRIMARY command (first command before
+// any pipe) is a file-read operation. Commands that use read-like tools (grep, jq,
+// awk) for output processing of non-file-read primary commands (curl, nmap, nuclei)
+// are NOT reads.
+//
+// Examples:
+//   - `curl ... | grep token` → primary is `curl` → NOT a read
+//   - `cat /work/STATE.json | jq .` → primary is `cat` → IS a read
+//   - `nmap -sV target | tee evidence.txt` → primary is `nmap` → NOT a read
 //
 // IMPORTANT: Commands that contain read-like patterns (cat, head, jq) but actually
 // WRITE to files (via redirects, heredocs, tee) must NOT be classified as reads.
-// Otherwise the read cap incorrectly blocks write operations.
 func (rd *repeatingDetector) isReadOnlyCall(fc llms.FunctionCall) bool {
 	// file tool with read_file action
 	if fc.Name == "file" {
-		if strings.Contains(fc.Arguments, `"read_file"`) {
-			return true
+		return strings.Contains(fc.Arguments, `"read_file"`)
+	}
+
+	// Only analyse terminal tool commands
+	if fc.Name != "terminal" {
+		return false
+	}
+
+	// First check: if the command is a write operation, it's NOT a read.
+	if isTerminalWriteCommand(fc.Arguments) {
+		return false
+	}
+
+	var termArgs map[string]interface{}
+	if err := json.Unmarshal([]byte(fc.Arguments), &termArgs); err != nil {
+		return false // Can't parse → don't classify as read (safe default)
+	}
+	input, ok := termArgs["input"].(string)
+	if !ok || input == "" {
+		return false
+	}
+
+	// Extract the PRIMARY command (first command before any pipe/&&/;).
+	primaryCmd := extractPrimaryCommand(input)
+
+	// If the primary command is a known offensive/network tool, NOT a read.
+	if isOffensiveCommand(primaryCmd) {
+		return false
+	}
+
+	// Check if the primary command is a read-only command
+	return isReadCommand(primaryCmd)
+}
+
+// extractPrimaryCommand returns the first command in a pipeline, stripped of
+// leading whitespace and environment variable assignments. For compound commands
+// (&&, ||, ;), returns the first segment.
+func extractPrimaryCommand(input string) string {
+	// Split on pipe first, but not || (logical OR)
+	segment := input
+	for i := 0; i < len(input); i++ {
+		if input[i] == '|' {
+			if i+1 < len(input) && input[i+1] == '|' {
+				// This is ||, split here
+				segment = input[:i]
+				break
+			}
+			// This is a single pipe
+			segment = input[:i]
+			break
 		}
 	}
-	// terminal tool running read commands
-	if fc.Name == "terminal" {
-		// First check: if the command is a write operation, it's NOT a read.
-		if isTerminalWriteCommand(fc.Arguments) {
-			return false
-		}
 
-		var termArgs map[string]interface{}
-		if err := json.Unmarshal([]byte(fc.Arguments), &termArgs); err != nil {
-			// Fallback to old string matching if JSON parse fails
-			args := fc.Arguments
-			for _, pattern := range []string{
-				`"cat `, `"head `, `"tail `, `"jq `, `"cat /work/`,
-				`"ls `, `"wc `, `"grep `, `"find `,
-			} {
-				if strings.Contains(args, pattern) {
-					return true
-				}
+	// Split on && and ;
+	for _, sep := range []string{"&&", ";"} {
+		if idx := strings.Index(segment, sep); idx > 0 {
+			segment = segment[:idx]
+		}
+	}
+
+	return strings.TrimSpace(segment)
+}
+
+// offensiveCommands are tools whose primary purpose is network interaction,
+// scanning, or exploitation. These should NEVER be classified as "reads"
+// even when their pipelines include grep/jq/awk for output processing.
+var offensiveCommands = map[string]bool{
+	"curl": true, "wget": true, "http": true, "https": true,
+	"nmap": true, "nuclei": true, "subfinder": true, "httpx": true, "ffuf": true,
+	"gobuster": true, "dirb": true, "nikto": true, "sqlmap": true, "wfuzz": true,
+	"amass": true, "masscan": true, "rustscan": true, "feroxbuster": true,
+	"hydra": true, "john": true, "hashcat": true, "medusa": true,
+	"msfconsole": true, "msfvenom": true,
+	"testssl.sh": true, "sslscan": true, "sslyze": true,
+	"dig": true, "nslookup": true, "host": true, "whois": true,
+	"nc": true, "ncat": true, "netcat": true, "socat": true,
+	"openssl": true, "ssh": true, "scp": true,
+	"python3": true, "python": true, "ruby": true, "perl": true,
+	"echo": true, "printf": true,
+}
+
+// isOffensiveCommand checks if the primary command segment starts with a known
+// offensive/network tool. Skips VAR=value env-var prefixes.
+//
+// Special case: python3/python/perl are offensive by default, but if the command
+// contains open() on a tracked state file, it's a file read, not offensive.
+func isOffensiveCommand(primaryCmd string) bool {
+	words := strings.Fields(primaryCmd)
+	for _, word := range words {
+		// Skip VAR=value prefixes (e.g., TOKEN=xxx curl ...)
+		if strings.Contains(word, "=") && !strings.HasPrefix(word, "-") {
+			continue
+		}
+		cmd := filepath.Base(word) // handle /usr/bin/curl → curl
+
+		// Special: python3/python/perl are offensive UNLESS they open() tracked files
+		if cmd == "python3" || cmd == "python" || cmd == "perl" {
+			if containsTrackedFileOpen(primaryCmd) {
+				return false // It's a file read disguised as a script
 			}
+			return true // Offensive (payload generation, exploitation, etc.)
+		}
+
+		return offensiveCommands[cmd]
+	}
+	return false
+}
+
+// readCommands are tools whose primary purpose is reading file contents.
+var readCommands = map[string]bool{
+	"cat": true, "head": true, "tail": true, "less": true, "more": true,
+	"jq": true, "grep": true, "awk": true, "sed": true,
+	"wc": true, "ls": true, "find": true, "file": true, "stat": true,
+	"strings": true, "xxd": true, "hexdump": true,
+}
+
+// isReadCommand checks if the primary command segment starts with a known
+// read-only tool. Handles VAR=value prefixes and special cases (sed -i).
+func isReadCommand(primaryCmd string) bool {
+	words := strings.Fields(primaryCmd)
+	for _, word := range words {
+		// Skip VAR=value prefixes
+		if strings.Contains(word, "=") && !strings.HasPrefix(word, "-") {
+			continue
+		}
+		cmd := filepath.Base(word)
+
+		// Special: python3/python/perl in offensiveCommands take precedence,
+		// but if the command contains open() on a tracked file, it's a read.
+		if cmd == "python3" || cmd == "python" || cmd == "perl" {
+			return containsTrackedFileOpen(primaryCmd)
+		}
+
+		// sed with -i is a write, not a read
+		if cmd == "sed" && strings.Contains(primaryCmd, " -i") {
 			return false
 		}
-		input, ok := termArgs["input"].(string)
-		if !ok || input == "" {
-			return false
-		}
 
-		// Comprehensive read-command detection including patterns that
-		// previously bypassed the cap (sed, awk, python3 file reads).
-		inputLower := strings.ToLower(input)
+		return readCommands[cmd]
+	}
+	return false
+}
 
-		// sed with -i flag is a WRITE, not a read — exclude it
-		if strings.Contains(inputLower, "sed ") && !strings.Contains(inputLower, "sed -i") {
-			return true
-		}
-
-		readPatterns := []string{
-			"cat ", "head ", "tail ", "less ", "more ",
-			"awk ", "grep ", "jq ", "wc ", "ls ", "find ",
-			"file ", "stat ", "strings ", "xxd ", "hexdump ",
-			"python3 -c", "python -c", "perl -e",
-		}
-		for _, pattern := range readPatterns {
-			if strings.Contains(inputLower, pattern) {
-				return true
-			}
-		}
-
-		// Shell read patterns: $(<file), $(cat file)
-		if strings.Contains(input, "$(cat ") || strings.Contains(input, "$(<") {
+// containsTrackedFileOpen checks if a python/perl command opens a tracked state file.
+func containsTrackedFileOpen(cmd string) bool {
+	cmdLower := strings.ToLower(cmd)
+	for _, tracked := range []string{
+		"state.json", "findings.md", "handoff.md", "resume.md", "report.md",
+	} {
+		if strings.Contains(cmdLower, tracked) && strings.Contains(cmdLower, "open(") {
 			return true
 		}
 	}
@@ -267,11 +368,18 @@ var readOnlyCmdPatterns = []*regexp.Regexp{
 // but without a cap they can read the same file 20+ times in infinite loops.
 //
 // Returns (blocked, message):
-//   - ≤1 read:   (false, "")         — free, initial bootstrap read
-//   - 2-3 reads: (false, "⚠️ ...")   — warning prepended to tool result
-//   - >3 reads:  (true, "BLOCKED...") — synthetic response, tool NOT executed
+//   - ≤2 reads:  (false, "")         — free reads (initial + verify-after-write)
+//   - 3-4 reads: (false, "⚠️ ...")   — warning prepended to tool result
+//   - >4 reads:  (true, "BLOCKED...") — synthetic response, tool NOT executed
 func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, string) {
 	if !rd.isReadOnlyCall(funcCall) {
+		return false, ""
+	}
+
+	// Exempt evidence files — agents legitimately read these during report compilation.
+	// Check BEFORE incrementing global counter so evidence reads are truly free.
+	filePath := extractReadFilePath(funcCall)
+	if filePath != "" && isEvidencePath(filePath) {
 		return false, ""
 	}
 
@@ -286,7 +394,6 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 		)
 	}
 
-	filePath := extractReadFilePath(funcCall)
 	if filePath == "" {
 		return false, ""
 	}
@@ -294,7 +401,7 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 	// Normalize to base name so /work/STATE.json and STATE.json count together.
 	key := filepath.Base(filePath)
 
-	// After 5 total blocks: hard-block ALL reads, even first reads of new files.
+	// After 6 total blocks: hard-block ALL reads, even first reads of new files.
 	if rd.allReadsBlocked {
 		rd.totalBlocks++
 		return true, fmt.Sprintf(
@@ -313,9 +420,11 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 	count := rd.readCounts[key]
 
 	switch {
-	case count <= 1:
+	case count <= 2:
+		// Free reads: initial bootstrap + verify-after-write (was: 1, now: 2)
 		return false, ""
-	case count <= 3:
+	case count <= 4:
+		// Warning zone (was: 3, now: 4)
 		return false, fmt.Sprintf(
 			"⚠️ WARNING: You've read '%s' %d times. The content has NOT changed since your first read. "+
 				"STOP reading this file. Instead, you MUST now:\n"+
@@ -329,8 +438,8 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 		// Per-file block — also escalate totalBlocks
 		rd.totalBlocks++
 
-		// After 5 total blocks: engage hard block for ALL future reads
-		if rd.totalBlocks >= 5 {
+		// After 6 total blocks: engage hard block for ALL future reads (was: 5, now: 6)
+		if rd.totalBlocks >= 6 {
 			rd.allReadsBlocked = true
 			return true, fmt.Sprintf(
 				"🛑 HARD BLOCK ENGAGED: Read of '%s' denied (read %d times). "+
@@ -342,8 +451,8 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 			)
 		}
 
-		// After 3 total blocks: critical escalation
-		if rd.totalBlocks >= 3 {
+		// After 4 total blocks: critical escalation (was: 3, now: 4)
+		if rd.totalBlocks >= 4 {
 			return true, fmt.Sprintf(
 				"🛑 CRITICAL: You have been blocked from reading files %d times. STOP ALL FILE READS IMMEDIATELY. "+
 					"Read of '%s' denied (read %d times). "+
@@ -354,7 +463,7 @@ func (rd *repeatingDetector) checkReadCap(funcCall llms.FunctionCall) (bool, str
 			)
 		}
 
-		// Standard block (totalBlocks 1-2)
+		// Standard block (totalBlocks 1-3)
 		return true, fmt.Sprintf(
 			"BLOCKED: Read of '%s' denied — already read %d times this subtask. "+
 				"The file content has not changed. Proceed with testing using the information you already have. "+
@@ -375,6 +484,10 @@ func (rd *repeatingDetector) resetReadCounts() {
 
 // extractReadFilePath extracts the file path from a read-only tool call.
 // Handles both "file" tool with read_file action and "terminal" tool with cat/head/tail.
+//
+// IMPORTANT: Only extracts paths from the PRIMARY command segment (before pipes).
+// Does NOT match tracked filenames that appear in URLs, write destinations, or
+// pipe targets. This prevents false-positive read counting on write/network commands.
 func extractReadFilePath(fc llms.FunctionCall) string {
 	switch fc.Name {
 	case "file":
@@ -398,9 +511,19 @@ func extractReadFilePath(fc llms.FunctionCall) string {
 		if !ok {
 			return ""
 		}
-		// Try each pattern to extract a file path
+
+		// CRITICAL: Only extract file paths from the PRIMARY command segment.
+		// Don't match filenames that appear in pipe targets, URLs, or write destinations.
+		primaryCmd := extractPrimaryCommand(input)
+
+		// If primary command is offensive, there's no file path to extract
+		if isOffensiveCommand(primaryCmd) {
+			return ""
+		}
+
+		// Try regex patterns on PRIMARY command only (not full pipeline)
 		for _, pattern := range readOnlyCmdPatterns {
-			matches := pattern.FindStringSubmatch(input)
+			matches := pattern.FindStringSubmatch(primaryCmd)
 			if len(matches) >= 2 {
 				candidate := matches[len(matches)-1]
 				if candidate != "" && !strings.HasPrefix(candidate, "-") {
@@ -408,17 +531,46 @@ func extractReadFilePath(fc llms.FunctionCall) string {
 				}
 			}
 		}
-		// Fallback: look for commonly tracked files in the command
-		inputLower := strings.ToLower(input)
-		for _, tracked := range []string{
-			"findings.md", "state.json", "handoff.md", "resume.md", "report.md",
-		} {
-			if strings.Contains(inputLower, tracked) {
-				return tracked
+
+		// Fallback: ONLY match tracked files when the primary command is a read command.
+		// This prevents matching tracked filenames in URLs or write targets.
+		if isReadCommand(primaryCmd) {
+			primaryLower := strings.ToLower(primaryCmd)
+			for _, tracked := range []string{
+				"findings.md", "state.json", "handoff.md", "resume.md", "report.md",
+			} {
+				if strings.Contains(primaryLower, tracked) {
+					return tracked
+				}
+			}
+
+			// Also track temp files that are commonly re-read (tokens, schemas,
+			// captured output). This extends read-cap coverage to /tmp/ files
+			// which were previously invisible to the cap — allowing agents to
+			// read /tmp/access_token.txt 20x without triggering any limit.
+			if strings.HasPrefix(strings.TrimSpace(primaryCmd), "cat ") {
+				parts := strings.Fields(primaryCmd)
+				if len(parts) >= 2 && strings.HasPrefix(parts[1], "/") {
+					candidate := parts[1]
+					// Strip shell operators/redirections that may be appended
+					candidate = strings.TrimRight(candidate, ";|&")
+					if candidate != "" {
+						return candidate
+					}
+				}
 			}
 		}
 	}
 	return ""
+}
+
+// isEvidencePath returns true for file paths under the evidence directory.
+// Evidence files should never count against the read cap — agents legitimately
+// read these during report compilation.
+func isEvidencePath(path string) bool {
+	normalized := strings.ToLower(path)
+	return strings.Contains(normalized, "/evidence/") ||
+		strings.HasPrefix(normalized, "evidence/")
 }
 
 func (rd *repeatingDetector) clearCallArguments(toolCall *llms.FunctionCall) llms.FunctionCall {

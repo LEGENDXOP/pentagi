@@ -31,6 +31,13 @@ type graphitiFallbackSearcher interface {
 	FallbackSearch(ctx context.Context, query string, groupID string) (string, error)
 }
 
+// graphitiAvailabilityProvider is an optional interface for flow-level availability tracking.
+// Clients that embed a GraphitiAvailability tracker (e.g., *graphiti.Client) implement this.
+// Used to fast-fail graphiti searches without network calls when the service is known to be down.
+type graphitiAvailabilityProvider interface {
+	GetAvailability() *graphiti.GraphitiAvailability
+}
+
 
 const (
 	// Default values for search parameters
@@ -46,6 +53,16 @@ const (
 	DefaultMinMentions    = 2
 	DefaultDiversityLevel = "medium"
 	DefaultRecencyWindow  = "24h"
+
+	// graphitiUnavailableMessage is returned when the flow-level availability
+	// tracker has determined that graphiti is unreachable. The wording is
+	// deliberately imperative ("PERMANENT", "do NOT retry") because the old
+	// "try again later" message caused LLMs to obediently cycle through all
+	// 7 search types, wasting 37+ minutes per flow.
+	graphitiUnavailableMessage = `Graphiti knowledge graph is UNREACHABLE (vector DB service is down).
+This is a PERMANENT condition for this flow — do NOT retry graphiti searches.
+Proceed with your task using other available tools and information.
+No historical context from the knowledge graph is available.`
 )
 
 var (
@@ -99,6 +116,15 @@ func (t *GraphitiSearchTool) IsAvailable() bool {
 func (t *GraphitiSearchTool) Handle(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	if !t.IsAvailable() {
 		return "Graphiti knowledge graph is not enabled. No historical context or memory data is available for this search.", nil
+	}
+
+	// FAST-FAIL: Check flow-level availability BEFORE any work.
+	// This prevents the LLM from cycling through all 7 search types when
+	// graphiti is known to be unreachable, saving ~35 minutes per flow.
+	if ap, ok := t.graphitiClient.(graphitiAvailabilityProvider); ok {
+		if ga := ap.GetAvailability(); ga != nil && !ga.IsAvailable() {
+			return graphitiUnavailableMessage, nil
+		}
 	}
 
 	logger := logrus.WithContext(ctx).WithFields(enrichLogrusFields(t.flowID, t.taskID, t.subtaskID, logrus.Fields{
@@ -170,26 +196,69 @@ func (t *GraphitiSearchTool) Handle(ctx context.Context, name string, args json.
 		err = fmt.Errorf("unknown search_type: %s", searchArgs.SearchType)
 	}
 
+	// Helper: record failure in the flow-level availability tracker.
+	// This is separate from the circuit breaker — it tracks tool-level failures
+	// and disables graphiti for the entire flow after the threshold is reached.
+	recordAvailabilityFailure := func() {
+		if ap, ok := t.graphitiClient.(graphitiAvailabilityProvider); ok {
+			if ga := ap.GetAvailability(); ga != nil {
+				ga.RecordFailure()
+			}
+		}
+	}
+
 	if err != nil {
 		// Check if this is a circuit breaker open error — attempt fallback
 		if coe, ok := graphiti.IsCircuitOpenError(err); ok {
+			// Record failure in flow-level availability tracker
+			recordAvailabilityFailure()
+
 			logger.WithField("circuit_state", "OPEN").
 				Warn("graphiti circuit breaker is open, attempting pgvector fallback")
 			if fb, ok := t.graphitiClient.(graphitiFallbackSearcher); ok {
 				fallbackResult, fbErr := fb.FallbackSearch(ctx, coe.Query, coe.GroupID)
 				if fbErr != nil {
 					logger.WithError(fbErr).Error("pgvector fallback search also failed")
-					return "", fmt.Errorf("graphiti unavailable and fallback failed: %w", fbErr)
+					// Return definitive unavailable message instead of error —
+					// returning an error would cause the agent to retry.
+					return graphitiUnavailableMessage, nil
 				}
 				return fallbackResult, nil
 			}
-			// No fallback searcher available — return a helpful message instead of error
-			return "Graphiti knowledge graph is temporarily unavailable (circuit breaker open). Please try again later.", nil
+			// No fallback searcher available — return definitive message.
+			// Old message said "try again later" which caused 50+ retries.
+			return graphitiUnavailableMessage, nil
+		}
+
+		// Non-circuit-breaker error (connection refused, timeout, etc.)
+		// Also record in availability tracker — these are the errors that
+		// indicate the service is truly unreachable.
+		recordAvailabilityFailure()
+
+		// If availability tracker just tripped, return the definitive message
+		// instead of the raw error to prevent further retries.
+		if ap, ok := t.graphitiClient.(graphitiAvailabilityProvider); ok {
+			if ga := ap.GetAvailability(); ga != nil && ga.IsDisabled() {
+				logger.WithError(err).Warn("graphiti availability tracker tripped — fast-failing")
+				return graphitiUnavailableMessage, nil
+			}
 		}
 
 		logger.WithError(err).Errorf("failed to perform graphiti search '%s'", searchArgs.SearchType)
 		return "", err
 	}
+
+	// Record success — re-enables availability if it was in half-open probe mode
+	if ap, ok := t.graphitiClient.(graphitiAvailabilityProvider); ok {
+		if ga := ap.GetAvailability(); ga != nil {
+			ga.RecordSuccess()
+		}
+	}
+
+	// Cache the result for dedup within the same subtask
+	t.cacheMu.Lock()
+	t.queryCache[cacheKey] = result
+	t.cacheMu.Unlock()
 
 	return result, nil
 }

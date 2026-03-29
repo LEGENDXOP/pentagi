@@ -552,6 +552,22 @@ func (fp *flowProvider) GetMemoristHandler(ctx context.Context, taskID, subtaskI
 	}
 
 	memoristHandler := func(ctx context.Context, action tools.MemoristAction) (string, error) {
+		// FAST-FAIL: If graphiti is known to be down for this flow, skip the
+		// entire memorist agent chain. Each memorist invocation spawns a nested
+		// agent (template rendering → LLM call → 7 search attempts), wasting
+		// 30-60 seconds even when every search will immediately fail.
+		if fp.graphitiClient != nil {
+			if ga := fp.graphitiClient.GetAvailability(); ga != nil && ga.IsDisabled() {
+				logrus.WithContext(ctx).WithFields(logrus.Fields{
+					"component": "memorist_handler",
+					"flow_id":   fp.flowID,
+				}).Info("memorist fast-fail: graphiti is unreachable, skipping agent chain")
+				return "Memory/knowledge graph service is currently unavailable. " +
+					"Proceeding without historical context. " +
+					"This is a known condition — do NOT retry memorist calls.", nil
+			}
+		}
+
 		executionDetails := ""
 
 		var requestedTask *database.Task

@@ -47,6 +47,12 @@ type Client struct {
 	timeout  time.Duration
 	cb       *CircuitBreaker
 	fallback *FallbackSearcher
+
+	// availability is a flow-scoped tracker that fast-fails graphiti searches
+	// after repeated connection failures. Unlike the circuit breaker (which
+	// operates at the HTTP request level), this prevents the expensive memorist
+	// agent chain from even starting when graphiti is known to be unreachable.
+	availability *GraphitiAvailability
 }
 
 // NewClient creates a new Graphiti client wrapper
@@ -67,6 +73,11 @@ func NewClient(url string, timeout time.Duration, enabled bool) (*Client, error)
 		enabled: true,
 		timeout: timeout,
 		cb:      NewCircuitBreaker(DefaultCircuitBreakerConfig()),
+		// 2 consecutive failures → fast-fail; probe for recovery after 10 minutes.
+		// This is deliberately more aggressive than the circuit breaker (3 failures)
+		// because by the time we see 2 tool-level failures, the CB has already seen
+		// 3+ HTTP failures internally.
+		availability: NewGraphitiAvailability(2, 10*time.Minute),
 	}, nil
 }
 
@@ -84,10 +95,11 @@ func NewClientWithCircuitBreaker(url string, timeout time.Duration, enabled bool
 	}
 
 	return &Client{
-		client:  client,
-		enabled: true,
-		timeout: timeout,
-		cb:      NewCircuitBreaker(cbConfig),
+		client:       client,
+		enabled:      true,
+		timeout:      timeout,
+		cb:           NewCircuitBreaker(cbConfig),
+		availability: NewGraphitiAvailability(2, 10*time.Minute),
 	}, nil
 }
 
@@ -106,6 +118,15 @@ func (c *Client) GetCircuitBreaker() *CircuitBreaker {
 		return nil
 	}
 	return c.cb
+}
+
+// GetAvailability returns the flow-scoped availability tracker.
+// Returns nil if the client is nil or disabled (callers must nil-check).
+func (c *Client) GetAvailability() *GraphitiAvailability {
+	if c == nil {
+		return nil
+	}
+	return c.availability
 }
 
 // IsEnabled returns whether Graphiti integration is active
@@ -147,7 +168,8 @@ func (c *Client) recordFailure() {
 // This is exposed so callers (e.g., graphiti search tools) can invoke fallback logic directly.
 func (c *Client) FallbackSearch(ctx context.Context, query string, groupID string) (string, error) {
 	if c.fallback == nil {
-		return "Graphiti knowledge graph is temporarily unavailable (circuit breaker open). No fallback search configured.", nil
+		return "Graphiti knowledge graph is UNREACHABLE and no fallback search is configured. " +
+			"Do NOT retry — proceed with your task using other available tools.", nil
 	}
 	return c.fallback.Search(ctx, query, groupID, fallbackVectorStoreResultLimit)
 }

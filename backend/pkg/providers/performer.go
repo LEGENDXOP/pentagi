@@ -200,6 +200,18 @@ func (fp *flowProvider) performAgentChain(
 		halfwayAlertSent         bool
 		findingTracker           = NewFindingTracker()
 		categoryTracker          = NewCategoryTracker(int(getSubtaskMaxDuration().Minutes()))
+
+		// Intra-subtask terminal dedup: caches idempotent terminal command outputs
+		// (token reads, schema introspection, jq on stored files) to prevent the
+		// agent from re-executing identical commands 15-20x per subtask. The cache
+		// is scoped to this single performAgentChain invocation — new subtask = new cache.
+		terminalCache = NewTerminalOutputCache()
+
+		// Known data tracker: scans terminal outputs for JWT tokens, GraphQL endpoints,
+		// credentials, etc. and injects them into the system prompt so the LLM always
+		// has access to previously extracted data — even after chain summarization
+		// strips the literal values from tool results.
+		knownData = newKnownDataTracker()
 	)
 
 	// Silence unused variable warnings for guard booleans (set inside loop).
@@ -420,6 +432,14 @@ func (fp *flowProvider) performAgentChain(
 						}
 					}
 					updated := injectMetricsIntoSystemPrompt(text.Text, metrics.Snapshot(metricsStartTime), timeRemainingMinutes)
+
+					// Inject known extracted data into system prompt so the LLM
+					// always has access to JWT tokens, GraphQL endpoints, etc.
+					// even after chain summarization strips the literal values.
+					if knownDataBlock := knownData.FormatForInjection(); knownDataBlock != "" {
+						updated = injectKnownDataBlock(updated, knownDataBlock)
+					}
+
 					chain[0].Parts[0] = llms.TextContent{Text: updated}
 				}
 			}
@@ -613,7 +633,7 @@ func (fp *flowProvider) performAgentChain(
 			metrics.AddCommand(funcName)
 			metrics.LastToolName = funcName
 
-			response, err := fp.execToolCall(ctx, chainID, idx, result, detector, executor, nTracker)
+			response, err := fp.execToolCall(ctx, chainID, idx, result, detector, executor, nTracker, terminalCache, knownData)
 
 			// Track repeated tool calls detected by the repeating detector
 			isRepeating := strings.HasPrefix(response, "tool call '") && strings.HasSuffix(response, "' is repeating, please try another tool")
@@ -986,6 +1006,8 @@ func (fp *flowProvider) execToolCall(
 	detector *repeatingDetector,
 	executor tools.ContextToolsExecutor,
 	nTracker *nucleiTracker,
+	terminalCache *TerminalOutputCache,
+	knownData *knownDataTracker,
 ) (string, error) {
 	var (
 		streamID int64
@@ -1061,6 +1083,24 @@ func (fp *flowProvider) execToolCall(
 			if input, ok := termArgs["input"].(string); ok && isBrowserAutomationInstall(input) {
 				logger.WithField("blocked_cmd", input).Warn("blocked browser automation package install attempt")
 				return blockedBrowserInstallMessage, nil
+			}
+		}
+	}
+
+	// --- Terminal Output Cache: return cached result for idempotent commands ---
+	// Check BEFORE repeat detection and execution. If the command was already
+	// executed in this subtask and its output is cached, return the cached
+	// result immediately. This is the primary mechanism for preventing the
+	// 15-20x JWT token re-extraction and 4x GraphQL schema re-introspection.
+	if funcName == "terminal" && terminalCache != nil {
+		var termArgs map[string]interface{}
+		if err := json.Unmarshal(funcArgs, &termArgs); err == nil {
+			if input, ok := termArgs["input"].(string); ok {
+				if cached, hit := terminalCache.Check(input); hit {
+					logger.WithField("cache_hit", true).
+						Info("terminal command cache hit — returning cached output")
+					return cached, nil
+				}
 			}
 		}
 	}
@@ -1150,6 +1190,26 @@ func (fp *flowProvider) execToolCall(
 			}
 		} else {
 			break
+		}
+	}
+
+	// --- Post-execution: cache terminal output and extract known data ---
+	// Store the terminal command output in the cache for future dedup, and
+	// scan it for recognizable data patterns (JWT tokens, GraphQL endpoints)
+	// to inject into the system prompt.
+	if funcName == "terminal" && terminalCache != nil {
+		var termArgs map[string]interface{}
+		if err := json.Unmarshal(funcArgs, &termArgs); err == nil {
+			if input, ok := termArgs["input"].(string); ok {
+				// Cache the output for identical future commands.
+				terminalCache.Store(input, response)
+
+				// Extract known data patterns (tokens, endpoints, schemas)
+				// for system prompt injection.
+				if knownData != nil {
+					knownData.Extract(input, response)
+				}
+			}
 		}
 	}
 
