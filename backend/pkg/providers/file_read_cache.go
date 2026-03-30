@@ -433,7 +433,8 @@ func (fc *FileReadCache) StoreFileRead(command, output string) {
 		newHash := contentFingerprint(output)
 		if existing.contentHash == newHash {
 			existing.readAt = time.Now()
-			// Don't reset hitCount — preserve escalation state
+			existing.hitCount++
+			// v7: Increment hitCount so InterceptTerminalRead threshold is reached
 			return
 		}
 		// Content actually changed — reset the entry

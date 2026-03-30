@@ -3,6 +3,7 @@ package tools
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -178,6 +179,32 @@ func (n *nucleiTool) Handle(ctx context.Context, name string, args json.RawMessa
 	// Parse and format findings
 	findings := parseNucleiFindings(resultsOutput)
 	result := formatNucleiResults(target, action, findings)
+
+	// v7: Write findings to the work directory so the agent can find them if it
+	// tries to read from disk (common LLM behavior — it ignores inline results).
+	if len(findings) > 0 {
+		evidenceDir := docker.WorkFolderPathInContainer + "/evidence"
+		mkdirCmd := fmt.Sprintf("mkdir -p %s", evidenceDir)
+		mkCtx, mkCancel := context.WithTimeout(ctx, 10*time.Second)
+		n.execInContainer(mkCtx, containerName, mkdirCmd)
+		mkCancel()
+
+		// Write the formatted markdown for the agent's convenience
+		writeCmd := fmt.Sprintf("echo '%s' | base64 -d > %s/nuclei_results.md",
+			base64EncodeResult(result), evidenceDir)
+		writeCtx, writeCancel := context.WithTimeout(ctx, 15*time.Second)
+		_, writeErr := n.execInContainer(writeCtx, containerName, writeCmd)
+		writeCancel()
+		if writeErr != nil {
+			logger.WithError(writeErr).Debug("failed to write nuclei results to evidence dir (non-fatal)")
+		}
+
+		// Also copy the raw JSONL
+		copyCmd := fmt.Sprintf("cp %s %s/nuclei_results.jsonl 2>/dev/null || true", nucleiOutputPath, evidenceDir)
+		copyCtx, copyCancel := context.WithTimeout(ctx, 10*time.Second)
+		n.execInContainer(copyCtx, containerName, copyCmd)
+		copyCancel()
+	}
 
 	// Log results to terminal
 	formattedResult := FormatTerminalSystemOutput(result)
@@ -528,10 +555,17 @@ func mapNucleiTagToVulnType(tags []string, templateID string) string {
 	return "security_misconfiguration"
 }
 
+
+// base64EncodeResult encodes a string to base64 for safe shell transport.
+func base64EncodeResult(s string) string {
+	return base64.StdEncoding.EncodeToString([]byte(s))
+}
+
 // formatNucleiResults produces a human-readable markdown report from parsed findings
 func formatNucleiResults(target string, action NucleiScanAction, findings []nucleiFinding) string {
 	var sb strings.Builder
 
+	sb.WriteString("⚠️ ALL RESULTS ARE BELOW — do NOT try to read any file from disk. These results are COMPLETE and INLINE.\n\n")
 	sb.WriteString("# Nuclei Scan Results\n\n")
 	sb.WriteString(fmt.Sprintf("**Target:** `%s`\n", target))
 	if action.Tags != "" {

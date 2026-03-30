@@ -221,6 +221,12 @@ func (fp *flowProvider) performAgentChain(
 		completedWork = NewCompletedWorkTracker()
 		loopDetector  = NewDefaultReadLoopDetector()
 		fileReadCache = NewFileReadCache()
+
+		// v7: Bootstrap dedup — tracks whether initial setup commands have
+		// already been executed. After the first sequence of mkdir/which/install
+		// commands, subsequent bootstrap attempts get synthetic responses.
+		bootstrapCompleted = false
+		bootstrapCallCount = 0
 	)
 
 	// Silence unused variable warnings for guard booleans (set inside loop).
@@ -356,6 +362,11 @@ func (fp *flowProvider) performAgentChain(
 				// immediately trigger a write on the very first tool call batch.
 				stateThrottle.MarkWritten(loaded.ToolCallCount)
 				resumeThrottle.MarkWritten(loaded.ToolCallCount)
+
+				// v7: If resuming with >5 tool calls, bootstrap is definitely done
+				if loaded.ToolCallCount > 5 {
+					bootstrapCompleted = true
+				}
 			}
 		}
 	}
@@ -814,6 +825,31 @@ func (fp *flowProvider) performAgentChain(
 				}
 			}
 
+			// v7: Bootstrap dedup — intercept redundant setup commands after
+			// bootstrap is complete. The LLM ignores prompt instructions to not
+			// re-run bootstrap, so we intercept at the code level.
+			if !v5Intercepted && funcName == "terminal" {
+				var termArgs map[string]interface{}
+				if err := json.Unmarshal(json.RawMessage(toolCall.FunctionCall.Arguments), &termArgs); err == nil {
+					if input, ok := termArgs["input"].(string); ok {
+						if isBootstrapCommand(input) {
+							if bootstrapCompleted {
+								v5Intercepted = true
+								v5Response = "\u2705 Bootstrap already completed. All tools are installed and directories exist. " +
+									"Proceed directly to your next offensive action."
+								logger.WithField("blocked_bootstrap", input).
+									Info("v7 bootstrap dedup intercepted redundant setup command")
+							} else {
+								bootstrapCallCount++
+								if bootstrapCallCount >= 3 {
+									bootstrapCompleted = true
+								}
+							}
+						}
+					}
+				}
+			}
+
 			var response string
 			var err error
 			if v5Intercepted {
@@ -1075,9 +1111,36 @@ func (fp *flowProvider) performAgentChain(
 				// Async DB write — always happens (coalesced by AsyncStateWriter).
 				stateWriter.Write(*subtaskID, stateJSON)
 
-				// v6: Write STATE.json to container filesystem on throttle schedule.
-				// Was: every 5 tool calls. Now: every 20 calls or 3 min.
-				if toolCallCount > 0 && stateThrottle.ShouldWrite(toolCallCount) {
+				// v7: Batch STATE.json and RESUME.md writes into a single terminal call
+				// when both throttles fire simultaneously. Saves 1 tool call per co-fire.
+				wantWriteState := toolCallCount > 0 && stateThrottle.ShouldWrite(toolCallCount)
+				wantWriteResume := toolCallCount > 0 && resumeThrottle.ShouldWrite(toolCallCount) && execState.ResumeContext != ""
+
+				if wantWriteState && wantWriteResume {
+					// Both fire — combine into a single terminal command
+					combinedCmd := fmt.Sprintf(
+						"cat > /work/STATE.json << 'STATE_EOF'\n%s\nSTATE_EOF\ncat > /work/RESUME.md << 'RESUME_EOF'\n%s\nRESUME_EOF",
+						stateJSON, execState.ResumeContext,
+					)
+					writeArgs, _ := json.Marshal(map[string]interface{}{
+						"input":   combinedCmd,
+						"timeout": 8,
+					})
+					if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeArgs); writeErr != nil {
+						logger.WithError(writeErr).Debug("failed to batch-write STATE.json + RESUME.md (non-fatal)")
+					} else {
+						stateThrottle.MarkWritten(toolCallCount)
+						resumeThrottle.MarkWritten(toolCallCount)
+					}
+					if loopDetector != nil {
+						loopDetector.RecordSystemWrite("STATE.json")
+						loopDetector.RecordSystemWrite("RESUME.md")
+					}
+					if fileReadCache != nil {
+						fileReadCache.RecordSystemFileWrite("STATE.json")
+						fileReadCache.RecordSystemFileWrite("RESUME.md")
+					}
+				} else if wantWriteState {
 					writeStateArgs, _ := json.Marshal(map[string]interface{}{
 						"input":   fmt.Sprintf("cat > /work/STATE.json << 'STATE_EOF'\n%s\nSTATE_EOF", stateJSON),
 						"timeout": 5,
@@ -1087,18 +1150,13 @@ func (fp *flowProvider) performAgentChain(
 					} else {
 						stateThrottle.MarkWritten(toolCallCount)
 					}
-					// v6: Notify loop detector and file cache of system-generated writes
 					if loopDetector != nil {
 						loopDetector.RecordSystemWrite("STATE.json")
 					}
 					if fileReadCache != nil {
 						fileReadCache.RecordSystemFileWrite("STATE.json")
 					}
-				}
-
-				// v6: Write RESUME.md to container filesystem on throttle schedule.
-				// Was: every 10 tool calls. Now: every 30 calls or 3 min.
-				if toolCallCount > 0 && resumeThrottle.ShouldWrite(toolCallCount) && execState.ResumeContext != "" {
+				} else if wantWriteResume {
 					writeResumeArgs, _ := json.Marshal(map[string]interface{}{
 						"input":   fmt.Sprintf("cat > /work/RESUME.md << 'RESUME_EOF'\n%s\nRESUME_EOF", execState.ResumeContext),
 						"timeout": 5,
@@ -1108,7 +1166,6 @@ func (fp *flowProvider) performAgentChain(
 					} else {
 						resumeThrottle.MarkWritten(toolCallCount)
 					}
-					// v6: Notify loop detector and file cache of system-generated writes
 					if loopDetector != nil {
 						loopDetector.RecordSystemWrite("RESUME.md")
 					}
@@ -2247,4 +2304,61 @@ func (fp *flowProvider) storeToolExecutionToGraphiti(
 	storeEvaluator.End(
 		langfuse.WithEvaluatorStatus("success"),
 	)
+}
+
+// isBootstrapCommand returns true if the command is a typical bootstrap/setup
+// command that only needs to run once. Conservative: only matches patterns
+// that are definitively setup-only (not general-purpose use of the same commands).
+func isBootstrapCommand(command string) bool {
+	cmd := strings.TrimSpace(command)
+
+	// Exact patterns for common bootstrap commands
+	bootstrapPatterns := []string{
+		"mkdir -p /work/evidence",
+		"mkdir -p /work/results",
+		"mkdir -p /work/reports",
+		"which jq",
+		"which nuclei",
+		"which curl",
+		"which nmap",
+		"which jq nuclei curl",
+		"which jq curl nuclei",
+		"which nmap nuclei jq curl",
+	}
+
+	for _, pattern := range bootstrapPatterns {
+		if cmd == pattern || strings.HasPrefix(cmd, pattern+" ") {
+			return true
+		}
+	}
+
+	// Compound which commands: "which <tool1> <tool2> ..." with known tool names
+	if strings.HasPrefix(cmd, "which ") && !strings.Contains(cmd, "/") {
+		parts := strings.Fields(cmd)
+		if len(parts) >= 2 && len(parts) <= 8 {
+			allTools := true
+			knownTools := map[string]bool{
+				"jq": true, "nuclei": true, "curl": true, "nmap": true,
+				"wget": true, "python3": true, "pip": true, "git": true,
+				"subfinder": true, "httpx": true, "ffuf": true, "sqlmap": true,
+				"nikto": true, "dirb": true, "gobuster": true, "wfuzz": true,
+			}
+			for _, part := range parts[1:] {
+				if !knownTools[part] {
+					allTools = false
+					break
+				}
+			}
+			if allTools {
+				return true
+			}
+		}
+	}
+
+	// Simple mkdir for work subdirectories (no compound commands)
+	if strings.HasPrefix(cmd, "mkdir -p /work/") && !strings.Contains(cmd, "&&") {
+		return true
+	}
+
+	return false
 }
