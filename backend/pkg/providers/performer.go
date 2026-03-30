@@ -231,6 +231,11 @@ func (fp *flowProvider) performAgentChain(
 	stateWriter := NewAsyncStateWriter(fp.db)
 	defer stateWriter.Close()
 
+	// v6: Write throttles — must be created before state restore so we can
+	// fast-forward them for resumed subtasks.
+	stateThrottle := NewStateWriteThrottle()
+	resumeThrottle := NewResumeWriteThrottle()
+
 	fields := logrus.Fields{
 		"provider":     fp.Type(),
 		"agent":        optAgentType,
@@ -328,6 +333,16 @@ func (fp *flowProvider) performAgentChain(
 						Info("restored completed work items from persisted state")
 				}
 
+				// v6/V2: Restore tracked operations from persisted state
+				if loaded.TrackedOperations != nil {
+					var ops []TrackedOperationJSON
+					if err := json.Unmarshal(loaded.TrackedOperations, &ops); err == nil && len(ops) > 0 {
+						completedWork.RestoreOperationsFromState(ops)
+						logger.WithField("restored_operations", len(ops)).
+							Info("restored tracked operations from persisted state (V2)")
+					}
+				}
+
 				// v5: Restore loop detector alert count from persisted state
 				// so escalation level (info → warning → critical) continues
 				// from where it left off instead of resetting.
@@ -336,6 +351,11 @@ func (fp *flowProvider) performAgentChain(
 					logger.WithField("restored_loop_alerts", loaded.LoopAlertCount).
 						Info("restored loop detector alert count from persisted state")
 				}
+
+				// v6: Fast-forward write throttles so resumed agents don't
+				// immediately trigger a write on the very first tool call batch.
+				stateThrottle.MarkWritten(loaded.ToolCallCount)
+				resumeThrottle.MarkWritten(loaded.ToolCallCount)
 			}
 		}
 	}
@@ -731,27 +751,62 @@ func (fp *flowProvider) performAgentChain(
 			metrics.AddCommand(funcName)
 			metrics.LastToolName = funcName
 
-			// v5: Pre-execution checks — completed work re-run + file read cache.
+			// v5/v6: Pre-execution checks — completed work re-run + file read cache + loop block.
 			var v5Intercepted bool
 			var v5Response string
+			var v5Warning string
 
-			// Check completed work tracker for semantic re-runs.
-			if completedWork != nil && toolCall.FunctionCall != nil {
-				if isReRun, msg := completedWork.CheckReRun(funcName, toolCall.FunctionCall.Arguments); isReRun {
-					logger.WithField("rerun_msg", msg).Warn("completed work tracker blocked re-run")
-					v5Intercepted = true
-					v5Response = msg
+			// v6: Loop detector hard block — reject ALL read tool calls after 3+ alerts.
+			if !v5Intercepted && loopDetector != nil && loopDetector.ShouldBlock() {
+				if funcName == "terminal" {
+					var termArgs map[string]interface{}
+					if err := json.Unmarshal(json.RawMessage(toolCall.FunctionCall.Arguments), &termArgs); err == nil {
+						if input, ok := termArgs["input"].(string); ok {
+							if _, isRead := fileReadCache.extractReadPath(input); isRead {
+								v5Intercepted = true
+								v5Response = "🛑 LOOP DETECTOR HARD BLOCK: All file reads are blocked. " +
+									"You have been warned 3+ times about cycling through the same files. " +
+									"Execute an offensive action, write your findings, or call the result tool."
+								logger.Warn("loop detector hard block rejected read tool call")
+							}
+						}
+					}
+				} else if funcName == "file" {
+					var fileArgs map[string]interface{}
+					if err := json.Unmarshal(json.RawMessage(toolCall.FunctionCall.Arguments), &fileArgs); err == nil {
+						if action, ok := fileArgs["action"].(string); ok && action == "read_file" {
+							v5Intercepted = true
+							v5Response = "🛑 LOOP DETECTOR HARD BLOCK: All file reads are blocked. " +
+								"Execute an offensive action, write your findings, or call the result tool."
+							logger.Warn("loop detector hard block rejected file read tool call")
+						}
+					}
 				}
 			}
 
-			// Check semantic file-read cache (catches command variations on same file).
+			// v6/V2: CheckReRun now returns warnings (isReRun=false, msg!="") AND blocks (isReRun=true).
+			if !v5Intercepted && completedWork != nil && toolCall.FunctionCall != nil {
+				if isReRun, msg := completedWork.CheckReRun(funcName, toolCall.FunctionCall.Arguments); isReRun {
+					// Hard block — don't execute
+					logger.WithField("rerun_msg", msg).Warn("completed work tracker V2 blocked re-run")
+					v5Intercepted = true
+					v5Response = msg
+				} else if msg != "" {
+					// Warning — execute but prepend warning to result
+					logger.WithField("rerun_warning", msg).Info("completed work tracker V2 issued duplicate warning")
+					v5Warning = msg
+				}
+			}
+
+			// v6: Use InterceptTerminalRead for escalating interception.
+			// Only intercepts after the configured threshold (default: 3 reads).
 			if !v5Intercepted && fileReadCache != nil && funcName == "terminal" {
 				var termArgs map[string]interface{}
 				if err := json.Unmarshal(json.RawMessage(toolCall.FunctionCall.Arguments), &termArgs); err == nil {
 					if input, ok := termArgs["input"].(string); ok {
-						if cached, hit := fileReadCache.CheckFileRead(input); hit {
+						if cached, hit := fileReadCache.InterceptTerminalRead(input); hit {
 							logger.WithField("file_cache_hit", true).
-								Info("semantic file-read cache hit")
+								Info("v6 terminal read cache interception")
 							v5Intercepted = true
 							v5Response = cached
 						}
@@ -765,6 +820,11 @@ func (fp *flowProvider) performAgentChain(
 				response = v5Response
 			} else {
 				response, err = fp.execToolCall(ctx, chainID, idx, result, detector, executor, nTracker, terminalCache, knownData)
+			}
+
+			// v6/V2: Prepend duplicate warning to response if CheckReRun issued one.
+			if v5Warning != "" && !v5Intercepted {
+				response = v5Warning + "\n\n" + response
 			}
 
 			// v5: Store file read results in semantic cache after successful execution.
@@ -944,7 +1004,7 @@ func (fp *flowProvider) performAgentChain(
 		toolCallCount += len(result.funcCalls)
 		metrics.ToolCallCount = toolCallCount
 
-		// v5: Read loop detection — check for cyclic read patterns after each batch.
+		// v5/v6: Read loop detection — check for cyclic read patterns after each batch.
 		if loopDetector != nil {
 			if alert := loopDetector.Check(); alert != nil {
 				chain = append(chain, llms.MessageContent{
@@ -956,10 +1016,16 @@ func (fp *flowProvider) performAgentChain(
 				if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
 					logger.WithError(err).Error("failed to update msg chain after loop alert")
 				}
+				// v6: If the alert signals a hard block, log it prominently
+				if alert.IsBlock {
+					logger.WithField("total_alerts", alert.TotalAlerts).
+						Error("loop detector engaged HARD BLOCK mode — all reads will be rejected")
+				}
 				logger.WithFields(logrus.Fields{
 					"cycle_length": alert.CycleLength,
 					"repeat_count": alert.RepeatCount,
 					"total_alerts": alert.TotalAlerts,
+					"is_block":     alert.IsBlock,
 				}).Warn("injected loop detection alert into agent chain")
 			}
 		}
@@ -970,16 +1036,33 @@ func (fp *flowProvider) performAgentChain(
 			if wantToStop {
 				phase = "finishing"
 			}
+
+			// v6: Force immediate writes on phase transitions and barrier hits.
+			prevPhase := execState.Phase
 			execState.Update(metrics, phase)
+			if prevPhase != phase {
+				stateThrottle.ForceNext()
+				resumeThrottle.ForceNext()
+			}
+			if wantToStop {
+				stateThrottle.ForceNext()
+				resumeThrottle.ForceNext()
+			}
 
 			// v5: Sync completed work and loop detector state before serialization.
 			execState.UpdateCompletedTasks(completedWork)
 			execState.UpdateLoopAlertCount(loopDetector)
 
-			// Every 10 tool calls, generate and persist resume context so that
-			// if the subtask times out and resumes, the agent has a summary of
-			// what was already done and doesn't waste time re-bootstrapping.
-			if toolCallCount > 0 && toolCallCount%10 == 0 {
+			// v6/V2: Also persist tracked operations
+			if opsJSON := completedWork.OperationsToJSON(); len(opsJSON) > 0 {
+				if rawOps, err := json.Marshal(opsJSON); err == nil {
+					execState.TrackedOperations = rawOps
+				}
+			}
+
+			// v6: Generate resume context based on resume throttle schedule (was every 10,
+			// now every 30 calls or 3 min).
+			if resumeThrottle.ShouldWrite(toolCallCount) {
 				resumeContent := buildResumeContent(toolHistory, metrics)
 				if resumeContent != "" {
 					execState.ResumeContext = resumeContent
@@ -989,30 +1072,48 @@ func (fp *flowProvider) performAgentChain(
 			}
 
 			if stateJSON, err := execState.ToJSON(); err == nil {
+				// Async DB write — always happens (coalesced by AsyncStateWriter).
 				stateWriter.Write(*subtaskID, stateJSON)
 
-				// FIX: Write STATE.json to container filesystem every 5 tool calls.
-				// The LLM reads /work/STATE.json on context reset but it never gets
-				// updated past "phase:recon" because the LLM loses context.
-				if toolCallCount > 0 && toolCallCount%5 == 0 {
+				// v6: Write STATE.json to container filesystem on throttle schedule.
+				// Was: every 5 tool calls. Now: every 20 calls or 3 min.
+				if toolCallCount > 0 && stateThrottle.ShouldWrite(toolCallCount) {
 					writeStateArgs, _ := json.Marshal(map[string]interface{}{
 						"input":   fmt.Sprintf("cat > /work/STATE.json << 'STATE_EOF'\n%s\nSTATE_EOF", stateJSON),
 						"timeout": 5,
 					})
 					if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeStateArgs); writeErr != nil {
 						logger.WithError(writeErr).Debug("failed to update container STATE.json (non-fatal)")
+					} else {
+						stateThrottle.MarkWritten(toolCallCount)
+					}
+					// v6: Notify loop detector and file cache of system-generated writes
+					if loopDetector != nil {
+						loopDetector.RecordSystemWrite("STATE.json")
+					}
+					if fileReadCache != nil {
+						fileReadCache.RecordSystemFileWrite("STATE.json")
 					}
 				}
 
-				// FIX: Write RESUME.md to container filesystem every 10 tool calls.
-				// The agent looks for /work/RESUME.md on restart but nobody writes it.
-				if toolCallCount > 0 && toolCallCount%10 == 0 && execState.ResumeContext != "" {
+				// v6: Write RESUME.md to container filesystem on throttle schedule.
+				// Was: every 10 tool calls. Now: every 30 calls or 3 min.
+				if toolCallCount > 0 && resumeThrottle.ShouldWrite(toolCallCount) && execState.ResumeContext != "" {
 					writeResumeArgs, _ := json.Marshal(map[string]interface{}{
 						"input":   fmt.Sprintf("cat > /work/RESUME.md << 'RESUME_EOF'\n%s\nRESUME_EOF", execState.ResumeContext),
 						"timeout": 5,
 					})
 					if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeResumeArgs); writeErr != nil {
 						logger.WithError(writeErr).Debug("failed to write RESUME.md to container (non-fatal)")
+					} else {
+						resumeThrottle.MarkWritten(toolCallCount)
+					}
+					// v6: Notify loop detector and file cache of system-generated writes
+					if loopDetector != nil {
+						loopDetector.RecordSystemWrite("RESUME.md")
+					}
+					if fileReadCache != nil {
+						fileReadCache.RecordSystemFileWrite("RESUME.md")
 					}
 				}
 			}

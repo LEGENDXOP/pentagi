@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +14,137 @@ import (
 
 	"github.com/sirupsen/logrus"
 )
+
+// ============================================================================
+// WriteThrottle — frequency controller for container filesystem writes
+// ============================================================================
+//
+// WriteThrottle gates STATE.json and RESUME.md writes to dramatically reduce
+// the number of executor.Execute() calls spent on checkpointing. Instead of
+// writing every N tool calls (which burned 70% of the tool call budget in
+// Flow 26), it uses a dual-condition gate:
+//
+//   1. Call-based: write only after callInterval tool calls since last write
+//   2. Time-based: write if timeInterval has elapsed (crash recovery safety net)
+//
+// Either condition being true triggers a write. ForceNext() bypasses both
+// gates for critical moments (phase transitions, barrier functions).
+
+// WriteThrottle controls the frequency of container filesystem writes.
+type WriteThrottle struct {
+	callInterval  int           // minimum tool calls between writes
+	timeInterval  time.Duration // maximum wall-clock time between writes
+	lastWriteCall int           // tool call count at last successful write
+	lastWriteTime time.Time     // timestamp of last successful write
+	forceNext     bool          // bypass gates on next ShouldWrite() call
+}
+
+// Default throttle intervals — tuned to reduce 70% overhead to ~8%.
+const (
+	defaultStateWriteCallInterval  = 20            // was 5 — write STATE.json every 20 calls
+	defaultResumeWriteCallInterval = 30            // was 10 — write RESUME.md every 30 calls
+	defaultWriteTimeInterval       = 3 * time.Minute // safety net: write if >3 min since last
+)
+
+// getStateWriteInterval returns the STATE.json write call interval,
+// configurable via STATE_WRITE_INTERVAL env var. Defaults to 20.
+func getStateWriteInterval() int {
+	if v := os.Getenv("STATE_WRITE_INTERVAL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultStateWriteCallInterval
+}
+
+// getResumeWriteInterval returns the RESUME.md write call interval,
+// configurable via RESUME_WRITE_INTERVAL env var. Defaults to 30.
+func getResumeWriteInterval() int {
+	if v := os.Getenv("RESUME_WRITE_INTERVAL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultResumeWriteCallInterval
+}
+
+// getWriteTimeInterval returns the time-based write fallback interval,
+// configurable via WRITE_TIME_INTERVAL env var (value in seconds).
+// Defaults to 180 seconds (3 minutes).
+func getWriteTimeInterval() time.Duration {
+	if v := os.Getenv("WRITE_TIME_INTERVAL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return defaultWriteTimeInterval
+}
+
+// NewWriteThrottle creates a throttle with the given call interval.
+// The time interval is shared and read from env/defaults.
+func NewWriteThrottle(callInterval int) *WriteThrottle {
+	return &WriteThrottle{
+		callInterval:  callInterval,
+		timeInterval:  getWriteTimeInterval(),
+		lastWriteCall: 0,
+		lastWriteTime: time.Now(),
+		forceNext:     false,
+	}
+}
+
+// NewStateWriteThrottle creates a throttle tuned for STATE.json writes.
+func NewStateWriteThrottle() *WriteThrottle {
+	return NewWriteThrottle(getStateWriteInterval())
+}
+
+// NewResumeWriteThrottle creates a throttle tuned for RESUME.md writes.
+func NewResumeWriteThrottle() *WriteThrottle {
+	return NewWriteThrottle(getResumeWriteInterval())
+}
+
+// ShouldWrite returns true if a filesystem write should happen now.
+// Conditions (OR logic — either triggers a write):
+//   - forceNext was called (phase transition, barrier function, etc.)
+//   - currentCallCount - lastWriteCall >= callInterval
+//   - time.Since(lastWriteTime) >= timeInterval
+//
+// Does NOT auto-reset counters — caller must call MarkWritten() after
+// a successful write to avoid repeated triggers on the same tick.
+func (wt *WriteThrottle) ShouldWrite(currentCallCount int) bool {
+	if wt.forceNext {
+		return true
+	}
+
+	// Call-based gate
+	if currentCallCount-wt.lastWriteCall >= wt.callInterval {
+		return true
+	}
+
+	// Time-based safety net
+	if time.Since(wt.lastWriteTime) >= wt.timeInterval {
+		return true
+	}
+
+	return false
+}
+
+// MarkWritten resets both counters after a successful filesystem write.
+func (wt *WriteThrottle) MarkWritten(currentCallCount int) {
+	wt.lastWriteCall = currentCallCount
+	wt.lastWriteTime = time.Now()
+	wt.forceNext = false
+}
+
+// ForceNext causes the next ShouldWrite() call to return true regardless
+// of interval gates. Use for phase transitions, barrier functions, and
+// other critical state changes that must be persisted immediately.
+func (wt *WriteThrottle) ForceNext() {
+	wt.forceNext = true
+}
+
+// ============================================================================
+// ExecutionState — unchanged from v2, included for completeness
+// ============================================================================
 
 // ExecutionState captures the agent's execution progress for crash recovery.
 // It is serialized to JSON and persisted in the subtask's Context column.
@@ -41,6 +174,9 @@ type ExecutionState struct {
 	// switches. If the agent was already warned 2x about looping, the 3rd
 	// warning after resume will be CRITICAL, not informational.
 	LoopAlertCount int `json:"loop_alert_count,omitempty"`
+
+	// V2: Tracked operation fingerprints for cross-session dedup
+	TrackedOperations json.RawMessage `json:"tracked_operations,omitempty"`
 }
 
 // MarshalJSON serializes the execution state to JSON.
@@ -169,6 +305,10 @@ func (es *ExecutionState) BuildResumeInjectionMessage() string {
 
 	return sb.String()
 }
+
+// ============================================================================
+// AsyncStateWriter — unchanged from v2
+// ============================================================================
 
 // stateWriteRequest is sent to the async writer goroutine.
 type stateWriteRequest struct {

@@ -12,49 +12,45 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// ReadLoopDetector detects the specific "re-read loop" pattern observed in
-// Flow 24 where the agent cycles through the same set of files repeatedly:
+// ReadLoopDetector v2 — Proactive cyclic pattern detection with escalation.
 //
-//   read summary.md → read FINDINGS.md → read STATE.json →
-//   check recon_runner.py → search storefront token → repeat
+// Changes from v1:
+//   - Lower default thresholds: cycleRepeatThreshold=2 (was 4), cooldownCalls=3 (was 8)
+//   - Checkpoint-aware: tracks STATE.json/RESUME.md reads AND writes as checkpoint ops
+//   - Fast-path checkpoint detection: fires if last N calls are all checkpoint file ops
+//   - Escalating response: warning → strong warning → HARD BLOCK (with ShouldBlock())
+//   - Fuzzy cycle matching: 80%+ signature match counts as a cycle repeat
+//   - RecordSystemWrite(): lets performer register system-generated file writes
+//   - ShouldBlock(): returns true after maxAlertsBeforeBlock alerts — performer uses
+//     this to reject all further read tool calls
 //
-// Unlike the existing repeatingDetector (which tracks individual tool call
-// repetition) and ToolHistory (which tracks entropy/frequency), this detector
-// identifies CYCLIC patterns — sequences of tool calls that form a repeating
-// cycle regardless of the specific arguments.
-//
-// The key insight from Flow 24 is that the loop wasn't repeating a SINGLE
-// call — it was repeating a SEQUENCE of 3-5 different calls in the same order.
-// The repeatingDetector's per-call window missed this because each individual
-// call appeared only once per cycle. ToolHistory's pattern score caught it
-// eventually but only after many cycles (high entropy until the window fills).
-//
-// Detection Algorithm:
-//  1. Maintain a sliding window of recent tool call "signatures" (name + file path)
-//  2. Search for the shortest repeating cycle of length ≥ cycleMinLength
-//  3. If a cycle repeats ≥ cycleRepeatThreshold times, fire the loop alert
-//  4. After firing, enter a cooldown period to avoid spamming the chain
-//
-// Configuration:
-//   - LOOP_CYCLE_MIN_LENGTH: minimum cycle length (default: 3)
-//   - LOOP_CYCLE_THRESHOLD: minimum repetitions to trigger (default: 3)
-//   - LOOP_WINDOW_SIZE: number of recent calls to analyze (default: 30)
-//   - LOOP_COOLDOWN_CALLS: calls to skip after firing (default: 5)
+// Configuration (env vars):
+//   - LOOP_CYCLE_MIN_LENGTH: minimum cycle length (default: 2)
+//   - LOOP_CYCLE_THRESHOLD: minimum repetitions to trigger (default: 2)
+//   - LOOP_WINDOW_SIZE: recent signatures to analyze (default: 30)
+//   - LOOP_COOLDOWN_CALLS: calls to skip after alert (default: 3)
+//   - LOOP_CHECKPOINT_WINDOW: window for checkpoint-specific detection (default: 8)
+//   - LOOP_MAX_ALERTS_BEFORE_BLOCK: alerts before ShouldBlock()=true (default: 3)
 type ReadLoopDetector struct {
 	mu sync.Mutex
 
-	// Configuration (set at creation, read from env)
-	cycleMinLength       int // minimum number of distinct calls in a cycle
-	cycleRepeatThreshold int // how many times the cycle must repeat to trigger
-	windowSize           int // how many recent signatures to keep
-	cooldownCalls        int // calls to skip after firing an alert
+	// Configuration
+	cycleMinLength       int
+	cycleRepeatThreshold int
+	windowSize           int
+	cooldownCalls        int
+	checkpointWindow     int // window size for checkpoint-specific fast detection
+	maxAlertsBeforeBlock int // after this many alerts, ShouldBlock() returns true
 
 	// State
-	signatures           []string    // recent tool call signatures
-	timestamps           []time.Time // parallel to signatures
-	callsSinceLastAlert  int         // cooldown counter
-	totalAlertsGenerated int         // lifetime alert count for this subtask
-	lastAlertCycle       string      // fingerprint of last detected cycle (avoid re-alerting same cycle)
+	signatures           []string
+	timestamps           []time.Time
+	callsSinceLastAlert  int
+	totalAlertsGenerated int
+	lastAlertCycle       string
+
+	// Checkpoint tracking: STATE.json, RESUME.md reads/writes by both agent and system
+	checkpointOps []string // recent checkpoint operation signatures
 }
 
 // ReadLoopDetectorConfig holds configuration for the loop detector.
@@ -63,19 +59,21 @@ type ReadLoopDetectorConfig struct {
 	CycleRepeatThreshold int
 	WindowSize           int
 	CooldownCalls        int
+	CheckpointWindow     int
+	MaxAlertsBeforeBlock int
 }
 
-// DefaultReadLoopDetectorConfig returns the default configuration, which can
-// be overridden by environment variables.
+// DefaultReadLoopDetectorConfig returns the default configuration, overridable by env vars.
 func DefaultReadLoopDetectorConfig() ReadLoopDetectorConfig {
 	config := ReadLoopDetectorConfig{
-		CycleMinLength:       3,
-		CycleRepeatThreshold: 4,
-		WindowSize:           40,
-		CooldownCalls:        8,
+		CycleMinLength:       2,  // v2: lowered from 3 → catch 2-step cycles
+		CycleRepeatThreshold: 2,  // v2: lowered from 4 → fire after 2 full cycles
+		WindowSize:           30, // v2: lowered from 40 → tighter window
+		CooldownCalls:        3,  // v2: lowered from 8 → much shorter cooldown
+		CheckpointWindow:     8,  // v2: new — fast-path checkpoint detection window
+		MaxAlertsBeforeBlock: 3,  // v2: new — hard block after 3 alerts
 	}
 
-	// Allow env var overrides for tuning in production
 	if v := os.Getenv("LOOP_CYCLE_MIN_LENGTH"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 2 {
 			config.CycleMinLength = n
@@ -96,6 +94,16 @@ func DefaultReadLoopDetectorConfig() ReadLoopDetectorConfig {
 			config.CooldownCalls = n
 		}
 	}
+	if v := os.Getenv("LOOP_CHECKPOINT_WINDOW"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 4 {
+			config.CheckpointWindow = n
+		}
+	}
+	if v := os.Getenv("LOOP_MAX_ALERTS_BEFORE_BLOCK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			config.MaxAlertsBeforeBlock = n
+		}
+	}
 
 	return config
 }
@@ -107,8 +115,11 @@ func NewReadLoopDetector(config ReadLoopDetectorConfig) *ReadLoopDetector {
 		cycleRepeatThreshold: config.CycleRepeatThreshold,
 		windowSize:           config.WindowSize,
 		cooldownCalls:        config.CooldownCalls,
+		checkpointWindow:     config.CheckpointWindow,
+		maxAlertsBeforeBlock: config.MaxAlertsBeforeBlock,
 		signatures:           make([]string, 0, config.WindowSize),
 		timestamps:           make([]time.Time, 0, config.WindowSize),
+		checkpointOps:        make([]string, 0, config.CheckpointWindow),
 		callsSinceLastAlert:  config.CooldownCalls, // allow immediate first detection
 	}
 }
@@ -118,23 +129,12 @@ func NewDefaultReadLoopDetector() *ReadLoopDetector {
 	return NewReadLoopDetector(DefaultReadLoopDetectorConfig())
 }
 
-// Record adds a tool call to the detection window. Call this after every
-// tool execution (successful or not). The signature is extracted from the
-// tool name and arguments.
-//
-// The signature format is: "toolName:normalizedTarget"
-// Examples:
-//   - "terminal:read_state.json" (file read)
-//   - "terminal:read_findings.md" (file read)
-//   - "file:read_subdomains.txt" (file tool read)
-//   - "search:storefront+token" (web search)
-//
-// Offensive/write operations are filtered out — they don't participate in
-// read-loop detection because they represent actual progress.
+// Record adds a tool call to the detection window.
+// Signature format: "toolName:normalizedTarget"
 func (rld *ReadLoopDetector) Record(toolName, toolArgs string) {
 	sig := extractLoopSignature(toolName, toolArgs)
 	if sig == "" {
-		return // not a trackable operation (offensive/write/unknown)
+		return
 	}
 
 	rld.mu.Lock()
@@ -151,6 +151,32 @@ func (rld *ReadLoopDetector) Record(toolName, toolArgs string) {
 	}
 
 	rld.callsSinceLastAlert++
+
+	// v2: Track checkpoint operations separately for fast-path detection
+	if isCheckpointSignature(sig) {
+		rld.checkpointOps = append(rld.checkpointOps, sig)
+		if len(rld.checkpointOps) > rld.checkpointWindow {
+			rld.checkpointOps = rld.checkpointOps[len(rld.checkpointOps)-rld.checkpointWindow:]
+		}
+	}
+}
+
+// RecordSystemWrite records a system-generated file write (e.g., the performer
+// writing STATE.json every 5 calls or RESUME.md every 10 calls). These don't
+// go through normal Record() but should be tracked for checkpoint cycle detection.
+//
+// This method does NOT add to the main signature window (which would pollute
+// cycle detection), but DOES add to the checkpoint ops window.
+func (rld *ReadLoopDetector) RecordSystemWrite(filename string) {
+	sig := "system:write_" + normalizeLoopFilename(filename)
+
+	rld.mu.Lock()
+	defer rld.mu.Unlock()
+
+	rld.checkpointOps = append(rld.checkpointOps, sig)
+	if len(rld.checkpointOps) > rld.checkpointWindow {
+		rld.checkpointOps = rld.checkpointOps[len(rld.checkpointOps)-rld.checkpointWindow:]
+	}
 }
 
 // LoopAlert contains the details of a detected loop for chain injection.
@@ -160,43 +186,67 @@ type LoopAlert struct {
 	CycleFiles  []string // the files/targets in the cycle
 	Message     string   // formatted message for chain injection
 	TotalAlerts int      // lifetime alerts generated this subtask
+	IsBlock     bool     // v2: true if this alert should BLOCK further reads
 }
 
 // Check analyzes the current window for repeating cycles.
 // Returns nil if no loop is detected or if in cooldown.
-//
-// This is the hot path — called after every Record(). It's optimized
-// to return early in the common case (no loop) and only does full
-// cycle detection when enough signatures have accumulated.
 func (rld *ReadLoopDetector) Check() *LoopAlert {
 	rld.mu.Lock()
 	defer rld.mu.Unlock()
 
-	// Not enough data for any cycle detection
+	// v2: Fast-path checkpoint detection — fires even during cooldown
+	if alert := rld.checkCheckpointLoop(); alert != nil {
+		rld.callsSinceLastAlert = 0
+		rld.totalAlertsGenerated++
+		alert.TotalAlerts = rld.totalAlertsGenerated
+		alert.IsBlock = rld.totalAlertsGenerated >= rld.maxAlertsBeforeBlock
+		alert.Message = rld.formatAlertMessage(alert)
+
+		logrus.WithFields(logrus.Fields{
+			"cycle_length": alert.CycleLength,
+			"repeat_count": alert.RepeatCount,
+			"cycle_files":  alert.CycleFiles,
+			"total_alerts": alert.TotalAlerts,
+			"is_block":     alert.IsBlock,
+			"detection":    "checkpoint_fast_path",
+		}).Warn("read loop detector: checkpoint cycle detected")
+
+		return alert
+	}
+
+	// Standard cycle detection
 	minRequired := rld.cycleMinLength * rld.cycleRepeatThreshold
 	if len(rld.signatures) < minRequired {
 		return nil
 	}
 
-	// Cooldown check
+	// Cooldown check (v2: much shorter cooldown of 3 calls)
 	if rld.callsSinceLastAlert < rld.cooldownCalls {
 		return nil
 	}
 
 	// Search for the shortest repeating cycle
 	maxCycleLen := len(rld.signatures) / rld.cycleRepeatThreshold
+	if maxCycleLen > 8 {
+		maxCycleLen = 8 // cap search to avoid O(n²) on large windows
+	}
+
 	for cycleLen := rld.cycleMinLength; cycleLen <= maxCycleLen; cycleLen++ {
 		if alert := rld.detectCycleOfLength(cycleLen); alert != nil {
-			// Check if this is the same cycle we already alerted on
+			// v2: Don't skip same-cycle with extra cooldown — escalate instead
 			cycleFingerprint := strings.Join(rld.signatures[len(rld.signatures)-cycleLen:], "|")
-			if cycleFingerprint == rld.lastAlertCycle && rld.callsSinceLastAlert < rld.cooldownCalls*2 {
-				continue // same cycle, give it more cooldown
+
+			// Only skip if SAME cycle AND we haven't escalated past warning level
+			if cycleFingerprint == rld.lastAlertCycle && rld.totalAlertsGenerated < 2 {
+				continue
 			}
 
 			rld.callsSinceLastAlert = 0
 			rld.totalAlertsGenerated++
 			rld.lastAlertCycle = cycleFingerprint
 			alert.TotalAlerts = rld.totalAlertsGenerated
+			alert.IsBlock = rld.totalAlertsGenerated >= rld.maxAlertsBeforeBlock
 			alert.Message = rld.formatAlertMessage(alert)
 
 			logrus.WithFields(logrus.Fields{
@@ -204,6 +254,7 @@ func (rld *ReadLoopDetector) Check() *LoopAlert {
 				"repeat_count": alert.RepeatCount,
 				"cycle_files":  alert.CycleFiles,
 				"total_alerts": alert.TotalAlerts,
+				"is_block":     alert.IsBlock,
 				"window_size":  len(rld.signatures),
 			}).Warn("read loop detector: cyclic pattern detected")
 
@@ -214,9 +265,80 @@ func (rld *ReadLoopDetector) Check() *LoopAlert {
 	return nil
 }
 
+// ShouldBlock returns true if the detector has fired enough alerts that the
+// performer should reject all further read-only tool calls. This provides a
+// hard enforcement mechanism beyond just injecting warning messages.
+func (rld *ReadLoopDetector) ShouldBlock() bool {
+	rld.mu.Lock()
+	defer rld.mu.Unlock()
+	return rld.totalAlertsGenerated >= rld.maxAlertsBeforeBlock
+}
+
+// checkCheckpointLoop detects the specific pattern where the agent is stuck in
+// a checkpoint-read-checkpoint loop (STATE.json → RESUME.md → read file → repeat).
+//
+// This is a fast-path that doesn't require full cycle detection — it simply checks
+// if the last N checkpoint operations are dominated by reads of the same files.
+//
+// Must be called with rld.mu held.
+func (rld *ReadLoopDetector) checkCheckpointLoop() *LoopAlert {
+	if len(rld.checkpointOps) < 4 {
+		return nil
+	}
+
+	// Count unique checkpoint files in the last checkpointWindow operations
+	opCounts := make(map[string]int)
+	for _, op := range rld.checkpointOps {
+		opCounts[op]++
+	}
+
+	// If any single checkpoint file has been read 3+ times in the window, it's a loop
+	var loopFiles []string
+	maxCount := 0
+	for sig, count := range opCounts {
+		if count > maxCount {
+			maxCount = count
+		}
+		if count >= 3 && strings.Contains(sig, "read_") {
+			// Extract the file part
+			parts := strings.SplitN(sig, ":", 2)
+			if len(parts) >= 2 {
+				loopFiles = append(loopFiles, strings.TrimPrefix(parts[1], "read_"))
+			}
+		}
+	}
+
+	if len(loopFiles) == 0 {
+		return nil
+	}
+
+	// Additional check: the checkpoint ops should show a pattern, not just high counts.
+	// If the agent reads state.json 3x but each time after a genuine write, that's OK.
+	// We check: are there more reads than writes in the checkpoint window?
+	readCount := 0
+	writeCount := 0
+	for _, op := range rld.checkpointOps {
+		if strings.Contains(op, "read_") {
+			readCount++
+		} else if strings.Contains(op, "write_") {
+			writeCount++
+		}
+	}
+
+	// If reads outnumber writes by at least 2:1, it's a checkpoint loop
+	if readCount < writeCount*2 {
+		return nil
+	}
+
+	return &LoopAlert{
+		CycleLength: len(loopFiles),
+		RepeatCount: maxCount,
+		CycleFiles:  loopFiles,
+	}
+}
+
 // detectCycleOfLength checks if the last `cycleLen` signatures repeat at least
-// `threshold` times in the recent window. Scans from the END of the window
-// backward to catch the most recent cycle.
+// `threshold` times. v2 adds fuzzy matching: 80%+ match counts as a repeat.
 //
 // Must be called with rld.mu held.
 func (rld *ReadLoopDetector) detectCycleOfLength(cycleLen int) *LoopAlert {
@@ -227,17 +349,24 @@ func (rld *ReadLoopDetector) detectCycleOfLength(cycleLen int) *LoopAlert {
 		return nil
 	}
 
-	// Candidate cycle: the last `cycleLen` signatures
 	candidate := sigs[n-cycleLen:]
 
-	// Walk backward and count matches
-	repeatCount := 1 // the candidate itself is one repetition
+	// Walk backward and count matches (exact + fuzzy)
+	repeatCount := 1
 	for offset := n - 2*cycleLen; offset >= 0; offset -= cycleLen {
-		chunk := sigs[offset : offset+cycleLen]
+		end := offset + cycleLen
+		if end > n {
+			break
+		}
+		chunk := sigs[offset:end]
+
 		if sigSliceEqual(chunk, candidate) {
 			repeatCount++
+		} else if sigSliceFuzzyMatch(chunk, candidate, 0.8) {
+			// v2: fuzzy match — 80% of signatures match
+			repeatCount++
 		} else {
-			break // cycle broken
+			break
 		}
 	}
 
@@ -245,11 +374,10 @@ func (rld *ReadLoopDetector) detectCycleOfLength(cycleLen int) *LoopAlert {
 		return nil
 	}
 
-	// Extract the unique files/targets in the cycle
+	// Extract unique files/targets
 	seen := make(map[string]bool)
 	var files []string
 	for _, sig := range candidate {
-		// Extract the target part after the first ":"
 		parts := strings.SplitN(sig, ":", 2)
 		target := sig
 		if len(parts) >= 2 {
@@ -268,11 +396,10 @@ func (rld *ReadLoopDetector) detectCycleOfLength(cycleLen int) *LoopAlert {
 	}
 }
 
-// formatAlertMessage generates the chain injection message for a detected loop.
-// The message escalates based on the number of alerts generated this subtask:
-//   - 1st alert: informational warning
-//   - 2nd alert: stronger warning with explicit instructions
-//   - 3rd+ alert: CRITICAL with command to call result tool
+// formatAlertMessage generates the chain injection message with v2 escalation:
+//   - Alert 1: Warning with gentle redirection
+//   - Alert 2: Strong warning with explicit action items
+//   - Alert 3+: CRITICAL BLOCK with only allowed actions listed
 //
 // Must be called with rld.mu held.
 func (rld *ReadLoopDetector) formatAlertMessage(alert *LoopAlert) string {
@@ -281,37 +408,42 @@ func (rld *ReadLoopDetector) formatAlertMessage(alert *LoopAlert) string {
 	switch {
 	case alert.TotalAlerts >= 3:
 		return fmt.Sprintf(
-			"🔴 LOOP DETECTED (CRITICAL — alert #%d): You've cycled through [%s] %d times in a row "+
-				"with a cycle of %d operations. Your current phase is DONE. "+
-				"STOP ALL FILE READS IMMEDIATELY. "+
-				"Your ONLY acceptable next action is:\n"+
+			"🛑 LOOP DETECTED — HARD BLOCK (alert #%d): You've cycled through [%s] %d times "+
+				"in a repeating cycle of %d operations. ALL FILE READS ARE NOW BLOCKED.\n\n"+
+				"Your information gathering is COMPLETE. You have read these files multiple times "+
+				"and the content has NOT changed. Further reads will be rejected.\n\n"+
+				"YOUR ONLY ALLOWED ACTIONS:\n"+
 				"1. Call the result/report tool to save findings\n"+
-				"2. Execute an offensive action (curl, nmap, nuclei_scan)\n"+
-				"3. Write a report using terminal heredoc\n"+
-				"DO NOT read any more files. DO NOT search for the same terms.",
+				"2. Execute an offensive action (curl, nmap, nuclei_scan, browser_navigate)\n"+
+				"3. Write a report/findings using terminal heredoc or file tool\n\n"+
+				"ANY file read tool call will be rejected until you take a non-read action.",
 			alert.TotalAlerts, fileList, alert.RepeatCount, alert.CycleLength,
 		)
-	case alert.TotalAlerts >= 2:
+	case alert.TotalAlerts == 2:
 		return fmt.Sprintf(
-			"🟠 LOOP DETECTED (WARNING #%d): You've read [%s] %d times in a repeating cycle. "+
-				"This is the SAME data you already have. Your recon/analysis is DONE. "+
-				"Advance to the next subtask or mark this one complete. "+
-				"If you need to act on findings, use offensive tools (curl, nmap) — don't re-read files.",
-			alert.TotalAlerts, fileList, alert.RepeatCount,
+			"🟠 LOOP DETECTED — FINAL WARNING (alert #%d): You are STILL cycling through [%s] "+
+				"(%d repetitions of the same %d-step sequence).\n\n"+
+				"This is your LAST WARNING before all file reads are blocked.\n\n"+
+				"The data in these files has NOT changed since your first read. "+
+				"You MUST now do ONE of these:\n"+
+				"• Execute an offensive tool (curl, nmap, nuclei_scan)\n"+
+				"• Write your findings to a report\n"+
+				"• Call the result tool to complete this subtask\n\n"+
+				"DO NOT read [%s] again. The next loop detection will BLOCK all reads.",
+			alert.TotalAlerts, fileList, alert.RepeatCount, alert.CycleLength, fileList,
 		)
 	default:
 		return fmt.Sprintf(
-			"🔴 LOOP DETECTED: You've read these files %d times: [%s]. "+
-				"Your recon is DONE. Advance to the next subtask or mark this one complete.",
-			alert.RepeatCount, fileList,
+			"⚠️ LOOP DETECTED (alert #%d): You've read [%s] %d times in a repeating %d-step cycle. "+
+				"You already have all the data from these files. "+
+				"Advance to your next action — execute an offensive tool, write findings, or complete the subtask. "+
+				"Continuing to re-read these files will trigger escalating restrictions.",
+			alert.TotalAlerts, fileList, alert.RepeatCount, alert.CycleLength,
 		)
 	}
 }
 
 // RestoreAlertCount restores the total alerts counter from persisted state.
-// Call this after loading execution state on chain resume so the escalation
-// level (info → warning → critical) continues from where it left off instead
-// of resetting to 0.
 func (rld *ReadLoopDetector) RestoreAlertCount(count int) {
 	rld.mu.Lock()
 	defer rld.mu.Unlock()
@@ -325,11 +457,33 @@ func (rld *ReadLoopDetector) GetStats() (windowSize int, totalAlerts int) {
 	return len(rld.signatures), rld.totalAlertsGenerated
 }
 
-// ─── Signature Extraction ───────────────────────────────────────────────────
+// ─── Checkpoint File Detection ──────────────────────────────────────────────
 
-// extractLoopSignature converts a tool call into a trackable signature for
-// cycle detection. Returns "" for operations that shouldn't participate in
-// loop detection (offensive tools, write operations, delegation).
+// checkpointFiles are files that the system writes periodically and the agent
+// reads on resume/bootstrap. These create a strong checkpoint-read-checkpoint
+// loop pattern that deserves fast-path detection.
+var checkpointFiles = map[string]bool{
+	"state.json": true,
+	"resume.md":  true,
+	"handoff.md": true,
+}
+
+// isCheckpointSignature returns true if the signature refers to a checkpoint file
+// read or write operation.
+func isCheckpointSignature(sig string) bool {
+	sigLower := strings.ToLower(sig)
+	for f := range checkpointFiles {
+		if strings.Contains(sigLower, f) {
+			return true
+		}
+	}
+	return false
+}
+
+// ─── Signature Extraction (unchanged public API) ────────────────────────────
+
+// extractLoopSignature converts a tool call into a trackable signature.
+// Returns "" for operations that shouldn't participate in loop detection.
 func extractLoopSignature(toolName, toolArgs string) string {
 	switch toolName {
 	case "terminal":
@@ -342,14 +496,11 @@ func extractLoopSignature(toolName, toolArgs string) string {
 		return "memorist:query"
 	case "graphiti_search":
 		return "graphiti:search"
-
-	// Offensive/action tools — NOT tracked for read-loop detection
 	case "nuclei_scan", "browser_navigate", "browser_click",
 		"hack_result", "done", "code_result", "maintenance_result",
 		"coder", "installer", "maintenance", "pentester",
 		"interactsh_get_url", "interactsh_poll":
 		return ""
-
 	default:
 		return ""
 	}
@@ -367,18 +518,24 @@ func extractTerminalLoopSig(toolArgs string) string {
 		return ""
 	}
 
-	// Skip write operations — they represent progress
 	if isTerminalWriteCommand(toolArgs) {
+		// v2: Track writes to checkpoint files so we can detect write-read loops
+		primaryCmd := extractPrimaryCommand(input)
+		target := extractLoopReadTarget(primaryCmd)
+		if target != "" {
+			normalized := normalizeLoopFilename(target)
+			if checkpointFiles[normalized] {
+				return "terminal:write_" + normalized
+			}
+		}
 		return ""
 	}
 
-	// Skip offensive commands — they represent progress
 	primaryCmd := extractPrimaryCommand(input)
 	if isOffensiveCommand(primaryCmd) {
 		return ""
 	}
 
-	// Classify as a read and extract the target
 	if isReadCommand(primaryCmd) {
 		target := extractLoopReadTarget(primaryCmd)
 		if target != "" {
@@ -387,7 +544,6 @@ func extractTerminalLoopSig(toolArgs string) string {
 		return "terminal:read_unknown"
 	}
 
-	// Python/script that reads files
 	if strings.Contains(strings.ToLower(input), "open(") {
 		return "terminal:script_read"
 	}
@@ -409,7 +565,12 @@ func extractFileLoopSig(toolArgs string) string {
 	case "read_file":
 		return "file:read_" + normalizeLoopFilename(path)
 	case "update_file":
-		return "" // writes are progress, not tracked
+		// v2: Track writes to checkpoint files
+		normalized := normalizeLoopFilename(path)
+		if checkpointFiles[normalized] {
+			return "file:write_" + normalized
+		}
+		return ""
 	default:
 		return ""
 	}
@@ -430,7 +591,6 @@ func extractSearchLoopSig(toolName, toolArgs string) string {
 		return toolName + ":unknown"
 	}
 
-	// Normalize the query: lowercase, collapse whitespace, take first 50 chars
 	normalized := strings.ToLower(strings.TrimSpace(query))
 	normalized = strings.Join(strings.Fields(normalized), "+")
 	if len(normalized) > 50 {
@@ -445,19 +605,16 @@ func extractLoopReadTarget(primaryCmd string) string {
 	words := strings.Fields(primaryCmd)
 	for i := len(words) - 1; i >= 1; i-- {
 		word := words[i]
-		// Skip flags
 		if strings.HasPrefix(word, "-") {
 			continue
 		}
-		// Skip shell operators
 		if word == "2>/dev/null" || word == "||" || word == "&&" || word == ";" {
 			continue
 		}
-		// Skip common builtins
 		if word == "echo" || word == "true" || word == "false" {
 			continue
 		}
-		// This is likely the file path
+		// v2: Match both absolute paths AND relative paths with extensions
 		if strings.Contains(word, "/") || strings.Contains(word, ".") {
 			return word
 		}
@@ -465,13 +622,12 @@ func extractLoopReadTarget(primaryCmd string) string {
 	return ""
 }
 
-// normalizeLoopFilename reduces a file path to its base name for comparison.
+// normalizeLoopFilename reduces a file path to its lowercase base name.
 func normalizeLoopFilename(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return "unknown"
 	}
-	// Strip everything before the last /
 	if idx := strings.LastIndex(path, "/"); idx >= 0 {
 		path = path[idx+1:]
 	}
@@ -481,7 +637,9 @@ func normalizeLoopFilename(path string) string {
 	return strings.ToLower(path)
 }
 
-// sigSliceEqual compares two string slices for equality.
+// ─── Slice Comparison Helpers ───────────────────────────────────────────────
+
+// sigSliceEqual compares two string slices for exact equality.
 func sigSliceEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -492,4 +650,23 @@ func sigSliceEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// sigSliceFuzzyMatch returns true if at least `threshold` fraction of elements
+// in `a` match the corresponding elements in `b`.
+// v2: Enables detection of cycles where the agent occasionally inserts a
+// different command between the main loop steps.
+func sigSliceFuzzyMatch(a, b []string, threshold float64) bool {
+	if len(a) != len(b) || len(a) == 0 {
+		return false
+	}
+
+	matchCount := 0
+	for i := range a {
+		if a[i] == b[i] {
+			matchCount++
+		}
+	}
+
+	return float64(matchCount)/float64(len(a)) >= threshold
 }
