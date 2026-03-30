@@ -365,6 +365,7 @@ func (fc *FileReadCache) InterceptTerminalRead(command string) (string, bool) {
 	}
 
 	// v2: Only intercept after threshold hits
+	entry.hitCount++ // v8: Count every read attempt, even below threshold
 	if entry.hitCount < fc.softThreshold {
 		// Below threshold: don't intercept, let it execute
 		// (hitCount will be incremented by StoreFileRead on re-store,
@@ -433,8 +434,7 @@ func (fc *FileReadCache) StoreFileRead(command, output string) {
 		newHash := contentFingerprint(output)
 		if existing.contentHash == newHash {
 			existing.readAt = time.Now()
-			existing.hitCount++
-			// v7: Increment hitCount so InterceptTerminalRead threshold is reached
+			// v8: hitCount now incremented in InterceptTerminalRead — skip here to avoid double-counting
 			return
 		}
 		// Content actually changed — reset the entry

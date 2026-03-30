@@ -38,13 +38,16 @@ const (
 	defaultMaxToolCallsPerSubtask = 100              // hard cap per subtask (configurable via MAX_TOOL_CALLS_PER_SUBTASK)
 	defaultSubtaskDuration      = 60 * time.Minute   // default hard time limit per subtask
 	defaultMaxNestingDepth      = 4                   // primary_agent(0) → pentester(1) → coder(2) → installer(3) all allowed
-	nestedTimeoutDepth1         = 25 * time.Minute    // timeout for depth-1 nested agents
+	nestedTimeoutDepth1         = 40 * time.Minute    // v8: increased from 25 — complex recon needs more time
 	nestedTimeoutDepth2         = 20 * time.Minute    // timeout for depth-2 nested agents
 	nestedTimeoutDepth3         = 15 * time.Minute    // timeout for depth-3 nested agents
 
 	// toolCallLimitWarningBuffer is how many calls before the limit we inject
 	// a "wrap up" warning into the chain, giving the agent a chance to save findings.
 	toolCallLimitWarningBuffer  = 10
+
+	// v8: Bootstrap flag path in shared container filesystem
+	bootstrapFlagPath = "/work/.bootstrapped"
 )
 
 // getSubtaskMaxDuration returns the subtask timeout, configurable via
@@ -84,6 +87,84 @@ func getMaxNestingDepth() int {
 type nestingDepthKey struct{}
 
 // getNestingDepth extracts the current nesting depth from context. Returns 0 if unset.
+// v8: writeBootstrapFlag creates the sentinel file that signals bootstrap is complete.
+// Non-fatal — if it fails, sub-agents just re-bootstrap (graceful degradation).
+func writeBootstrapFlag(executor tools.ContextToolsExecutor, ctx context.Context, logger *logrus.Entry) {
+	flagArgs, _ := json.Marshal(map[string]interface{}{
+		"input":   fmt.Sprintf("echo 'bootstrapped at %s' > %s", time.Now().UTC().Format(time.RFC3339), bootstrapFlagPath),
+		"timeout": 3,
+	})
+	if _, err := executor.Execute(ctx, 0, "", "terminal", "", flagArgs); err != nil {
+		logger.WithError(err).Debug("v8: failed to write bootstrap flag file (non-fatal)")
+	}
+}
+
+// v8: checkBootstrapFlag checks if the bootstrap sentinel exists in the container.
+func checkBootstrapFlag(executor tools.ContextToolsExecutor, ctx context.Context) bool {
+	checkArgs, _ := json.Marshal(map[string]interface{}{
+		"input":   fmt.Sprintf("test -f %s && echo 'YES' || echo 'NO'", bootstrapFlagPath),
+		"timeout": 3,
+	})
+	result, err := executor.Execute(ctx, 0, "", "terminal", "", checkArgs)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(result) == "YES"
+}
+
+// CrossAgentState holds state that persists across pentester boundaries via /work/.agent_state.json.
+type CrossAgentState struct {
+	CompletedTasks   []CompletedTaskJSON `json:"completed_tasks,omitempty"`
+	LoopAlertCount   int                 `json:"loop_alert_count"`
+	BootstrapDone    bool                `json:"bootstrap_done"`
+	TotalToolCalls   int                 `json:"total_tool_calls"`
+	LastAgentEnd     string              `json:"last_agent_end"`
+}
+
+const crossAgentStatePath = "/work/.agent_state.json"
+
+// v8: writeCrossAgentState persists cross-agent state to the container filesystem.
+func writeCrossAgentState(executor tools.ContextToolsExecutor, ctx context.Context, logger *logrus.Entry,
+	completedWork *CompletedWorkTracker, loopDetector *ReadLoopDetector, bootstrapDone bool, toolCallCount int) {
+	cas := CrossAgentState{
+		BootstrapDone:  bootstrapDone,
+		TotalToolCalls: toolCallCount,
+		LastAgentEnd:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if completedWork != nil {
+		cas.CompletedTasks = completedWork.ToJSON()
+	}
+	if loopDetector != nil {
+		_, cas.LoopAlertCount = loopDetector.GetStats()
+	}
+	data, err := json.Marshal(cas)
+	if err != nil {
+		return
+	}
+	cmd := fmt.Sprintf("cat > %s << 'AS_EOF'\n%s\nAS_EOF", crossAgentStatePath, string(data))
+	args, _ := json.Marshal(map[string]interface{}{"input": cmd, "timeout": 5})
+	if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", args); writeErr != nil {
+		logger.WithError(writeErr).Debug("v8: failed to write cross-agent state (non-fatal)")
+	}
+}
+
+// v8: readCrossAgentState reads cross-agent state from the container filesystem.
+func readCrossAgentState(executor tools.ContextToolsExecutor, ctx context.Context) *CrossAgentState {
+	readArgs, _ := json.Marshal(map[string]interface{}{
+		"input":   fmt.Sprintf("cat %s 2>/dev/null || echo '{}'", crossAgentStatePath),
+		"timeout": 5,
+	})
+	result, err := executor.Execute(ctx, 0, "", "terminal", "", readArgs)
+	if err != nil {
+		return nil
+	}
+	var cas CrossAgentState
+	if json.Unmarshal([]byte(strings.TrimSpace(result)), &cas) != nil {
+		return nil
+	}
+	return &cas
+}
+
 func getNestingDepth(ctx context.Context) int {
 	if v, ok := ctx.Value(nestingDepthKey{}).(int); ok {
 		return v
@@ -229,6 +310,10 @@ func (fp *flowProvider) performAgentChain(
 		bootstrapCallCount = 0
 	)
 
+	// v8: For sub-agents (depth > 0), check file-based bootstrap flag.
+	// Main agent (depth=0) uses in-memory flag naturally — zero cost.
+	// depth is set later (line ~381), so we defer the check to after depth is known.
+
 	// Silence unused variable warnings for guard booleans (set inside loop).
 	_ = industryDetected
 	_ = halfwayAlertSent
@@ -363,9 +448,11 @@ func (fp *flowProvider) performAgentChain(
 				stateThrottle.MarkWritten(loaded.ToolCallCount)
 				resumeThrottle.MarkWritten(loaded.ToolCallCount)
 
-				// v7: If resuming with >5 tool calls, bootstrap is definitely done
+				// v7/v8: If resuming with >5 tool calls, bootstrap is definitely done
 				if loaded.ToolCallCount > 5 {
 					bootstrapCompleted = true
+					// v8: Ensure the file flag exists for sub-agents
+					writeBootstrapFlag(executor, ctx, logger)
 				}
 			}
 		}
@@ -381,6 +468,37 @@ func (fp *flowProvider) performAgentChain(
 	depth := getNestingDepth(ctx)
 	ctx = withIncrementedDepth(ctx)
 
+	// v8: File-based bootstrap flag check for sub-agents
+	if !bootstrapCompleted && depth > 0 {
+		if checkBootstrapFlag(executor, ctx) {
+			bootstrapCompleted = true
+			logger.Info("v8: bootstrap flag detected from filesystem — skipping bootstrap")
+		}
+	}
+
+	// v8: Restore cross-agent state from filesystem for sub-agents
+	if depth > 0 {
+		if cas := readCrossAgentState(executor, ctx); cas != nil {
+			if cas.BootstrapDone && !bootstrapCompleted {
+				bootstrapCompleted = true
+			}
+			if len(cas.CompletedTasks) > 0 && len(execState.CompletedTasks) == 0 {
+				completedWork.RestoreFromState(cas.CompletedTasks)
+				logger.WithField("restored_completed_tasks", len(cas.CompletedTasks)).
+					Info("v8: restored completed work from cross-agent state")
+			}
+			if cas.LoopAlertCount > 0 && loopDetector != nil {
+				loopDetector.RestoreAlertCount(cas.LoopAlertCount)
+			}
+			logger.WithFields(logrus.Fields{
+				"bootstrap":       cas.BootstrapDone,
+				"completed_tasks": len(cas.CompletedTasks),
+				"loop_alerts":     cas.LoopAlertCount,
+				"prev_tool_calls": cas.TotalToolCalls,
+			}).Info("v8: restored cross-agent state from filesystem")
+		}
+	}
+
 	// Hard time limit per subtask to prevent infinite execution.
 	// For nested agents (depth > 0), use a FRESH timeout detached from the parent's
 	// deadline to prevent the shared-deadline starvation problem where each nesting
@@ -393,7 +511,7 @@ func (fp *flowProvider) performAgentChain(
 	// v5: Per-subtask-type time-boxing — classify the subtask and use a
 	// category-specific budget (recon=30min, exploit=25min, generic=20min).
 	var timebox *SubtaskTimebox
-	if depth == 0 && ShouldUseTimebox() {
+	if ShouldUseTimebox() {
 		if meta := GetSubtaskMeta(ctx); meta != nil {
 			timebox = NewSubtaskTimebox(meta.Title, meta.Description)
 			logger.WithFields(logrus.Fields{
@@ -405,6 +523,16 @@ func (fp *flowProvider) performAgentChain(
 			if timebox.MaxDuration < effectiveTimeout {
 				effectiveTimeout = timebox.MaxDuration
 			}
+		} else if depth > 0 {
+			// v8: Nested agent without SubtaskMeta — create a generic timebox
+			// matching the nested timeout so graceful force-finish works
+			timebox = &SubtaskTimebox{
+				Category:    SubtaskCategoryGeneric,
+				MaxDuration: getNestedTimeout(depth),
+				StartTime:   time.Now(),
+			}
+			logger.WithField("timebox_max_duration", timebox.MaxDuration.String()).
+				Info("v8: created fallback timebox for nested agent")
 		}
 	}
 
@@ -843,6 +971,8 @@ func (fp *flowProvider) performAgentChain(
 								bootstrapCallCount++
 								if bootstrapCallCount >= 3 {
 									bootstrapCompleted = true
+									// v8: Write persistent flag so sub-agents skip bootstrap
+									writeBootstrapFlag(executor, ctx, logger)
 								}
 							}
 						}
@@ -981,6 +1111,8 @@ func (fp *flowProvider) performAgentChain(
 
 			// Sprint 2 wiring: Record finding for attack chain detection.
 			findingTracker.RecordFinding(response)
+			// v8: Wire FindingsCount to FindingTracker so STATE.json reports accurate count
+			execState.FindingsCount = findingTracker.GetTotalCount()
 			if findingTracker.HasNewHighFindings() {
 				if suggestion := findingTracker.GetChainSuggestions(); suggestion != nil {
 					chain = append(chain, llms.MessageContent{
@@ -1096,9 +1228,9 @@ func (fp *flowProvider) performAgentChain(
 				}
 			}
 
-			// v6: Generate resume context based on resume throttle schedule (was every 10,
-			// now every 30 calls or 3 min).
-			if resumeThrottle.ShouldWrite(toolCallCount) {
+			// v8: Generate resume content whenever STATE.json is about to be written,
+			// not just on the resume throttle schedule. RESUME.md always piggybacks on STATE writes.
+			if stateThrottle.ShouldWrite(toolCallCount) || resumeThrottle.ShouldWrite(toolCallCount) {
 				resumeContent := buildResumeContent(toolHistory, metrics)
 				if resumeContent != "" {
 					execState.ResumeContext = resumeContent
@@ -1111,52 +1243,58 @@ func (fp *flowProvider) performAgentChain(
 				// Async DB write — always happens (coalesced by AsyncStateWriter).
 				stateWriter.Write(*subtaskID, stateJSON)
 
-				// v7: Batch STATE.json and RESUME.md writes into a single terminal call
-				// when both throttles fire simultaneously. Saves 1 tool call per co-fire.
+				// v8: Unified batching — RESUME.md always piggybacks on STATE.json writes.
+				// STATE.json is the "clock" (fires every 20 calls); RESUME.md is written
+				// alongside it whenever resume content is available. This guarantees 100%
+				// batching and eliminates the alignment problem entirely.
 				wantWriteState := toolCallCount > 0 && stateThrottle.ShouldWrite(toolCallCount)
-				wantWriteResume := toolCallCount > 0 && resumeThrottle.ShouldWrite(toolCallCount) && execState.ResumeContext != ""
+				wantForceResume := toolCallCount > 0 && resumeThrottle.ShouldWrite(toolCallCount) && execState.ResumeContext != "" && !wantWriteState
 
-				if wantWriteState && wantWriteResume {
-					// Both fire — combine into a single terminal command
-					combinedCmd := fmt.Sprintf(
-						"cat > /work/STATE.json << 'STATE_EOF'\n%s\nSTATE_EOF\ncat > /work/RESUME.md << 'RESUME_EOF'\n%s\nRESUME_EOF",
-						stateJSON, execState.ResumeContext,
-					)
-					writeArgs, _ := json.Marshal(map[string]interface{}{
-						"input":   combinedCmd,
-						"timeout": 8,
-					})
-					if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeArgs); writeErr != nil {
-						logger.WithError(writeErr).Debug("failed to batch-write STATE.json + RESUME.md (non-fatal)")
+				if wantWriteState {
+					// STATE fires — always include RESUME.md if content exists
+					if execState.ResumeContext != "" {
+						// Batched write: STATE.json + RESUME.md in one terminal call
+						combinedCmd := fmt.Sprintf(
+							"cat > /work/STATE.json << 'STATE_EOF'\n%s\nSTATE_EOF\ncat > /work/RESUME.md << 'RESUME_EOF'\n%s\nRESUME_EOF",
+							stateJSON, execState.ResumeContext,
+						)
+						writeArgs, _ := json.Marshal(map[string]interface{}{
+							"input":   combinedCmd,
+							"timeout": 8,
+						})
+						if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeArgs); writeErr != nil {
+							logger.WithError(writeErr).Debug("failed to batch-write STATE.json + RESUME.md (non-fatal)")
+						} else {
+							stateThrottle.MarkWritten(toolCallCount)
+							resumeThrottle.MarkWritten(toolCallCount)
+						}
 					} else {
-						stateThrottle.MarkWritten(toolCallCount)
-						resumeThrottle.MarkWritten(toolCallCount)
+						// STATE.json only (no resume content yet)
+						writeStateArgs, _ := json.Marshal(map[string]interface{}{
+							"input":   fmt.Sprintf("cat > /work/STATE.json << 'STATE_EOF'\n%s\nSTATE_EOF", stateJSON),
+							"timeout": 5,
+						})
+						if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeStateArgs); writeErr != nil {
+							logger.WithError(writeErr).Debug("failed to update container STATE.json (non-fatal)")
+						} else {
+							stateThrottle.MarkWritten(toolCallCount)
+						}
 					}
+					// Record system writes for cache invalidation
 					if loopDetector != nil {
 						loopDetector.RecordSystemWrite("STATE.json")
-						loopDetector.RecordSystemWrite("RESUME.md")
+						if execState.ResumeContext != "" {
+							loopDetector.RecordSystemWrite("RESUME.md")
+						}
 					}
 					if fileReadCache != nil {
 						fileReadCache.RecordSystemFileWrite("STATE.json")
-						fileReadCache.RecordSystemFileWrite("RESUME.md")
+						if execState.ResumeContext != "" {
+							fileReadCache.RecordSystemFileWrite("RESUME.md")
+						}
 					}
-				} else if wantWriteState {
-					writeStateArgs, _ := json.Marshal(map[string]interface{}{
-						"input":   fmt.Sprintf("cat > /work/STATE.json << 'STATE_EOF'\n%s\nSTATE_EOF", stateJSON),
-						"timeout": 5,
-					})
-					if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeStateArgs); writeErr != nil {
-						logger.WithError(writeErr).Debug("failed to update container STATE.json (non-fatal)")
-					} else {
-						stateThrottle.MarkWritten(toolCallCount)
-					}
-					if loopDetector != nil {
-						loopDetector.RecordSystemWrite("STATE.json")
-					}
-					if fileReadCache != nil {
-						fileReadCache.RecordSystemFileWrite("STATE.json")
-					}
-				} else if wantWriteResume {
+				} else if wantForceResume {
+					// RESUME forced independently (phase transition, barrier hit)
 					writeResumeArgs, _ := json.Marshal(map[string]interface{}{
 						"input":   fmt.Sprintf("cat > /work/RESUME.md << 'RESUME_EOF'\n%s\nRESUME_EOF", execState.ResumeContext),
 						"timeout": 5,
@@ -1172,6 +1310,11 @@ func (fp *flowProvider) performAgentChain(
 					if fileReadCache != nil {
 						fileReadCache.RecordSystemFileWrite("RESUME.md")
 					}
+				}
+
+				// v8: Write cross-agent state to filesystem (piggybacks on state write schedule)
+				if depth > 0 && wantWriteState {
+					writeCrossAgentState(executor, ctx, logger, completedWork, loopDetector, bootstrapCompleted, toolCallCount)
 				}
 			}
 		}

@@ -177,6 +177,14 @@ func (ft *FindingTracker) GetInjectionCount() int {
 	return ft.chainInjectionCount
 }
 
+// GetTotalCount returns the total number of distinct vulnerability types discovered.
+// v8: Wired to ExecutionState.FindingsCount so STATE.json reports accurate finding count.
+func (ft *FindingTracker) GetTotalCount() int {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	return len(ft.discoveredVulns)
+}
+
 // isHighOrCritical checks if a normalized vuln type is HIGH or CRITICAL severity
 // based on ComplianceMappings CVSS scores (>= 7.0 = HIGH).
 func (ft *FindingTracker) isHighOrCritical(normalizedVuln string) bool {

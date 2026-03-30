@@ -58,7 +58,10 @@ type Client struct {
 // NewClient creates a new Graphiti client wrapper
 func NewClient(url string, timeout time.Duration, enabled bool) (*Client, error) {
 	if !enabled {
-		return &Client{enabled: false}, nil
+		// v8: Pre-disabled availability tracker so memorist fast-fail works
+		avail := NewGraphitiAvailability(1, 24*time.Hour)
+		avail.RecordFailure() // immediately trip — graphiti intentionally disabled
+		return &Client{enabled: false, availability: avail}, nil
 	}
 
 	client := graphiti.NewClient(url, graphiti.WithTimeout(timeout))
@@ -84,7 +87,10 @@ func NewClient(url string, timeout time.Duration, enabled bool) (*Client, error)
 // NewClientWithCircuitBreaker creates a new Graphiti client wrapper with a custom circuit breaker config.
 func NewClientWithCircuitBreaker(url string, timeout time.Duration, enabled bool, cbConfig CircuitBreakerConfig) (*Client, error) {
 	if !enabled {
-		return &Client{enabled: false}, nil
+		// v8: Pre-disabled availability tracker so memorist fast-fail works
+		avail := NewGraphitiAvailability(1, 24*time.Hour)
+		avail.RecordFailure() // immediately trip — graphiti intentionally disabled
+		return &Client{enabled: false, availability: avail}, nil
 	}
 
 	client := graphiti.NewClient(url, graphiti.WithTimeout(timeout))
