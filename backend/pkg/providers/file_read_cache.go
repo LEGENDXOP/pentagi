@@ -283,18 +283,24 @@ func (fc *FileReadCache) RecordFileWrite(command string) {
 		entry.modifiedAt = time.Now()
 	}
 
-	// Relative path fallback: if the write path has no leading slash (relative),
-	// scan all cache entries for a basename match. This handles the common case
-	// of `echo >> FINDINGS.md` invalidating `/work/FINDINGS.md`.
-	if !strings.HasPrefix(writePath, "/") {
-		writeBase := strings.ToLower(writePath)
+	// Cross-path invalidation: match by basename so that a write via either
+	// absolute or relative path invalidates any cache entry for the same file.
+	// Handles:
+	//   - Relative write (`echo >> FINDINGS.md`) → absolute cache (`/work/FINDINGS.md`)
+	//   - Absolute write (`cat > /work/FINDINGS.md`) → relative cache (`FINDINGS.md`)
+	//   - Different directory prefixes for same basename
+	writeBase := writePath
+	if idx := strings.LastIndex(writePath, "/"); idx >= 0 {
+		writeBase = writePath[idx+1:]
+	}
+	writeBaseLower := strings.ToLower(writeBase)
+	if writeBaseLower != "" {
 		for key, entry := range fc.entries {
-			// Extract base name from the cached absolute path
 			cachedBase := key
 			if idx := strings.LastIndex(key, "/"); idx >= 0 {
 				cachedBase = key[idx+1:]
 			}
-			if strings.ToLower(cachedBase) == writeBase {
+			if strings.ToLower(cachedBase) == writeBaseLower {
 				entry.modifiedAt = time.Now()
 			}
 		}

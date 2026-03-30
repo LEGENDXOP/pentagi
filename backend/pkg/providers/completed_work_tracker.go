@@ -315,7 +315,9 @@ var workItemPatterns = []workItemPattern{
 		key:         "graphql_introspection",
 		description: "GraphQL schema introspection",
 		toolName:    "terminal",
-		argPattern:  regexp.MustCompile(`(?i)(__schema|__type|IntrospectionQuery|graphql)`),
+		// Only match actual introspection keywords, NOT bare "graphql" which
+		// matches every GraphQL exploitation query (mutations, auth bypass, etc.).
+		argPattern:  regexp.MustCompile(`(?i)(__schema|__type|IntrospectionQuery)`),
 		outputFile:  "/tmp/graphql_schema.json",
 	},
 	{

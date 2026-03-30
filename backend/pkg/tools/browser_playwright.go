@@ -118,7 +118,7 @@ func (bp *browserPlaywright) ensureServer(ctx context.Context) error {
 		if bp.healthCheck(ctx) {
 			return nil
 		}
-		bp.running = false
+		bp.running = false // Server might have crashed
 	}
 
 	containerName := PrimaryTerminalName(bp.flowID)
@@ -302,7 +302,9 @@ func (bp *browserPlaywright) handleNavigate(ctx context.Context, logger *logrus.
 		"timeout":   bp.timeout * 1000,
 	})
 	if err != nil {
+		bp.mu.Lock()
 		bp.running = false // Server might have crashed
+		bp.mu.Unlock()
 		return fmt.Sprintf("[ERROR] Navigation failed: %v", err), nil
 	}
 

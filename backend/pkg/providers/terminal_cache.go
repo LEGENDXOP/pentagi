@@ -209,6 +209,10 @@ func (tc *TerminalOutputCache) isCacheable(command string) bool {
 	return false
 }
 
+// fingerprintWhitespaceRe is pre-compiled for use in fingerprint().
+// Avoids recompiling on every call (hot path: every terminal command execution).
+var fingerprintWhitespaceRe = regexp.MustCompile(`\s+`)
+
 // fingerprint generates a stable 128-bit hash for a terminal command.
 // Normalization: trim leading/trailing whitespace, collapse internal whitespace
 // to single spaces. This makes "cat  /tmp/token.txt" and "cat /tmp/token.txt"
@@ -218,7 +222,7 @@ func (tc *TerminalOutputCache) isCacheable(command string) bool {
 // arguments can be case-sensitive on Linux.
 func fingerprint(command string) string {
 	normalized := strings.TrimSpace(command)
-	normalized = regexp.MustCompile(`\s+`).ReplaceAllString(normalized, " ")
+	normalized = fingerprintWhitespaceRe.ReplaceAllString(normalized, " ")
 
 	hash := sha256.Sum256([]byte(normalized))
 	return hex.EncodeToString(hash[:16]) // 128-bit — collision probability negligible for <200 entries

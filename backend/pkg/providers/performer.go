@@ -1206,6 +1206,9 @@ func (fp *flowProvider) execToolCall(
 	}
 
 	toolCall := result.funcCalls[toolCallIDx]
+	if toolCall.FunctionCall == nil {
+		return "", fmt.Errorf("tool call at index %d has nil FunctionCall", toolCallIDx)
+	}
 	funcName := toolCall.FunctionCall.Name
 	funcArgs := json.RawMessage(toolCall.FunctionCall.Arguments)
 
