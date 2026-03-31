@@ -38,7 +38,7 @@ const (
 	defaultMaxToolCallsPerSubtask = 100              // hard cap per subtask (configurable via MAX_TOOL_CALLS_PER_SUBTASK)
 	defaultSubtaskDuration      = 60 * time.Minute   // default hard time limit per subtask
 	defaultMaxNestingDepth      = 4                   // primary_agent(0) → pentester(1) → coder(2) → installer(3) all allowed
-	nestedTimeoutDepth1         = 40 * time.Minute    // v8: increased from 25 — complex recon needs more time
+	nestedTimeoutDepth1         = 25 * time.Minute    // timeout for depth-1 nested agents
 	nestedTimeoutDepth2         = 20 * time.Minute    // timeout for depth-2 nested agents
 	nestedTimeoutDepth3         = 15 * time.Minute    // timeout for depth-3 nested agents
 
@@ -46,8 +46,12 @@ const (
 	// a "wrap up" warning into the chain, giving the agent a chance to save findings.
 	toolCallLimitWarningBuffer  = 10
 
-	// v8: Bootstrap flag path in shared container filesystem
-	bootstrapFlagPath = "/work/.bootstrapped"
+	// autoDoneWarningThreshold is the number of post-delegation tool calls
+	// without calling done before we inject a warning.
+	autoDoneWarningThreshold    = 5
+	// autoDoneForceThreshold is the number of ADDITIONAL calls after the
+	// warning before we force-finish the subtask.
+	autoDoneForceThreshold      = 3
 )
 
 // getSubtaskMaxDuration returns the subtask timeout, configurable via
@@ -87,84 +91,6 @@ func getMaxNestingDepth() int {
 type nestingDepthKey struct{}
 
 // getNestingDepth extracts the current nesting depth from context. Returns 0 if unset.
-// v8: writeBootstrapFlag creates the sentinel file that signals bootstrap is complete.
-// Non-fatal — if it fails, sub-agents just re-bootstrap (graceful degradation).
-func writeBootstrapFlag(executor tools.ContextToolsExecutor, ctx context.Context, logger *logrus.Entry) {
-	flagArgs, _ := json.Marshal(map[string]interface{}{
-		"input":   fmt.Sprintf("echo 'bootstrapped at %s' > %s", time.Now().UTC().Format(time.RFC3339), bootstrapFlagPath),
-		"timeout": 3,
-	})
-	if _, err := executor.Execute(ctx, 0, "", "terminal", "", flagArgs); err != nil {
-		logger.WithError(err).Debug("v8: failed to write bootstrap flag file (non-fatal)")
-	}
-}
-
-// v8: checkBootstrapFlag checks if the bootstrap sentinel exists in the container.
-func checkBootstrapFlag(executor tools.ContextToolsExecutor, ctx context.Context) bool {
-	checkArgs, _ := json.Marshal(map[string]interface{}{
-		"input":   fmt.Sprintf("test -f %s && echo 'YES' || echo 'NO'", bootstrapFlagPath),
-		"timeout": 3,
-	})
-	result, err := executor.Execute(ctx, 0, "", "terminal", "", checkArgs)
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(result) == "YES"
-}
-
-// CrossAgentState holds state that persists across pentester boundaries via /work/.agent_state.json.
-type CrossAgentState struct {
-	CompletedTasks   []CompletedTaskJSON `json:"completed_tasks,omitempty"`
-	LoopAlertCount   int                 `json:"loop_alert_count"`
-	BootstrapDone    bool                `json:"bootstrap_done"`
-	TotalToolCalls   int                 `json:"total_tool_calls"`
-	LastAgentEnd     string              `json:"last_agent_end"`
-}
-
-const crossAgentStatePath = "/work/.agent_state.json"
-
-// v8: writeCrossAgentState persists cross-agent state to the container filesystem.
-func writeCrossAgentState(executor tools.ContextToolsExecutor, ctx context.Context, logger *logrus.Entry,
-	completedWork *CompletedWorkTracker, loopDetector *ReadLoopDetector, bootstrapDone bool, toolCallCount int) {
-	cas := CrossAgentState{
-		BootstrapDone:  bootstrapDone,
-		TotalToolCalls: toolCallCount,
-		LastAgentEnd:   time.Now().UTC().Format(time.RFC3339),
-	}
-	if completedWork != nil {
-		cas.CompletedTasks = completedWork.ToJSON()
-	}
-	if loopDetector != nil {
-		_, cas.LoopAlertCount = loopDetector.GetStats()
-	}
-	data, err := json.Marshal(cas)
-	if err != nil {
-		return
-	}
-	cmd := fmt.Sprintf("cat > %s << 'AS_EOF'\n%s\nAS_EOF", crossAgentStatePath, string(data))
-	args, _ := json.Marshal(map[string]interface{}{"input": cmd, "timeout": 5})
-	if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", args); writeErr != nil {
-		logger.WithError(writeErr).Debug("v8: failed to write cross-agent state (non-fatal)")
-	}
-}
-
-// v8: readCrossAgentState reads cross-agent state from the container filesystem.
-func readCrossAgentState(executor tools.ContextToolsExecutor, ctx context.Context) *CrossAgentState {
-	readArgs, _ := json.Marshal(map[string]interface{}{
-		"input":   fmt.Sprintf("cat %s 2>/dev/null || echo '{}'", crossAgentStatePath),
-		"timeout": 5,
-	})
-	result, err := executor.Execute(ctx, 0, "", "terminal", "", readArgs)
-	if err != nil {
-		return nil
-	}
-	var cas CrossAgentState
-	if json.Unmarshal([]byte(strings.TrimSpace(result)), &cas) != nil {
-		return nil
-	}
-	return &cas
-}
-
 func getNestingDepth(ctx context.Context) int {
 	if v, ok := ctx.Value(nestingDepthKey{}).(int); ok {
 		return v
@@ -308,11 +234,14 @@ func (fp *flowProvider) performAgentChain(
 		// commands, subsequent bootstrap attempts get synthetic responses.
 		bootstrapCompleted = false
 		bootstrapCallCount = 0
-	)
 
-	// v8: For sub-agents (depth > 0), check file-based bootstrap flag.
-	// Main agent (depth=0) uses in-memory flag naturally — zero cost.
-	// depth is set later (line ~381), so we defer the check to after depth is known.
+		// Fix 13: Auto-done safety net — tracks calls since the last
+		// delegation tool returned results. If the primary agent keeps
+		// working without calling done, we inject warnings then force-finish.
+		callsSinceLastDelegation    = 0
+		delegationResultReceived    = false
+		autoDoneWarningInjected     = false
+	)
 
 	// Silence unused variable warnings for guard booleans (set inside loop).
 	_ = industryDetected
@@ -448,11 +377,9 @@ func (fp *flowProvider) performAgentChain(
 				stateThrottle.MarkWritten(loaded.ToolCallCount)
 				resumeThrottle.MarkWritten(loaded.ToolCallCount)
 
-				// v7/v8: If resuming with >5 tool calls, bootstrap is definitely done
+				// v7: If resuming with >5 tool calls, bootstrap is definitely done
 				if loaded.ToolCallCount > 5 {
 					bootstrapCompleted = true
-					// v8: Ensure the file flag exists for sub-agents
-					writeBootstrapFlag(executor, ctx, logger)
 				}
 			}
 		}
@@ -468,37 +395,6 @@ func (fp *flowProvider) performAgentChain(
 	depth := getNestingDepth(ctx)
 	ctx = withIncrementedDepth(ctx)
 
-	// v8: File-based bootstrap flag check for sub-agents
-	if !bootstrapCompleted && depth > 0 {
-		if checkBootstrapFlag(executor, ctx) {
-			bootstrapCompleted = true
-			logger.Info("v8: bootstrap flag detected from filesystem — skipping bootstrap")
-		}
-	}
-
-	// v8: Restore cross-agent state from filesystem for sub-agents
-	if depth > 0 {
-		if cas := readCrossAgentState(executor, ctx); cas != nil {
-			if cas.BootstrapDone && !bootstrapCompleted {
-				bootstrapCompleted = true
-			}
-			if len(cas.CompletedTasks) > 0 && len(execState.CompletedTasks) == 0 {
-				completedWork.RestoreFromState(cas.CompletedTasks)
-				logger.WithField("restored_completed_tasks", len(cas.CompletedTasks)).
-					Info("v8: restored completed work from cross-agent state")
-			}
-			if cas.LoopAlertCount > 0 && loopDetector != nil {
-				loopDetector.RestoreAlertCount(cas.LoopAlertCount)
-			}
-			logger.WithFields(logrus.Fields{
-				"bootstrap":       cas.BootstrapDone,
-				"completed_tasks": len(cas.CompletedTasks),
-				"loop_alerts":     cas.LoopAlertCount,
-				"prev_tool_calls": cas.TotalToolCalls,
-			}).Info("v8: restored cross-agent state from filesystem")
-		}
-	}
-
 	// Hard time limit per subtask to prevent infinite execution.
 	// For nested agents (depth > 0), use a FRESH timeout detached from the parent's
 	// deadline to prevent the shared-deadline starvation problem where each nesting
@@ -511,7 +407,7 @@ func (fp *flowProvider) performAgentChain(
 	// v5: Per-subtask-type time-boxing — classify the subtask and use a
 	// category-specific budget (recon=30min, exploit=25min, generic=20min).
 	var timebox *SubtaskTimebox
-	if ShouldUseTimebox() {
+	if depth == 0 && ShouldUseTimebox() {
 		if meta := GetSubtaskMeta(ctx); meta != nil {
 			timebox = NewSubtaskTimebox(meta.Title, meta.Description)
 			logger.WithFields(logrus.Fields{
@@ -523,16 +419,6 @@ func (fp *flowProvider) performAgentChain(
 			if timebox.MaxDuration < effectiveTimeout {
 				effectiveTimeout = timebox.MaxDuration
 			}
-		} else if depth > 0 {
-			// v8: Nested agent without SubtaskMeta — create a generic timebox
-			// matching the nested timeout so graceful force-finish works
-			timebox = &SubtaskTimebox{
-				Category:    SubtaskCategoryGeneric,
-				MaxDuration: getNestedTimeout(depth),
-				StartTime:   time.Now(),
-			}
-			logger.WithField("timebox_max_duration", timebox.MaxDuration.String()).
-				Info("v8: created fallback timebox for nested agent")
 		}
 	}
 
@@ -821,6 +707,26 @@ func (fp *flowProvider) performAgentChain(
 
 		result, err := fp.callWithRetries(ctx, chain, optAgentType, executor)
 		if err != nil {
+			// Fix 12: Check if this is a context.DeadlineExceeded — if so,
+			// save partial results and return the error so the controller
+			// treats it as a deadline expiry (no retry, mark finished).
+			if errors.Is(err, context.DeadlineExceeded) && subtaskID != nil {
+				partialResult := fmt.Sprintf(
+					"[DEADLINE EXPIRED during LLM call — subtask time budget exhausted]\n"+
+						"Tool calls completed: %d\nPhase: %s\n",
+					toolCallCount, execState.Phase,
+				)
+				bgCtx, bgCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if _, dbErr := fp.db.UpdateSubtaskResult(bgCtx, database.UpdateSubtaskResultParams{
+					Result: partialResult,
+					ID:     *subtaskID,
+				}); dbErr != nil {
+					logger.WithError(dbErr).Error("failed to save partial results on deadline expiry (mid-LLM)")
+				}
+				bgCancel()
+				logger.WithField("tool_call_count", toolCallCount).
+					Warn("subtask deadline expired during LLM call: returning with partial results")
+			}
 			logger.WithError(err).Error("failed to call agent chain")
 			return err
 		}
@@ -971,8 +877,6 @@ func (fp *flowProvider) performAgentChain(
 								bootstrapCallCount++
 								if bootstrapCallCount >= 3 {
 									bootstrapCompleted = true
-									// v8: Write persistent flag so sub-agents skip bootstrap
-									writeBootstrapFlag(executor, ctx, logger)
 								}
 							}
 						}
@@ -983,10 +887,12 @@ func (fp *flowProvider) performAgentChain(
 			// v14: Memorist circuit breaker — block memorist calls after 2+ failures.
 			// This operates at the CALLING AGENT level, preventing the LLM from
 			// invoking memorist when the service is known to be down.
-			if !v5Intercepted && funcName == tools.MemoristToolName && fp.memoristCB != nil {
+			var memoristIntercepted bool
+			var memoristResponse string
+			if funcName == tools.MemoristToolName && fp.memoristCB != nil {
 				if fp.memoristCB.shouldBlock() {
-					v5Intercepted = true
-					v5Response = memoristBreakerMessage
+					memoristIntercepted = true
+					memoristResponse = memoristBreakerMessage
 					logger.WithField("memorist_breaker", "blocked").
 						Warn("v14: memorist call blocked by flow-level circuit breaker")
 				}
@@ -996,13 +902,15 @@ func (fp *flowProvider) performAgentChain(
 			var err error
 			if v5Intercepted {
 				response = v5Response
+			} else if memoristIntercepted {
+				response = memoristResponse
 			} else {
 				response, err = fp.execToolCall(ctx, chainID, idx, result, detector, executor, nTracker, terminalCache, knownData)
 			}
 
 			// v14: Track memorist unavailability at the flow level.
-			if funcName == tools.MemoristToolName && fp.memoristCB != nil && !v5Intercepted {
-				if err == nil && isMemoristUnavailableResponse(response) {
+			if funcName == tools.MemoristToolName && fp.memoristCB != nil && !memoristIntercepted && !v5Intercepted {
+				if err == nil && isUnavailableResponse(response) {
 					fp.memoristCB.recordFailure()
 					logger.WithField("memorist_breaker", "failure_recorded").
 						Warn("v14: memorist returned unavailable — recording failure in flow breaker")
@@ -1058,6 +966,29 @@ func (fp *flowProvider) performAgentChain(
 			}
 
 			if err != nil {
+				// Fix 12: Check if tool execution failed due to deadline expiry.
+				// Save partial results and let the error propagate so the controller
+				// handles it as a deadline expiry (no retry, mark finished).
+				if errors.Is(err, context.DeadlineExceeded) && subtaskID != nil {
+					partialResult := fmt.Sprintf(
+						"[DEADLINE EXPIRED during tool execution — subtask time budget exhausted]\n"+
+							"Tool calls completed: %d\nLast tool: %s\nPhase: %s\n",
+						toolCallCount+idx+1, funcName, execState.Phase,
+					)
+					bgCtx, bgCancel := context.WithTimeout(context.Background(), 10*time.Second)
+					if _, dbErr := fp.db.UpdateSubtaskResult(bgCtx, database.UpdateSubtaskResultParams{
+						Result: partialResult,
+						ID:     *subtaskID,
+					}); dbErr != nil {
+						logger.WithError(dbErr).Error("failed to save partial results on deadline expiry (mid-tool)")
+					}
+					bgCancel()
+					logger.WithFields(logrus.Fields{
+						"tool_call_count": toolCallCount + idx + 1,
+						"func_name":       funcName,
+					}).Warn("subtask deadline expired during tool execution: returning with partial results")
+				}
+
 				metrics.ErrorCount++
 				logger.WithError(err).WithFields(logrus.Fields{
 					"func_name": funcName,
@@ -1134,8 +1065,6 @@ func (fp *flowProvider) performAgentChain(
 
 			// Sprint 2 wiring: Record finding for attack chain detection.
 			findingTracker.RecordFinding(response)
-			// v8: Wire FindingsCount to FindingTracker so STATE.json reports accurate count
-			execState.FindingsCount = findingTracker.GetTotalCount()
 			if findingTracker.HasNewHighFindings() {
 				if suggestion := findingTracker.GetChainSuggestions(); suggestion != nil {
 					chain = append(chain, llms.MessageContent{
@@ -1190,6 +1119,19 @@ func (fp *flowProvider) performAgentChain(
 			if executor.IsBarrierFunction(funcName) {
 				wantToStop = true
 			}
+
+			// Fix 13: Track delegation results for auto-done enforcement.
+			// When the primary agent (depth 0) receives a result from a
+			// delegation tool (pentester, coder, maintenance, etc.),
+			// start counting subsequent non-done calls.
+			if depth == 0 && toolTypeMapping[funcName] == tools.AgentToolType {
+				delegationResultReceived = true
+				callsSinceLastDelegation = 0
+				logger.WithField("delegation_tool", funcName).
+					Debug("fix13: delegation result received, resetting auto-done counter")
+			} else if depth == 0 && delegationResultReceived && !executor.IsBarrierFunction(funcName) {
+				callsSinceLastDelegation++
+			}
 		}
 
 		toolCallCount += len(result.funcCalls)
@@ -1218,6 +1160,78 @@ func (fp *flowProvider) performAgentChain(
 					"total_alerts": alert.TotalAlerts,
 					"is_block":     alert.IsBlock,
 				}).Warn("injected loop detection alert into agent chain")
+			}
+		}
+
+		// Fix 13: Auto-done safety net — inject escalating warnings when the
+		// primary agent keeps working after receiving delegation results without
+		// calling done. Force-finish if warnings are ignored.
+		if depth == 0 && delegationResultReceived && !wantToStop {
+			if callsSinceLastDelegation >= autoDoneWarningThreshold && !autoDoneWarningInjected {
+				autoDoneWarningInjected = true
+				warningMsg := fmt.Sprintf(
+					"[⚠️ AUTO-DONE WARNING — You have made %d tool calls since receiving specialist results without calling \"%s\"]\n"+
+						"Your specialist has already returned complete results. You MUST call \"%s\" NOW to finish this subtask.\n"+
+						"Do NOT re-read files, re-verify, or re-delegate. Synthesize the results you have and call \"%s\" immediately.\n"+
+						"If you do not call \"%s\" within %d more tool calls, the subtask will be FORCE-FINISHED with partial results.",
+					callsSinceLastDelegation, tools.FinalyToolName,
+					tools.FinalyToolName, tools.FinalyToolName, tools.FinalyToolName,
+					autoDoneForceThreshold,
+				)
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: warningMsg},
+					},
+				})
+				if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+					logger.WithError(err).Error("failed to update msg chain after auto-done warning")
+				}
+				logger.WithFields(logrus.Fields{
+					"calls_since_delegation": callsSinceLastDelegation,
+					"tool_call_count":        toolCallCount,
+				}).Warn("fix13: injected auto-done warning — agent not calling done after delegation results")
+			}
+
+			if autoDoneWarningInjected && callsSinceLastDelegation >= autoDoneWarningThreshold+autoDoneForceThreshold {
+				logger.WithFields(logrus.Fields{
+					"calls_since_delegation": callsSinceLastDelegation,
+					"tool_call_count":        toolCallCount,
+				}).Error("fix13: force-finishing subtask — agent ignored auto-done warning")
+
+				// Force-finish: save partial results and exit the loop.
+				if subtaskID != nil {
+					partialResult := fmt.Sprintf(
+						"[AUTO-DONE: Subtask force-finished after %d tool calls without calling done]\n"+
+							"The agent received complete results from delegated specialists but failed to call the done tool.\n",
+						toolCallCount,
+					)
+					// Collect recent tool results as evidence of work done
+					partialResult += "\nRecent tool results (last 5):\n"
+					toolResultCount := 0
+					for i := len(chain) - 1; i >= 0 && toolResultCount < 5; i-- {
+						if chain[i].Role == llms.ChatMessageTypeTool {
+							for _, part := range chain[i].Parts {
+								if resp, ok := part.(llms.ToolCallResponse); ok {
+									snippet := resp.Content
+									if len(snippet) > 300 {
+										snippet = snippet[:300] + "..."
+									}
+									partialResult += fmt.Sprintf("- %s: %s\n", resp.Name, snippet)
+									toolResultCount++
+								}
+							}
+						}
+					}
+					if _, err := fp.db.UpdateSubtaskResult(ctx, database.UpdateSubtaskResultParams{
+						Result: partialResult,
+						ID:     *subtaskID,
+					}); err != nil {
+						logger.WithError(err).Error("fix13: failed to save partial results on auto-done force-finish")
+					}
+				}
+
+				return fmt.Errorf("fix13: subtask force-finished — agent did not call done after %d calls post-delegation", callsSinceLastDelegation)
 			}
 		}
 
@@ -1251,9 +1265,9 @@ func (fp *flowProvider) performAgentChain(
 				}
 			}
 
-			// v8: Generate resume content whenever STATE.json is about to be written,
-			// not just on the resume throttle schedule. RESUME.md always piggybacks on STATE writes.
-			if stateThrottle.ShouldWrite(toolCallCount) || resumeThrottle.ShouldWrite(toolCallCount) {
+			// v6: Generate resume context based on resume throttle schedule (was every 10,
+			// now every 30 calls or 3 min).
+			if resumeThrottle.ShouldWrite(toolCallCount) {
 				resumeContent := buildResumeContent(toolHistory, metrics)
 				if resumeContent != "" {
 					execState.ResumeContext = resumeContent
@@ -1266,58 +1280,52 @@ func (fp *flowProvider) performAgentChain(
 				// Async DB write — always happens (coalesced by AsyncStateWriter).
 				stateWriter.Write(*subtaskID, stateJSON)
 
-				// v8: Unified batching — RESUME.md always piggybacks on STATE.json writes.
-				// STATE.json is the "clock" (fires every 20 calls); RESUME.md is written
-				// alongside it whenever resume content is available. This guarantees 100%
-				// batching and eliminates the alignment problem entirely.
+				// v7: Batch STATE.json and RESUME.md writes into a single terminal call
+				// when both throttles fire simultaneously. Saves 1 tool call per co-fire.
 				wantWriteState := toolCallCount > 0 && stateThrottle.ShouldWrite(toolCallCount)
-				wantForceResume := toolCallCount > 0 && resumeThrottle.ShouldWrite(toolCallCount) && execState.ResumeContext != "" && !wantWriteState
+				wantWriteResume := toolCallCount > 0 && resumeThrottle.ShouldWrite(toolCallCount) && execState.ResumeContext != ""
 
-				if wantWriteState {
-					// STATE fires — always include RESUME.md if content exists
-					if execState.ResumeContext != "" {
-						// Batched write: STATE.json + RESUME.md in one terminal call
-						combinedCmd := fmt.Sprintf(
-							"cat > /work/STATE.json << 'STATE_EOF'\n%s\nSTATE_EOF\ncat > /work/RESUME.md << 'RESUME_EOF'\n%s\nRESUME_EOF",
-							stateJSON, execState.ResumeContext,
-						)
-						writeArgs, _ := json.Marshal(map[string]interface{}{
-							"input":   combinedCmd,
-							"timeout": 8,
-						})
-						if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeArgs); writeErr != nil {
-							logger.WithError(writeErr).Debug("failed to batch-write STATE.json + RESUME.md (non-fatal)")
-						} else {
-							stateThrottle.MarkWritten(toolCallCount)
-							resumeThrottle.MarkWritten(toolCallCount)
-						}
+				if wantWriteState && wantWriteResume {
+					// Both fire — combine into a single terminal command
+					combinedCmd := fmt.Sprintf(
+						"cat > /work/STATE.json << 'STATE_EOF'\n%s\nSTATE_EOF\ncat > /work/RESUME.md << 'RESUME_EOF'\n%s\nRESUME_EOF",
+						stateJSON, execState.ResumeContext,
+					)
+					writeArgs, _ := json.Marshal(map[string]interface{}{
+						"input":   combinedCmd,
+						"timeout": 8,
+					})
+					if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeArgs); writeErr != nil {
+						logger.WithError(writeErr).Debug("failed to batch-write STATE.json + RESUME.md (non-fatal)")
 					} else {
-						// STATE.json only (no resume content yet)
-						writeStateArgs, _ := json.Marshal(map[string]interface{}{
-							"input":   fmt.Sprintf("cat > /work/STATE.json << 'STATE_EOF'\n%s\nSTATE_EOF", stateJSON),
-							"timeout": 5,
-						})
-						if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeStateArgs); writeErr != nil {
-							logger.WithError(writeErr).Debug("failed to update container STATE.json (non-fatal)")
-						} else {
-							stateThrottle.MarkWritten(toolCallCount)
-						}
+						stateThrottle.MarkWritten(toolCallCount)
+						resumeThrottle.MarkWritten(toolCallCount)
 					}
-					// Record system writes for cache invalidation
 					if loopDetector != nil {
 						loopDetector.RecordSystemWrite("STATE.json")
-						if execState.ResumeContext != "" {
-							loopDetector.RecordSystemWrite("RESUME.md")
-						}
+						loopDetector.RecordSystemWrite("RESUME.md")
 					}
 					if fileReadCache != nil {
 						fileReadCache.RecordSystemFileWrite("STATE.json")
-						if execState.ResumeContext != "" {
-							fileReadCache.RecordSystemFileWrite("RESUME.md")
-						}
+						fileReadCache.RecordSystemFileWrite("RESUME.md")
 					}
-				} else if wantForceResume {
-					// RESUME forced independently (phase transition, barrier hit)
+				} else if wantWriteState {
+					writeStateArgs, _ := json.Marshal(map[string]interface{}{
+						"input":   fmt.Sprintf("cat > /work/STATE.json << 'STATE_EOF'\n%s\nSTATE_EOF", stateJSON),
+						"timeout": 5,
+					})
+					if _, writeErr := executor.Execute(ctx, 0, "", "terminal", "", writeStateArgs); writeErr != nil {
+						logger.WithError(writeErr).Debug("failed to update container STATE.json (non-fatal)")
+					} else {
+						stateThrottle.MarkWritten(toolCallCount)
+					}
+					if loopDetector != nil {
+						loopDetector.RecordSystemWrite("STATE.json")
+					}
+					if fileReadCache != nil {
+						fileReadCache.RecordSystemFileWrite("STATE.json")
+					}
+				} else if wantWriteResume {
 					writeResumeArgs, _ := json.Marshal(map[string]interface{}{
 						"input":   fmt.Sprintf("cat > /work/RESUME.md << 'RESUME_EOF'\n%s\nRESUME_EOF", execState.ResumeContext),
 						"timeout": 5,
@@ -1333,11 +1341,6 @@ func (fp *flowProvider) performAgentChain(
 					if fileReadCache != nil {
 						fileReadCache.RecordSystemFileWrite("RESUME.md")
 					}
-				}
-
-				// v8: Write cross-agent state to filesystem (piggybacks on state write schedule)
-				if depth > 0 && wantWriteState {
-					writeCrossAgentState(executor, ctx, logger, completedWork, loopDetector, bootstrapCompleted, toolCallCount)
 				}
 			}
 		}

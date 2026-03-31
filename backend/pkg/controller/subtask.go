@@ -348,6 +348,19 @@ func (stw *subtaskWorker) Run(ctx context.Context) error {
 				err = errors.Join(err, errChainConsistency)
 			}
 			_ = stw.SetStatus(ctx, database.SubtaskStatusWaiting)
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			// Fix 12: Timebox deadline expiry — the subtask used its full time budget.
+			// Mark as Finished (not Failed) since partial results were already saved
+			// by the deadline handler in performAgentChain. Do NOT retry.
+			bgCtx := context.Background()
+			errChainConsistency := stw.subtaskCtx.Provider.EnsureChainConsistency(bgCtx, msgChainID)
+			if errChainConsistency != nil {
+				err = errors.Join(err, errChainConsistency)
+			}
+			_ = stw.SetStatus(bgCtx, database.SubtaskStatusFinished)
+			// Return nil so the controller advances to the next subtask.
+			// The partial results are already in the DB.
+			return nil
 		} else {
 			// Permanent failure (API key expired, model error, schema error, etc.)
 			// Set to Failed — this needs investigation, not user input.

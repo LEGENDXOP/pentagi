@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"pentagi/pkg/cast"
 	"pentagi/pkg/csum"
@@ -117,7 +118,6 @@ type FlowProviderHandlers interface {
 	GetSummarizeResultHandler(taskID, subtaskID *int64) tools.SummarizeHandler
 }
 
-
 // memoristBreaker tracks consecutive memorist unavailability responses at the
 // flow level. Unlike the GraphitiAvailability tracker (which prevents the memorist
 // agent chain from starting), this operates at the CALLING AGENT level — it
@@ -127,17 +127,17 @@ type FlowProviderHandlers interface {
 type memoristBreaker struct {
 	consecutiveFails atomic.Int32
 	disabled         atomic.Bool
-	disabledAt       atomic.Int64 // unix timestamp in seconds
+	disabledAt       atomic.Int64 // unix timestamp
 	reopenAfter      time.Duration
 }
 
 const (
 	memoristBreakerThreshold   = 2
 	memoristBreakerReopenAfter = 10 * time.Minute
-	memoristBreakerMessage     = "\u26a1 Memorist service unavailable \u2014 skipped (circuit breaker). " +
+	memoristBreakerMessage     = "⚡ Memorist service unavailable — skipped (circuit breaker). " +
 		"The memory/knowledge graph service has been down for this entire flow. " +
 		"This tool call was blocked BEFORE execution to save time. " +
-		"Do NOT call memorist again \u2014 use other tools and available context instead."
+		"Do NOT call memorist again — use other tools and available context instead."
 )
 
 func newMemoristBreaker(reopenAfter time.Duration) *memoristBreaker {
@@ -154,12 +154,14 @@ func (mb *memoristBreaker) shouldBlock() bool {
 	// Half-open: allow one probe after reopenAfter elapses
 	disabledAt := time.Unix(mb.disabledAt.Load(), 0)
 	if time.Since(disabledAt) >= mb.reopenAfter {
+		// Allow one probe — reset disabled temporarily
+		// If the probe fails, recordFailure will re-disable
 		mb.disabled.Store(false)
 		mb.consecutiveFails.Store(0)
 		logrus.WithFields(logrus.Fields{
 			"component":    "memorist_breaker",
 			"reopen_after": mb.reopenAfter,
-		}).Info("memorist breaker half-open \u2014 allowing probe request")
+		}).Info("memorist breaker half-open — allowing probe request")
 		return false
 	}
 	return true
@@ -175,7 +177,7 @@ func (mb *memoristBreaker) recordFailure() {
 			"component":         "memorist_breaker",
 			"consecutive_fails": count,
 			"threshold":         memoristBreakerThreshold,
-		}).Warn("memorist breaker TRIPPED \u2014 blocking all memorist calls for this flow")
+		}).Warn("memorist breaker TRIPPED — blocking all memorist calls for this flow")
 	}
 }
 
@@ -186,14 +188,15 @@ func (mb *memoristBreaker) recordSuccess() {
 	mb.disabled.Store(false)
 	if wasDisabled {
 		logrus.WithField("component", "memorist_breaker").
-			Info("memorist breaker RECOVERED \u2014 re-enabling memorist calls")
+			Info("memorist breaker RECOVERED — re-enabling memorist calls")
 	}
 }
 
-// isMemoristUnavailableResponse checks if a memorist response indicates the service is down.
-func isMemoristUnavailableResponse(response string) bool {
+// isUnavailableResponse checks if a memorist response indicates the service is down.
+func isUnavailableResponse(response string) bool {
 	return strings.Contains(response, "currently unavailable") ||
 		strings.Contains(response, "temporarily unavailable") ||
+		strings.Contains(response, "service is currently unavailable") ||
 		strings.Contains(response, "UNREACHABLE")
 }
 
@@ -216,16 +219,16 @@ type flowProvider struct {
 	embedder          embeddings.Embedder
 	graphitiClient    *graphiti.Client
 	interactshEnabled bool
-
-	// v14: Flow-level memorist circuit breaker — prevents LLMs from calling
-	// memorist after repeated failures at the tool call interception level.
-	memoristCB *memoristBreaker
 	authStoreEnabled  bool
 
 	flowID   int64
 	publicIP string
 
 	callCounter *atomic.Int64
+
+	// v14: Flow-level memorist circuit breaker — prevents LLMs from calling
+	// memorist after repeated failures. See memoristBreaker doc.
+	memoristCB *memoristBreaker
 
 	image    string
 	title    string

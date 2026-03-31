@@ -530,8 +530,10 @@ func (tw *taskWorker) runSubtaskWithRetry(
 			return nil // success
 		}
 
-		// Context cancellation is not retryable
-		if errors.Is(lastErr, context.Canceled) {
+		// Context cancellation and deadline expiry are not retryable.
+		// DeadlineExceeded from timebox must not trigger retries — the subtask
+		// already ran its full time budget and force-finished gracefully.
+		if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, context.DeadlineExceeded) {
 			return lastErr
 		}
 
