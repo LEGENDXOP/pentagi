@@ -980,12 +980,35 @@ func (fp *flowProvider) performAgentChain(
 				}
 			}
 
+			// v14: Memorist circuit breaker — block memorist calls after 2+ failures.
+			// This operates at the CALLING AGENT level, preventing the LLM from
+			// invoking memorist when the service is known to be down.
+			if !v5Intercepted && funcName == tools.MemoristToolName && fp.memoristCB != nil {
+				if fp.memoristCB.shouldBlock() {
+					v5Intercepted = true
+					v5Response = memoristBreakerMessage
+					logger.WithField("memorist_breaker", "blocked").
+						Warn("v14: memorist call blocked by flow-level circuit breaker")
+				}
+			}
+
 			var response string
 			var err error
 			if v5Intercepted {
 				response = v5Response
 			} else {
 				response, err = fp.execToolCall(ctx, chainID, idx, result, detector, executor, nTracker, terminalCache, knownData)
+			}
+
+			// v14: Track memorist unavailability at the flow level.
+			if funcName == tools.MemoristToolName && fp.memoristCB != nil && !v5Intercepted {
+				if err == nil && isMemoristUnavailableResponse(response) {
+					fp.memoristCB.recordFailure()
+					logger.WithField("memorist_breaker", "failure_recorded").
+						Warn("v14: memorist returned unavailable — recording failure in flow breaker")
+				} else if err == nil {
+					fp.memoristCB.recordSuccess()
+				}
 			}
 
 			// v6/V2: Prepend duplicate warning to response if CheckReRun issued one.

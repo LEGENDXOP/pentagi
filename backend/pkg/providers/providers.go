@@ -392,6 +392,7 @@ func (pc *providerController) NewFlowProvider(
 		flowID:            flowID,
 		publicIP:          pc.publicIP,
 		callCounter:       newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
+		memoristCB:        newMemoristBreaker(memoristBreakerReopenAfter), // v14
 		image:             image,
 		title:             title,
 		language:          language,
@@ -433,6 +434,7 @@ func (pc *providerController) LoadFlowProvider(
 		flowID:            flowID,
 		publicIP:          pc.publicIP,
 		callCounter:       newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
+		memoristCB:        newMemoristBreaker(memoristBreakerReopenAfter), // v14
 		image:             image,
 		title:             title,
 		language:          language,
@@ -519,6 +521,7 @@ func (pc *providerController) NewAssistantProvider(
 			flowID:            flowID,
 			publicIP:          pc.publicIP,
 			callCounter:       newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
+			memoristCB:        newMemoristBreaker(memoristBreakerReopenAfter), // v14
 			image:             image,
 			title:             title,
 			language:          language,
@@ -564,6 +567,7 @@ func (pc *providerController) LoadAssistantProvider(
 			flowID:            flowID,
 			publicIP:          pc.publicIP,
 			callCounter:       newAtomicInt64(pc.startCallNumber.Add(deltaCallCounter)),
+			memoristCB:        newMemoristBreaker(memoristBreakerReopenAfter), // v14
 			image:             image,
 			title:             title,
 			language:          language,
