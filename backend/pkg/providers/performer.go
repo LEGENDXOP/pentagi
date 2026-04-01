@@ -241,6 +241,13 @@ func (fp *flowProvider) performAgentChain(
 		callsSinceLastDelegation    = 0
 		delegationResultReceived    = false
 		autoDoneWarningInjected     = false
+
+		// Hard loop breaker: counts consecutive read-only tool calls.
+		// Resets on any write/execute/offensive/barrier tool call.
+		consecutiveReadStreak    = 0
+		readStreakWarnThreshold  = getReadStreakWarnThreshold()  // default: 5
+		readStreakBlockThreshold = getReadStreakBlockThreshold() // default: 8
+		readStreakForceThreshold = getReadStreakForceThreshold() // default: 15
 	)
 
 	// Silence unused variable warnings for guard booleans (set inside loop).
@@ -455,6 +462,45 @@ func (fp *flowProvider) performAgentChain(
 		})
 		logger.WithField("tool_call_count", execState.ToolCallCount).
 			Info("injected resume context into chain from persisted execution state")
+	}
+
+	// Sibling context injection: query completed sibling subtasks and inject
+	// their CompletedTasks into the chain so the new agent knows what was
+	// already done. This prevents redundant work across subtasks.
+	if subtaskID != nil && taskID != nil {
+		siblings, sibErr := fp.db.GetTaskSubtasks(ctx, *taskID)
+		if sibErr == nil {
+			var sibCtx strings.Builder
+			for _, sib := range siblings {
+				if sib.ID == *subtaskID || sib.Status != database.SubtaskStatusFinished {
+					continue
+				}
+				if sib.Context == "" {
+					continue
+				}
+				if loaded := ParseExecutionState(sib.Context); loaded != nil && len(loaded.CompletedTasks) > 0 {
+					sibCtx.WriteString(fmt.Sprintf("\n### Already done by '%s':\n", sib.Title))
+					for _, ct := range loaded.CompletedTasks {
+						sibCtx.WriteString(fmt.Sprintf("- ✅ %s", ct.Description))
+						if ct.OutputFile != "" {
+							sibCtx.WriteString(fmt.Sprintf(" (results in %s)", ct.OutputFile))
+						}
+						sibCtx.WriteString("\n")
+					}
+				}
+			}
+			if sibCtx.Len() > 0 {
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: "[WORK ALREADY COMPLETED BY SIBLING SUBTASKS \u2014 DO NOT REPEAT]\n" + sibCtx.String() +
+							"\nDo NOT re-run any of the above. Start with NEW work only."},
+					},
+				})
+				logger.WithField("sibling_count", len(siblings)).
+					Info("injected sibling subtask context")
+			}
+		}
 	}
 
 	for {
@@ -801,6 +847,29 @@ func (fp *flowProvider) performAgentChain(
 			var v5Response string
 			var v5Warning string
 
+			// ── Hard Loop Breaker: consecutive read-only streak enforcement ──
+			if !v5Intercepted && consecutiveReadStreak >= readStreakBlockThreshold {
+				if isReadOnlyToolCall(funcName, toolCall.FunctionCall.Arguments) {
+					v5Intercepted = true
+					v5Response = fmt.Sprintf(
+						"🛑 READ STREAK HARD BLOCK: You have executed %d consecutive read-only "+
+							"commands with ZERO write or execute operations between them. "+
+							"This read has been REFUSED.\n\n"+
+							"YOUR ONLY ALLOWED ACTIONS:\n"+
+							"1. Execute an offensive tool (curl, nmap, nuclei_scan, browser_navigate)\n"+
+							"2. Write findings using terminal heredoc (cat > /work/FINDINGS.md << 'EOF')\n"+
+							"3. Call the result/report tool to complete this subtask\n\n"+
+							"The next read-only command will also be refused. After %d more refused reads, "+
+							"this subtask will be FORCE-COMPLETED with partial results.",
+						consecutiveReadStreak,
+						readStreakForceThreshold-consecutiveReadStreak,
+					)
+					logger.WithField("consecutive_read_streak", consecutiveReadStreak).
+						Warn("hard loop breaker: refused read-only tool call due to streak")
+					consecutiveReadStreak++ // Keep incrementing even on blocks
+				}
+			}
+
 			// v6: Loop detector hard block — reject ALL read tool calls after 3+ alerts.
 			if !v5Intercepted && loopDetector != nil && loopDetector.ShouldBlock() {
 				if funcName == "terminal" {
@@ -1116,6 +1185,40 @@ func (fp *flowProvider) performAgentChain(
 				}
 			}
 
+			// ── Hard Loop Breaker: update consecutive read streak ──
+			if isReadOnlyToolCall(funcName, toolCall.FunctionCall.Arguments) {
+				consecutiveReadStreak++
+				if consecutiveReadStreak == readStreakWarnThreshold {
+					warnMsg := fmt.Sprintf(
+						"⚠️ [READ STREAK WARNING: %d consecutive read-only operations]\n"+
+							"You have made %d consecutive read-only commands (ls, cat, head, grep, find, etc.) "+
+							"without executing any write or offensive action.\n\n"+
+							"If you continue reading without acting, your read commands will be BLOCKED "+
+							"after %d consecutive reads, and the subtask will be FORCE-COMPLETED after %d.\n\n"+
+							"TAKE ACTION NOW: execute an offensive tool, write your findings, or complete the subtask.",
+						consecutiveReadStreak, consecutiveReadStreak,
+						readStreakBlockThreshold, readStreakForceThreshold,
+					)
+					chain = append(chain, llms.MessageContent{
+						Role: llms.ChatMessageTypeHuman,
+						Parts: []llms.ContentPart{
+							llms.TextContent{Text: warnMsg},
+						},
+					})
+					logger.WithField("consecutive_read_streak", consecutiveReadStreak).
+						Warn("hard loop breaker: injected read streak warning")
+				}
+			} else {
+				// Any non-read tool call resets the streak
+				if consecutiveReadStreak > 0 {
+					logger.WithFields(logrus.Fields{
+						"consecutive_read_streak_broken": consecutiveReadStreak,
+						"breaking_tool":                  funcName,
+					}).Debug("hard loop breaker: read streak broken by non-read tool call")
+				}
+				consecutiveReadStreak = 0
+			}
+
 			if executor.IsBarrierFunction(funcName) {
 				wantToStop = true
 			}
@@ -1132,6 +1235,52 @@ func (fp *flowProvider) performAgentChain(
 			} else if depth == 0 && delegationResultReceived && !executor.IsBarrierFunction(funcName) {
 				callsSinceLastDelegation++
 			}
+		}
+
+		// ── Hard Loop Breaker: force-complete if streak reaches force threshold ──
+		if consecutiveReadStreak >= readStreakForceThreshold {
+			logger.WithFields(logrus.Fields{
+				"consecutive_read_streak": consecutiveReadStreak,
+				"tool_call_count":         toolCallCount + len(result.funcCalls),
+			}).Error("hard loop breaker: FORCE-COMPLETING subtask due to extreme read streak")
+
+			if subtaskID != nil {
+				partialResult := fmt.Sprintf(
+					"[FORCE-COMPLETED: Subtask terminated after %d consecutive read-only operations]\n"+
+						"The agent executed %d read-only commands in a row without taking any "+
+						"write or offensive action. This indicates an unproductive analysis loop.\n\n"+
+						"Total tool calls: %d\n",
+					consecutiveReadStreak, consecutiveReadStreak,
+					toolCallCount+len(result.funcCalls),
+				)
+				// Collect recent tool results as evidence
+				partialResult += "\nLast 5 read operations:\n"
+				toolResultCount := 0
+				for i := len(chain) - 1; i >= 0 && toolResultCount < 5; i-- {
+					if chain[i].Role == llms.ChatMessageTypeTool {
+						for _, part := range chain[i].Parts {
+							if resp, ok := part.(llms.ToolCallResponse); ok {
+								snippet := resp.Content
+								if len(snippet) > 200 {
+									snippet = snippet[:200] + "..."
+								}
+								partialResult += fmt.Sprintf("- %s: %s\n", resp.Name, snippet)
+								toolResultCount++
+							}
+						}
+					}
+				}
+				bgCtx, bgCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if _, dbErr := fp.db.UpdateSubtaskResult(bgCtx, database.UpdateSubtaskResultParams{
+					Result: partialResult,
+					ID:     *subtaskID,
+				}); dbErr != nil {
+					logger.WithError(dbErr).Error("hard loop breaker: failed to save partial results")
+				}
+				bgCancel()
+			}
+
+			return fmt.Errorf("hard loop breaker: subtask force-completed after %d consecutive read-only operations", consecutiveReadStreak)
 		}
 
 		toolCallCount += len(result.funcCalls)
@@ -2530,4 +2679,70 @@ func isBootstrapCommand(command string) bool {
 	}
 
 	return false
+}
+
+// ─── Hard Loop Breaker: helper functions ─────────────────────────────────────────
+
+// getReadStreakWarnThreshold returns the consecutive read-only streak count
+// at which a warning is injected. Configurable via READ_STREAK_WARN env var.
+func getReadStreakWarnThreshold() int {
+	if v := os.Getenv("READ_STREAK_WARN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 3 {
+			return n
+		}
+	}
+	return 5
+}
+
+// getReadStreakBlockThreshold returns the consecutive read-only streak count
+// at which individual read calls are REFUSED. Configurable via READ_STREAK_BLOCK env var.
+func getReadStreakBlockThreshold() int {
+	if v := os.Getenv("READ_STREAK_BLOCK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 4 {
+			return n
+		}
+	}
+	return 8
+}
+
+// getReadStreakForceThreshold returns the consecutive read-only streak count
+// at which the subtask is FORCE-COMPLETED. Configurable via READ_STREAK_FORCE env var.
+func getReadStreakForceThreshold() int {
+	if v := os.Getenv("READ_STREAK_FORCE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 6 {
+			return n
+		}
+	}
+	return 15
+}
+
+// isReadOnlyToolCall returns true if the tool call is a read-only operation
+// that should count toward the consecutive read streak. Uses the existing
+// classification functions from helpers.go.
+func isReadOnlyToolCall(funcName string, funcArgs string) bool {
+	switch funcName {
+	case "search", "search_code", "search_guide", "memorist", "graphiti_search":
+		return true
+	case "file":
+		return strings.Contains(funcArgs, `"read_file"`)
+	case "terminal":
+		if isTerminalWriteCommand(funcArgs) {
+			return false
+		}
+		var termArgs map[string]interface{}
+		if err := json.Unmarshal([]byte(funcArgs), &termArgs); err != nil {
+			return false
+		}
+		input, ok := termArgs["input"].(string)
+		if !ok || input == "" {
+			return false
+		}
+		primaryCmd := extractPrimaryCommand(input)
+		if isOffensiveCommand(primaryCmd) {
+			return false
+		}
+		return isReadCommand(primaryCmd)
+	default:
+		return false
+	}
 }
