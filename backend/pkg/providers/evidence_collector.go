@@ -3,11 +3,16 @@ package providers
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
+
+	"pentagi/pkg/database"
+
+	"github.com/sirupsen/logrus"
 )
 
 // EvidenceType classifies the kind of evidence collected.
@@ -235,6 +240,61 @@ func (fr *FindingRegistry) GetFindingsBySeverity() map[string][]ReportFinding {
 		}
 	}
 	return grouped
+}
+
+// PersistFindings writes all accumulated findings to the database.
+// Uses best-effort semantics: logs errors but does not fail.
+func (fr *FindingRegistry) PersistFindings(ctx context.Context, db database.Querier) {
+	fr.mu.Lock()
+	findings := make([]ReportFinding, len(fr.findings))
+	copy(findings, fr.findings)
+	fr.mu.Unlock()
+
+	if len(findings) == 0 {
+		return
+	}
+
+	for _, f := range findings {
+		// Check if already persisted (dedup by fingerprint + flow_id).
+		_, err := db.GetFindingByFingerprint(ctx, database.GetFindingByFingerprintParams{
+			Fingerprint: f.Fingerprint,
+			FlowID:      f.FlowID,
+		})
+		if err == nil {
+			continue // Already exists.
+		}
+
+		var subtaskID sql.NullInt64
+		if f.SubtaskID != nil {
+			subtaskID = sql.NullInt64{Int64: *f.SubtaskID, Valid: true}
+		}
+		var rootCauseID sql.NullInt64
+
+		_, err = db.CreateFinding(ctx, database.CreateFindingParams{
+			FlowID:        f.FlowID,
+			SubtaskID:     subtaskID,
+			VulnType:      f.VulnType,
+			Title:         f.Title,
+			Description:   truncateString(f.Description, 8192),
+			Severity:      f.Severity,
+			Endpoint:      f.Endpoint,
+			Fingerprint:   f.Fingerprint,
+			OWASPRef:      f.OWASPRef,
+			CWE:           f.CWE,
+			CVSSBase:      f.CVSSBase,
+			Remediation:   f.Remediation,
+			Confirmed:     f.Confirmed,
+			FalsePositive: f.FalsePositive,
+			RootCauseID:   rootCauseID,
+		})
+		if err != nil {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"flow_id":     f.FlowID,
+				"vuln_type":   f.VulnType,
+				"fingerprint": f.Fingerprint,
+			}).Warn("failed to persist finding to DB")
+		}
+	}
 }
 
 // GetFindingCount returns the total number of non-false-positive findings.
@@ -558,6 +618,24 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "...[truncated]"
+}
+
+// inferSeverityFromResponse guesses severity from response content.
+// Returns "medium" as default if no clear indicators are found.
+func inferSeverityFromResponse(response string) string {
+	lower := strings.ToLower(response)
+	switch {
+	case strings.Contains(lower, "critical") || strings.Contains(lower, "cvss: 9") || strings.Contains(lower, "cvss: 10"):
+		return "critical"
+	case strings.Contains(lower, "high severity") || strings.Contains(lower, "cvss: 7") || strings.Contains(lower, "cvss: 8"):
+		return "high"
+	case strings.Contains(lower, "low severity") || strings.Contains(lower, "informational"):
+		return "low"
+	case strings.Contains(lower, "info"):
+		return "info"
+	default:
+		return "medium"
+	}
 }
 
 // ─── Context propagation ─────────────────────────────────────────────────────

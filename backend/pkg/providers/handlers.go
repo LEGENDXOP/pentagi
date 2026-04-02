@@ -116,21 +116,24 @@ func checkDelegationAllowed(ctx context.Context, agentName string) string {
 		)
 	}
 
-	// Deadline gating: two-tier system for delegation control.
-	// Hard block at 15 min: prevents the pattern where agents attempt delegation
-	// 5-6 times with only minutes left (Flow 38 wasted 2+ hours this way).
+	// Deadline gating: depth-aware system for delegation control.
+	// Depth 1 needs at least 10 minutes; depth 2+ needs at least 5 minutes.
 	// Soft warning at 25 min: logs but allows delegation to proceed.
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
 
-		// Hard block: not enough time for delegation overhead + meaningful nested work
-		hardBlockThreshold := 15 * time.Minute
+		// Hard block: depth-aware minimum time requirement
+		hardBlockThreshold := 10 * time.Minute
+		if depth >= 2 {
+			hardBlockThreshold = 5 * time.Minute
+		}
 		if remaining < hardBlockThreshold {
 			return fmt.Sprintf(
-				"DELEGATION BLOCKED: Only %v remaining — not enough time for %s. "+
+				"Not enough time remaining to delegate — only %v left. "+
+					"Complete the work directly or summarize current findings. "+
 					"Write files DIRECTLY using the terminal tool with heredoc "+
 					"(cat > /work/file.md << 'EOF' ... EOF) or the file tool "+
-					"(action=update_file). Do NOT retry this delegation.",
+					"(action=update_file). Do NOT retry delegation to %s.",
 				remaining.Round(time.Second), agentName,
 			)
 		}

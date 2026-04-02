@@ -507,12 +507,21 @@ func (fp *flowProvider) RefineSubtasks(ctx context.Context, taskID int64) ([]too
 		"completed_count": len(subtasksInfo.Completed),
 	}).Debug("retrieved subtasks info for refinement")
 
+	// Collect workspace files so the refiner knows what already exists in /work/
+	var workspaceFiles []tools.FileInfo
+	if files, err := fp.executor.ListWorkspaceFiles(ctx); err != nil {
+		logger.WithError(err).Warn("failed to list workspace files for refiner context, continuing without them")
+	} else {
+		workspaceFiles = files
+	}
+
 	refinerContext := map[string]map[string]any{
 		"user": {
 			"Task":              tasksInfo.Task,
 			"Tasks":             tasksInfo.Tasks,
 			"PlannedSubtasks":   subtasksInfo.Planned,
 			"CompletedSubtasks": subtasksInfo.Completed,
+			"WorkspaceFiles":    workspaceFiles,
 		},
 		"system": {
 			"SubtaskPatchToolName":    tools.SubtaskPatchToolName,
@@ -731,6 +740,14 @@ func (fp *flowProvider) PrepareAgentChain(ctx context.Context, taskID, subtaskID
 		return 0, fmt.Errorf("failed to update subtask context: %w", err)
 	}
 
+	// Collect workspace files for the primary agent prompt context.
+	var primaryWorkspaceFiles []tools.FileInfo
+	if files, err := fp.executor.ListWorkspaceFiles(ctx); err != nil {
+		logger.WithError(err).Warn("failed to list workspace files for primary agent context, continuing without them")
+	} else {
+		primaryWorkspaceFiles = files
+	}
+
 	systemAgentTmpl, err := fp.prompter.RenderTemplate(templates.PromptTypePrimaryAgent, map[string]any{
 		"FinalyToolName":          tools.FinalyToolName,
 		"SearchToolName":          tools.SearchToolName,
@@ -744,6 +761,7 @@ func (fp *flowProvider) PrepareAgentChain(ctx context.Context, taskID, subtaskID
 		"AskUserToolName":         tools.AskUserToolName,
 		"AskUserEnabled":          fp.askUser,
 		"ExecutionContext":        executionContext,
+		"WorkspaceFiles":          primaryWorkspaceFiles,
 		"Lang":                    fp.language,
 		"DockerImage":             fp.image,
 		"CurrentTime":             getCurrentTime(),

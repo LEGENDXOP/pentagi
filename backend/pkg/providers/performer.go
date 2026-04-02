@@ -38,9 +38,9 @@ const (
 	defaultMaxToolCallsPerSubtask = 100              // hard cap per subtask (configurable via MAX_TOOL_CALLS_PER_SUBTASK)
 	defaultSubtaskDuration      = 60 * time.Minute   // default hard time limit per subtask
 	defaultMaxNestingDepth      = 4                   // primary_agent(0) → pentester(1) → coder(2) → installer(3) all allowed
-	nestedTimeoutDepth1         = 25 * time.Minute    // timeout for depth-1 nested agents
-	nestedTimeoutDepth2         = 20 * time.Minute    // timeout for depth-2 nested agents
-	nestedTimeoutDepth3         = 15 * time.Minute    // timeout for depth-3 nested agents
+	nestedTimeoutDepth1         = 45 * time.Minute    // timeout for depth-1 nested agents
+	nestedTimeoutDepth2         = 30 * time.Minute    // timeout for depth-2 nested agents
+	nestedTimeoutDepth3         = 20 * time.Minute    // timeout for depth-3 nested agents
 
 	// toolCallLimitWarningBuffer is how many calls before the limit we inject
 	// a "wrap up" warning into the chain, giving the agent a chance to save findings.
@@ -106,15 +106,31 @@ func withIncrementedDepth(ctx context.Context) context.Context {
 // getNestedTimeout returns the appropriate timeout for a given nesting depth.
 // Nested agents get their own FRESH timeout to prevent parent deadline starvation.
 // Each level gets a generous timeout (minimum 10 minutes) to allow real work.
+// Env vars NESTED_TIMEOUT_DEPTH1/2/3 (in minutes) override the compiled defaults.
 func getNestedTimeout(depth int) time.Duration {
 	switch {
 	case depth <= 0:
 		return getSubtaskMaxDuration()
 	case depth == 1:
+		if v := os.Getenv("NESTED_TIMEOUT_DEPTH1"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				return time.Duration(n) * time.Minute
+			}
+		}
 		return nestedTimeoutDepth1
 	case depth == 2:
+		if v := os.Getenv("NESTED_TIMEOUT_DEPTH2"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				return time.Duration(n) * time.Minute
+			}
+		}
 		return nestedTimeoutDepth2
 	case depth == 3:
+		if v := os.Getenv("NESTED_TIMEOUT_DEPTH3"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				return time.Duration(n) * time.Minute
+			}
+		}
 		return nestedTimeoutDepth3
 	default:
 		// Even deeper nesting still gets minimum 10 minutes
@@ -264,11 +280,19 @@ func (fp *flowProvider) performAgentChain(
 	_ = wafDetector
 	_ = exploitState
 	_ = evidenceCollector
-	_ = findingRegistry
 
 	// Async state writer — batches DB writes so the agent loop isn't blocked.
 	stateWriter := NewAsyncStateWriter(fp.db)
 	defer stateWriter.Close()
+
+	// Persist findings to DB on subtask completion (best-effort).
+	defer func() {
+		if findingRegistry != nil && findingRegistry.GetFindingCount() > 0 {
+			persistCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			findingRegistry.PersistFindings(persistCtx, fp.db)
+		}
+	}()
 
 	// v6: Write throttles — must be created before state restore so we can
 	// fast-forward them for resumed subtasks.
@@ -460,6 +484,11 @@ func (fp *flowProvider) performAgentChain(
 	// FIX: Create a per-chain delegation block tracker so that handlers can
 	// count consecutive blocked delegation attempts and escalate responses.
 	ctx = withDelegationTracker(ctx, newDelegationBlockTracker())
+
+	// Attach finding registry to context so tool handlers can register findings.
+	if findingRegistry != nil {
+		ctx = WithFindingRegistry(ctx, findingRegistry)
+	}
 
 	// FIX: Inject resume context into the message chain so the LLM knows
 	// what has already been done. Without this, chain summarization strips
@@ -882,18 +911,21 @@ func (fp *flowProvider) performAgentChain(
 				}
 			}
 
-			// v6: Loop detector hard block — reject ALL read tool calls after 3+ alerts.
+			// v6: Loop detector per-file block — reject reads of files that participated
+			// in detected cycles. New files that were never in a cycle pass through.
 			if !v5Intercepted && loopDetector != nil && loopDetector.ShouldBlock() {
 				if funcName == "terminal" {
 					var termArgs map[string]interface{}
 					if err := json.Unmarshal(json.RawMessage(toolCall.FunctionCall.Arguments), &termArgs); err == nil {
 						if input, ok := termArgs["input"].(string); ok {
-							if _, isRead := fileReadCache.extractReadPath(input); isRead {
-								v5Intercepted = true
-								v5Response = "🛑 LOOP DETECTOR HARD BLOCK: All file reads are blocked. " +
-									"You have been warned 3+ times about cycling through the same files. " +
-									"Execute an offensive action, write your findings, or call the result tool."
-								logger.Warn("loop detector hard block rejected read tool call")
+							if readPath, isRead := fileReadCache.extractReadPath(input); isRead {
+								if loopDetector.ShouldBlockFile(readPath) {
+									v5Intercepted = true
+									v5Response = "🛑 LOOP DETECTOR BLOCK: Read of this file is blocked — " +
+										"it was part of a detected read cycle. " +
+										"Execute an offensive action, write your findings, or call the result tool."
+									logger.WithField("blocked_file", readPath).Warn("loop detector blocked cycled file read")
+								}
 							}
 						}
 					}
@@ -901,10 +933,14 @@ func (fp *flowProvider) performAgentChain(
 					var fileArgs map[string]interface{}
 					if err := json.Unmarshal(json.RawMessage(toolCall.FunctionCall.Arguments), &fileArgs); err == nil {
 						if action, ok := fileArgs["action"].(string); ok && action == "read_file" {
-							v5Intercepted = true
-							v5Response = "🛑 LOOP DETECTOR HARD BLOCK: All file reads are blocked. " +
-								"Execute an offensive action, write your findings, or call the result tool."
-							logger.Warn("loop detector hard block rejected file read tool call")
+							filePath, _ := fileArgs["path"].(string)
+							if loopDetector.ShouldBlockFile(filePath) {
+								v5Intercepted = true
+								v5Response = "🛑 LOOP DETECTOR BLOCK: Read of this file is blocked — " +
+									"it was part of a detected read cycle. " +
+									"Execute an offensive action, write your findings, or call the result tool."
+								logger.WithField("blocked_file", filePath).Warn("loop detector blocked cycled file read")
+							}
 						}
 					}
 				}
@@ -1201,12 +1237,28 @@ func (fp *flowProvider) performAgentChain(
 				evidenceCollector.CollectFromToolCall(funcName, toolCall.FunctionCall.Arguments, response, subtaskID, nil)
 			}
 
+			// Sprint 3: Finding registration — extract [VULN_TYPE: xxx] from tool responses.
+			if findingRegistry != nil && response != "" {
+				matches := vulnTypeRegex.FindAllStringSubmatch(response, -1)
+				for _, match := range matches {
+					if len(match) >= 2 {
+						vulnType := match[1]
+						endpoint := ""
+						if toolCall.FunctionCall != nil {
+							endpoint = extractEndpointFromToolCall(funcName, toolCall.FunctionCall.Arguments)
+						}
+						severity := inferSeverityFromResponse(response)
+						findingRegistry.CheckAndRegister(vulnType, endpoint, truncateString(response, 4096), severity, subtaskID, nil)
+					}
+				}
+			}
+
 			// Sprint 3: Exploit trigger — track failures for custom exploit development.
 			if exploitState != nil && toolCall.FunctionCall != nil && isToolCallFailure(response) {
 				if trigger := exploitState.RecordToolFailure(funcName, toolCall.FunctionCall.Arguments, response); trigger != nil {
 					triggerMsg := FormatExploitTriggerForSystem(trigger)
 					chain = append(chain, llms.MessageContent{
-						Role: llms.ChatMessageTypeSystem,
+						Role: llms.ChatMessageTypeHuman,
 						Parts: []llms.ContentPart{
 							llms.TextContent{Text: triggerMsg},
 						},

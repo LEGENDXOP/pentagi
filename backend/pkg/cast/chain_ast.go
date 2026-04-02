@@ -160,15 +160,27 @@ func NewChainAST(chain []llms.MessageContent, force bool) (*ChainAST, error) {
 		case llms.ChatMessageTypeSystem:
 			// System message should only appear at the beginning of a section
 			if currentSection != nil {
-				return nil, fmt.Errorf("unexpected system message in the middle of a chain")
+				if !force {
+					return nil, fmt.Errorf("unexpected system message in the middle of a chain")
+				}
+				// Force mode: close current section and start a new one with the
+				// system message as header (same recovery pattern as other handlers).
+				if err := checkAndFixPendingToolCalls(); err != nil {
+					return nil, err
+				}
+				systemMsgCopy := msg
+				currentHeader = NewHeader(&systemMsgCopy, nil)
+				currentSection = NewChainSection(currentHeader, []*BodyPair{})
+				ast.AddSection(currentSection)
+				currentBodyPair = nil
+			} else {
+				// Start a new section with a system message
+				systemMsgCopy := msg // Create a copy to avoid reference issues
+				currentHeader = NewHeader(&systemMsgCopy, nil)
+				currentSection = NewChainSection(currentHeader, []*BodyPair{})
+				ast.AddSection(currentSection)
+				currentBodyPair = nil
 			}
-
-			// Start a new section with a system message
-			systemMsgCopy := msg // Create a copy to avoid reference issues
-			currentHeader = NewHeader(&systemMsgCopy, nil)
-			currentSection = NewChainSection(currentHeader, []*BodyPair{})
-			ast.AddSection(currentSection)
-			currentBodyPair = nil
 
 		case llms.ChatMessageTypeHuman:
 			// Handle normal case for human messages

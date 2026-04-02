@@ -56,6 +56,20 @@
   </planned_subtasks>
   {{end}}
 
+  {{if .WorkspaceFiles}}
+  <workspace_files>
+    {{range .WorkspaceFiles}}
+    <file>
+      <path>{{.Path}}</path>
+      <size>{{.Size}}</size>
+    </file>
+    {{end}}
+  </workspace_files>
+  <workspace_files_instruction>
+  The workspace file listing above is current. Do NOT run ls, find, cat, or other file-discovery commands to check workspace state.
+  </workspace_files_instruction>
+  {{end}}
+
   {{if .ExecutionState}}
   <execution_state>
   {{.ExecutionState}}

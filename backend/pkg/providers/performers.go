@@ -625,6 +625,19 @@ func (fp *flowProvider) performPentester(
 			if err != nil {
 				return "", fmt.Errorf("failed to unmarshal result: %w", err)
 			}
+
+			// Extract findings from hack_result and register them.
+			if fr := GetFindingRegistry(ctx); fr != nil {
+				resultText := hackResult.Result + " " + hackResult.Message
+				matches := vulnTypeRegex.FindAllStringSubmatch(resultText, -1)
+				for _, match := range matches {
+					if len(match) >= 2 {
+						severity := inferSeverityFromResponse(resultText)
+						fr.CheckAndRegister(match[1], "", truncateString(resultText, 4096), severity, subtaskID, nil)
+					}
+				}
+			}
+
 			return "hack result successfully processed", nil
 		},
 		Summarizer: fp.GetSummarizeResultHandler(taskID, subtaskID),

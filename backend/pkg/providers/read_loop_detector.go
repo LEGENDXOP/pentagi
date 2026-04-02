@@ -51,6 +51,9 @@ type ReadLoopDetector struct {
 
 	// Checkpoint tracking: STATE.json, RESUME.md reads/writes by both agent and system
 	checkpointOps []string // recent checkpoint operation signatures
+
+	// Per-file blocking: only files that participated in a detected cycle are blocked.
+	blockedFiles map[string]bool
 }
 
 // ReadLoopDetectorConfig holds configuration for the loop detector.
@@ -121,6 +124,7 @@ func NewReadLoopDetector(config ReadLoopDetectorConfig) *ReadLoopDetector {
 		timestamps:           make([]time.Time, 0, config.WindowSize),
 		checkpointOps:        make([]string, 0, config.CheckpointWindow),
 		callsSinceLastAlert:  config.CooldownCalls, // allow immediate first detection
+		blockedFiles:         make(map[string]bool),
 	}
 }
 
@@ -202,6 +206,9 @@ func (rld *ReadLoopDetector) Check() *LoopAlert {
 		alert.TotalAlerts = rld.totalAlertsGenerated
 		alert.IsBlock = rld.totalAlertsGenerated >= rld.maxAlertsBeforeBlock
 		alert.Message = rld.formatAlertMessage(alert)
+		for _, f := range alert.CycleFiles {
+			rld.blockedFiles[normalizeLoopFilename(f)] = true
+		}
 
 		logrus.WithFields(logrus.Fields{
 			"cycle_length": alert.CycleLength,
@@ -248,6 +255,9 @@ func (rld *ReadLoopDetector) Check() *LoopAlert {
 			alert.TotalAlerts = rld.totalAlertsGenerated
 			alert.IsBlock = rld.totalAlertsGenerated >= rld.maxAlertsBeforeBlock
 			alert.Message = rld.formatAlertMessage(alert)
+			for _, f := range alert.CycleFiles {
+				rld.blockedFiles[normalizeLoopFilename(f)] = true
+			}
 
 			logrus.WithFields(logrus.Fields{
 				"cycle_length": alert.CycleLength,
@@ -272,6 +282,17 @@ func (rld *ReadLoopDetector) ShouldBlock() bool {
 	rld.mu.Lock()
 	defer rld.mu.Unlock()
 	return rld.totalAlertsGenerated >= rld.maxAlertsBeforeBlock
+}
+
+// ShouldBlockFile returns true only if the specific file was part of a detected
+// cycle. Files that were never in a cycle always pass through.
+func (rld *ReadLoopDetector) ShouldBlockFile(filename string) bool {
+	rld.mu.Lock()
+	defer rld.mu.Unlock()
+	if rld.totalAlertsGenerated < rld.maxAlertsBeforeBlock {
+		return false
+	}
+	return rld.blockedFiles[normalizeLoopFilename(filename)]
 }
 
 // checkCheckpointLoop detects the specific pattern where the agent is stuck in
