@@ -62,6 +62,13 @@
   </execution_state>
   {{end}}
 
+  {{if .MethodologyCoverage}}
+  <methodology_coverage>
+  {{.MethodologyCoverage}}
+  CRITICAL: When refining subtasks, ensure ALL uncovered P0 categories have dedicated subtasks.
+  </methodology_coverage>
+  {{end}}
+
   {{if .ExecutionLogs}}
   <execution_logs>
   {{.ExecutionLogs}}

@@ -59,6 +59,13 @@
   </execution_state>
   {{end}}
 
+  {{if .MethodologyCoverage}}
+  <methodology_coverage>
+  {{.MethodologyCoverage}}
+  When generating subtasks, ensure coverage of ALL uncovered P0 categories.
+  </methodology_coverage>
+  {{end}}
+
   {{if .ExecutionLogs}}
   <execution_logs>
   {{.ExecutionLogs}}

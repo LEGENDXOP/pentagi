@@ -212,6 +212,12 @@ func (fp *flowProvider) performAgentChain(
 		findingTracker           = NewFindingTracker()
 		categoryTracker          = NewCategoryTracker(int(getSubtaskMaxDuration().Minutes()))
 
+		// Sprint 3: Advanced modules — WAF detection, exploit triggers, evidence collection.
+		wafDetector       = NewWAFDetector()
+		exploitState      = NewExploitDevelopmentState(fp.flowID)
+		evidenceCollector = NewEvidenceCollector(fp.flowID)
+		findingRegistry   = NewFindingRegistry(fp.flowID)
+
 		// Intra-subtask terminal dedup: caches idempotent terminal command outputs
 		// (token reads, schema introspection, jq on stored files) to prevent the
 		// agent from re-executing identical commands 15-20x per subtask. The cache
@@ -253,6 +259,12 @@ func (fp *flowProvider) performAgentChain(
 	// Silence unused variable warnings for guard booleans (set inside loop).
 	_ = industryDetected
 	_ = halfwayAlertSent
+
+	// Silence Sprint 3 variables until their wiring points.
+	_ = wafDetector
+	_ = exploitState
+	_ = evidenceCollector
+	_ = findingRegistry
 
 	// Async state writer — batches DB writes so the agent loop isn't blocked.
 	stateWriter := NewAsyncStateWriter(fp.db)
@@ -1167,6 +1179,56 @@ func (fp *flowProvider) performAgentChain(
 
 			// Sprint 2 wiring: Record tool call for category tracking and P0 coverage.
 			categoryTracker.RecordToolCall(funcName, toolCall.FunctionCall.Arguments)
+
+			// Sprint 3: WAF detection — analyze tool results for WAF indicators.
+			if wafDetector != nil && toolCall.FunctionCall != nil {
+				wafDetector.AnalyzeToolResult(funcName, toolCall.FunctionCall.Arguments, response)
+				if wafCtx := wafDetector.FormatWAFContextForPrompt(); wafCtx != "" {
+					// Inject WAF context as system message (not human) so it persists.
+					if len(chain) > 0 && chain[0].Role == llms.ChatMessageTypeSystem {
+						if text, ok := chain[0].Parts[0].(llms.TextContent); ok {
+							if !strings.Contains(text.Text, "<waf_detection>") {
+								chain[0].Parts[0] = llms.TextContent{Text: text.Text + "\n\n" + wafCtx}
+								logger.Info("injected WAF detection context into system prompt")
+							}
+						}
+					}
+				}
+			}
+
+			// Sprint 3: Evidence collection — capture interesting tool results.
+			if evidenceCollector != nil && toolCall.FunctionCall != nil {
+				evidenceCollector.CollectFromToolCall(funcName, toolCall.FunctionCall.Arguments, response, subtaskID, nil)
+			}
+
+			// Sprint 3: Exploit trigger — track failures for custom exploit development.
+			if exploitState != nil && toolCall.FunctionCall != nil && isToolCallFailure(response) {
+				if trigger := exploitState.RecordToolFailure(funcName, toolCall.FunctionCall.Arguments, response); trigger != nil {
+					triggerMsg := FormatExploitTriggerForSystem(trigger)
+					chain = append(chain, llms.MessageContent{
+						Role: llms.ChatMessageTypeSystem,
+						Parts: []llms.ContentPart{
+							llms.TextContent{Text: triggerMsg},
+						},
+					})
+					logger.WithField("endpoint", trigger.Endpoint).
+						Info("exploit development triggered for failing endpoint")
+				}
+			}
+
+			// Sprint 3: Methodology coverage — update from vuln type tags.
+			if mc := GetMethodologyCoverage(ctx); mc != nil {
+				matches := vulnTypeRegex.FindAllStringSubmatch(response, -1)
+				for _, match := range matches {
+					if len(match) >= 2 {
+						mc.RecordFinding(match[1])
+					}
+				}
+				// Classify tool call by category and record.
+				for _, catID := range classifySubtaskCategories(funcName, toolCall.FunctionCall.Arguments) {
+					mc.RecordToolCall(catID)
+				}
+			}
 
 			// v5: Record execution in completed work tracker and loop detector.
 			if completedWork != nil {

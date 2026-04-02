@@ -434,6 +434,13 @@ func (fp *flowProvider) GenerateSubtasks(ctx context.Context, taskID int64) ([]t
 		generatorContext["user"]["ExecutionState"] = strategyContext
 	}
 
+	// Sprint 3: Inject methodology coverage into generator if available.
+	if mc := GetMethodologyCoverage(ctx); mc != nil {
+		if coverage := mc.FormatCoverageForGenerator(); coverage != "" {
+			generatorContext["user"]["MethodologyCoverage"] = coverage
+		}
+	}
+
 	ctx, observation := obs.Observer.NewObservation(ctx)
 	generatorEvaluator := observation.Evaluator(
 		langfuse.WithEvaluatorName("subtasks generator"),
@@ -549,6 +556,12 @@ func (fp *flowProvider) RefineSubtasks(ctx context.Context, taskID int64) ([]too
 		}
 
 		refinerContext["user"]["ExecutionState"] = executionState
+
+		// Sprint 3: Inject methodology coverage into refiner.
+		if mc := GetMethodologyCoverage(ctx); mc != nil {
+			refinerContext["user"]["MethodologyCoverage"] = mc.FormatCoverageForRefiner()
+		}
+
 		refinerTmpl, err = fp.prompter.RenderTemplate(templates.PromptTypeSubtasksRefiner, refinerContext["user"])
 		if err != nil {
 			return nil, wrapErrorEndEvaluatorSpan(ctx, refinerEvaluator, "failed to get task subtasks refiner template (2)", err)

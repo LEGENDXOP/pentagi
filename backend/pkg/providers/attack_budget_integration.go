@@ -79,6 +79,11 @@ func IsToolCallSuccess(response string, isRepeating bool) bool {
 		"command not found",
 		"no such file",
 		"access denied",
+		"403 forbidden",
+		"request blocked",
+		"blocked by",
+		"web application firewall",
+		"captcha",
 	}
 
 	for _, indicator := range errorIndicators {

@@ -782,6 +782,21 @@ func (fp *flowProvider) GetPentesterHandler(ctx context.Context, taskID, subtask
 			},
 		}
 
+		// Sprint 3: Inject methodology coverage into pentester context.
+		if mc := GetMethodologyCoverage(ctx); mc != nil {
+			pentesterContext["system"]["MethodologyCoverage"] = mc.FormatCoverageForPentester()
+		}
+		// Sprint 3: Inject WAF detection context.
+		if wd := GetWAFDetector(ctx); wd != nil && wd.IsWAFDetected() {
+			pentesterContext["system"]["WAFContext"] = wd.FormatWAFContextForPrompt()
+		}
+		// Sprint 3: Inject exploit library.
+		if eds := GetExploitDevelopmentState(ctx); eds != nil {
+			if lib := eds.FormatForPentester(); lib != "" {
+				pentesterContext["system"]["ExploitLibrary"] = lib
+			}
+		}
+
 		pentesterCtx, observation := obs.Observer.NewObservation(ctx)
 		pentesterEvaluator := observation.Evaluator(
 			langfuse.WithEvaluatorName("render pentester agent prompts"),
