@@ -34,19 +34,24 @@ import (
 
 const (
 	// DefaultReconMaxDuration is the maximum time for reconnaissance subtasks.
-	// Recon is the primary offender: the agent keeps discovering new endpoints,
-	// subdomains, and services, never declaring "done."
-	DefaultReconMaxDuration = 30 * time.Minute
+	// Set to 45 min: pentesters need 40-50 tool calls for thorough recon,
+	// which at ~45sec/call average takes ~37 min plus LLM overhead.
+	DefaultReconMaxDuration = 45 * time.Minute
 
 	// DefaultExploitMaxDuration is the maximum time for exploitation subtasks.
-	// Raised from 25 to 35 min: multi-step exploit chains (SSRF→internal→RCE)
-	// and retry-after-failure patterns need the extra headroom.
-	DefaultExploitMaxDuration = 35 * time.Minute
+	// Set to 60 min: multi-step exploit chains (primary→pentester→coder→installer)
+	// generate 100+ combined tool calls across 4 agents. 35 min caused 78%
+	// expiration rate in Flow 19.
+	DefaultExploitMaxDuration = 60 * time.Minute
+
+	// DefaultReportMaxDuration is the maximum time for report/documentation subtasks.
+	// Reports need time to read findings, compile, and format. Set higher than
+	// generic because report generation involves file I/O and summarization.
+	DefaultReportMaxDuration = 45 * time.Minute
 
 	// DefaultGenericMaxDuration is the fallback for subtasks that don't match
-	// a known category (reporting, enumeration, etc.).
-	// Raised from 20 to 25 min: mixed recon/exploit subtasks need more room.
-	DefaultGenericMaxDuration = 25 * time.Minute
+	// a known category.
+	DefaultGenericMaxDuration = 35 * time.Minute
 
 	// TimeboxWarningBuffer is how many minutes before the deadline the
 	// "TIME WARNING: N minutes remaining" message is injected.
@@ -103,6 +108,17 @@ func getExploitMaxDuration() time.Duration {
 	return DefaultExploitMaxDuration
 }
 
+// getReportMaxDuration returns the report subtask timeout, configurable via
+// SUBTASK_REPORT_MAX_DURATION env var (value in minutes).
+func getReportMaxDuration() time.Duration {
+	if v := os.Getenv("SUBTASK_REPORT_MAX_DURATION"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Minute
+		}
+	}
+	return DefaultReportMaxDuration
+}
+
 // getGenericMaxDuration returns the generic subtask timeout, configurable via
 // SUBTASK_GENERIC_MAX_DURATION env var (value in minutes).
 func getGenericMaxDuration() time.Duration {
@@ -140,14 +156,18 @@ var reportKeywords = []string{
 }
 
 // ClassifySubtask determines the category of a subtask from its title and
-// description. Uses simple keyword matching — no ML, no external calls.
+// description. Title keywords carry 3x weight because the title is the
+// primary intent signal — descriptions often contain cross-category terms
+// (e.g., a report subtask's description mentioning "penetration test").
 func ClassifySubtask(title, description string) SubtaskCategory {
-	combined := strings.ToLower(title + " " + description)
+	titleLower := strings.ToLower(title)
+	descLower := strings.ToLower(description)
 
-	// Score each category by keyword hits. Highest score wins.
-	reconScore := countKeywordHits(combined, reconKeywords)
-	exploitScore := countKeywordHits(combined, exploitKeywords)
-	reportScore := countKeywordHits(combined, reportKeywords)
+	// Title keywords carry 3x weight — title is the primary intent signal.
+	// Description adds supplementary context but shouldn't overwhelm title.
+	reconScore := countKeywordHits(titleLower, reconKeywords)*3 + countKeywordHits(descLower, reconKeywords)
+	exploitScore := countKeywordHits(titleLower, exploitKeywords)*3 + countKeywordHits(descLower, exploitKeywords)
+	reportScore := countKeywordHits(titleLower, reportKeywords)*3 + countKeywordHits(descLower, reportKeywords)
 
 	// Require at least one keyword hit to classify; otherwise generic.
 	maxScore := max(reconScore, max(exploitScore, reportScore))
@@ -155,13 +175,14 @@ func ClassifySubtask(title, description string) SubtaskCategory {
 		return SubtaskCategoryGeneric
 	}
 
+	// Priority: report > exploit > recon (report is most specific/actionable)
 	switch maxScore {
-	case reconScore:
-		return SubtaskCategoryRecon
-	case exploitScore:
-		return SubtaskCategoryExploit
 	case reportScore:
 		return SubtaskCategoryReport
+	case exploitScore:
+		return SubtaskCategoryExploit
+	case reconScore:
+		return SubtaskCategoryRecon
 	default:
 		return SubtaskCategoryGeneric
 	}
@@ -185,8 +206,7 @@ func GetMaxDurationForCategory(cat SubtaskCategory) time.Duration {
 	case SubtaskCategoryExploit:
 		return getExploitMaxDuration()
 	case SubtaskCategoryReport:
-		// Reports should be fast — use generic or shorter.
-		return getGenericMaxDuration()
+		return getReportMaxDuration()
 	default:
 		return getGenericMaxDuration()
 	}

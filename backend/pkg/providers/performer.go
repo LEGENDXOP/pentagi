@@ -36,11 +36,11 @@ const (
 	maxReflectorCallsPerChain   = 3
 	delayBetweenRetries         = 5 * time.Second
 	defaultMaxToolCallsPerSubtask = 100              // hard cap per subtask (configurable via MAX_TOOL_CALLS_PER_SUBTASK)
-	defaultSubtaskDuration      = 60 * time.Minute   // default hard time limit per subtask
+	defaultSubtaskDuration      = 90 * time.Minute   // default hard time limit per subtask (raised: 60m caused 78% expiry)
 	defaultMaxNestingDepth      = 4                   // primary_agent(0) → pentester(1) → coder(2) → installer(3) all allowed
-	nestedTimeoutDepth1         = 45 * time.Minute    // timeout for depth-1 nested agents
-	nestedTimeoutDepth2         = 30 * time.Minute    // timeout for depth-2 nested agents
-	nestedTimeoutDepth3         = 20 * time.Minute    // timeout for depth-3 nested agents
+	nestedTimeoutDepth1         = 75 * time.Minute    // timeout for depth-1 nested agents (raised: must fit within parent timebox)
+	nestedTimeoutDepth2         = 50 * time.Minute    // timeout for depth-2 nested agents (raised: coder needs room for real work)
+	nestedTimeoutDepth3         = 30 * time.Minute    // timeout for depth-3 nested agents (raised: installer can run long commands)
 
 	// toolCallLimitWarningBuffer is how many calls before the limit we inject
 	// a "wrap up" warning into the chain, giving the agent a chance to save findings.
@@ -838,12 +838,25 @@ func (fp *flowProvider) performAgentChain(
 			// Fix 12: Check if this is a context.DeadlineExceeded — if so,
 			// save partial results and return the error so the controller
 			// treats it as a deadline expiry (no retry, mark finished).
+			// Fix 15: Use comprehensive timebox result builder for LLM call deadline too
 			if errors.Is(err, context.DeadlineExceeded) && subtaskID != nil {
-				partialResult := fmt.Sprintf(
-					"[DEADLINE EXPIRED during LLM call — subtask time budget exhausted]\n"+
-						"Tool calls completed: %d\nPhase: %s\n",
-					toolCallCount, execState.Phase,
-				)
+				var partialResult string
+				if timebox != nil {
+					partialResult = timebox.BuildForceFinishResultFull(&ForceFinishContext{
+						ToolCallCount:   toolCallCount,
+						ExecState:       execState,
+						Chain:           chain,
+						ToolHistory:     toolHistory,
+						FindingRegistry: findingRegistry,
+						CompletedWork:   completedWork,
+					})
+				} else {
+					partialResult = fmt.Sprintf(
+						"[DEADLINE EXPIRED during LLM call — subtask time budget exhausted]\n"+
+							"Tool calls completed: %d\nPhase: %s\n",
+						toolCallCount, execState.Phase,
+					)
+				}
 				bgCtx, bgCancel := context.WithTimeout(context.Background(), 10*time.Second)
 				if _, dbErr := fp.db.UpdateSubtaskResult(bgCtx, database.UpdateSubtaskResultParams{
 					Result: partialResult,
@@ -1127,12 +1140,26 @@ func (fp *flowProvider) performAgentChain(
 				// Fix 12: Check if tool execution failed due to deadline expiry.
 				// Save partial results and let the error propagate so the controller
 				// handles it as a deadline expiry (no retry, mark finished).
+				// Fix 15: Use comprehensive timebox result builder when available
+				// to preserve findings, tool outputs, and completed work.
 				if errors.Is(err, context.DeadlineExceeded) && subtaskID != nil {
-					partialResult := fmt.Sprintf(
-						"[DEADLINE EXPIRED during tool execution — subtask time budget exhausted]\n"+
-							"Tool calls completed: %d\nLast tool: %s\nPhase: %s\n",
-						toolCallCount+idx+1, funcName, execState.Phase,
-					)
+					var partialResult string
+					if timebox != nil {
+						partialResult = timebox.BuildForceFinishResultFull(&ForceFinishContext{
+							ToolCallCount:   toolCallCount + idx + 1,
+							ExecState:       execState,
+							Chain:           chain,
+							ToolHistory:     toolHistory,
+							FindingRegistry: findingRegistry,
+							CompletedWork:   completedWork,
+						})
+					} else {
+						partialResult = fmt.Sprintf(
+							"[DEADLINE EXPIRED during tool execution — subtask time budget exhausted]\n"+
+								"Tool calls completed: %d\nLast tool: %s\nPhase: %s\n",
+							toolCallCount+idx+1, funcName, execState.Phase,
+						)
+					}
 					bgCtx, bgCancel := context.WithTimeout(context.Background(), 10*time.Second)
 					if _, dbErr := fp.db.UpdateSubtaskResult(bgCtx, database.UpdateSubtaskResultParams{
 						Result: partialResult,
