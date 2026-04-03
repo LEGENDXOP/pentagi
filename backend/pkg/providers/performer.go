@@ -295,7 +295,17 @@ func (fp *flowProvider) performAgentChain(
 
 		// M6 FALLBACK: Try to read FINDINGS.md from the container and sync
 		// any findings that were missed by the primary extraction path.
+		// Fix ECHO-1: Skip M6 fallback entirely when the primary extraction
+		// path already captured findings for this subtask. This prevents the
+		// double-extraction that creates duplicates (primary captures with
+		// empty endpoint, M6 re-captures with ${port}${path} endpoint).
 		func() {
+			if findingRegistry.GetFindingCount() > 0 {
+				logrus.WithField("existing_findings", findingRegistry.GetFindingCount()).
+					Info("FINDINGS.md sync skipped: primary extraction already captured findings")
+				return
+			}
+
 			syncCtx := context.WithoutCancel(ctx)
 			syncCtx, syncCancel := context.WithTimeout(syncCtx, 10*time.Second)
 			defer syncCancel()

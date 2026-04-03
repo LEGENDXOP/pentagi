@@ -162,6 +162,11 @@ func NewFindingRegistry(flowID int64) *FindingRegistry {
 
 // CheckAndRegister attempts to register a new finding. Returns true if the finding
 // is new (not a duplicate), false if it's a duplicate.
+// Fix ECHO-4: Adds semantic dedup — if a finding has the same normalized vuln_type
+// and either (a) one has an empty endpoint while the other doesn't, or (b) they
+// share the same hostname, the incoming finding is treated as a duplicate.
+// When the new finding has a non-empty endpoint and the existing one is empty,
+// the existing finding is upgraded with the new endpoint (more specific wins).
 func (fr *FindingRegistry) CheckAndRegister(
 	vulnType string,
 	endpoint string,
@@ -170,14 +175,47 @@ func (fr *FindingRegistry) CheckAndRegister(
 	subtaskID *int64,
 	evidence []Evidence,
 ) (*ReportFinding, bool) {
+	// Sanitize endpoint before any processing
+	endpoint = sanitizeEndpoint(endpoint)
+
 	fp := buildFingerprint(vulnType, endpoint)
 
 	fr.mu.Lock()
 	defer fr.mu.Unlock()
 
 	if fr.seenFingerprints[fp] {
-		return nil, false // Duplicate
+		return nil, false // Exact fingerprint duplicate
 	}
+
+	// Semantic dedup: same vuln_type with empty-vs-populated endpoint
+	normalizedVT := NormalizeVulnType(vulnType)
+	for i, existing := range fr.findings {
+		if existing.VulnType != normalizedVT {
+			continue
+		}
+		existingEP := normalizeEndpointForFingerprint(existing.Endpoint)
+		newEP := normalizeEndpointForFingerprint(endpoint)
+
+		// Case 1: One has empty endpoint, the other doesn't → same finding
+		// Case 2: Same host after normalization → same finding
+		isSemDupe := (existingEP == "" || newEP == "") ||
+			extractHost(existingEP) == extractHost(newEP)
+
+		if isSemDupe {
+			// Keep the more specific version (the one WITH an endpoint)
+			if existing.Endpoint == "" && endpoint != "" {
+				fr.findings[i].Endpoint = endpoint
+				fr.findings[i].Title = generateFindingTitle(normalizedVT, endpoint)
+				logrus.WithFields(logrus.Fields{
+					"vuln_type":    normalizedVT,
+					"new_endpoint": endpoint,
+				}).Debug("Semantic dedup: upgraded existing finding with specific endpoint")
+			}
+			fr.seenFingerprints[fp] = true
+			return nil, false // Semantic duplicate
+		}
+	}
+
 	fr.seenFingerprints[fp] = true
 
 	fr.idCounter++
@@ -388,10 +426,11 @@ func (fr *FindingRegistry) ParseAndSyncFindingsMD(content string, subtaskID *int
 			}
 		}
 
-		// Extract endpoint
+		// Extract endpoint — sanitize to strip template variables like ${port}${path}
+		// and trailing backslashes that the LLM may inject (Fix ECHO-2).
 		endpoint := ""
 		if tgtMatch := findingsMDTargetRegex.FindStringSubmatch(block); len(tgtMatch) >= 2 {
-			endpoint = strings.TrimSpace(tgtMatch[1])
+			endpoint = sanitizeEndpoint(tgtMatch[1])
 		}
 
 		// Extract description
@@ -653,10 +692,91 @@ func classifyEvidenceType(toolName string) EvidenceType {
 	}
 }
 
+// sanitizeEndpoint strips shell-style template variables (${port}, $path, etc.),
+// trailing backslashes, and other artifacts the LLM may inject into endpoints.
+// This prevents raw template strings like "https://example.com:${port}${path}\"
+// from entering the findings database.
+func sanitizeEndpoint(endpoint string) string {
+	ep := strings.TrimSpace(endpoint)
+	if ep == "" {
+		return ""
+	}
+	// Remove shell-style template variables: ${port}, ${path}, $port, $path
+	ep = shellVarRegex.ReplaceAllString(ep, "")
+	// Remove trailing backslashes (common LLM artifact)
+	ep = strings.TrimRight(ep, "\\")
+	// Remove trailing colons left after stripping :${port}
+	ep = strings.TrimRight(ep, ":")
+	// Clean up any double slashes in path (but preserve ://)
+	for strings.Contains(ep, "///") {
+		ep = strings.ReplaceAll(ep, "///", "//")
+	}
+	return strings.TrimSpace(ep)
+}
+
+// shellVarRegex matches shell-style template variables like ${port}, $path, ${HOST}
+var shellVarRegex = regexp.MustCompile(`\$\{?\w+\}?`)
+
+// extractHost extracts the hostname from a URL-like endpoint string.
+// Returns the host portion (without scheme, port, or path).
+// E.g., "https://backend.netbond.in:443/api" → "backend.netbond.in"
+func extractHost(endpoint string) string {
+	ep := strings.TrimSpace(endpoint)
+	if ep == "" {
+		return ""
+	}
+	// Strip scheme
+	if idx := strings.Index(ep, "://"); idx != -1 {
+		ep = ep[idx+3:]
+	}
+	// Strip path
+	if idx := strings.IndexByte(ep, '/'); idx != -1 {
+		ep = ep[:idx]
+	}
+	// Strip port
+	if idx := strings.LastIndexByte(ep, ':'); idx != -1 {
+		ep = ep[:idx]
+	}
+	return strings.ToLower(ep)
+}
+
+// normalizeEndpointForFingerprint applies additional normalization beyond
+// sanitization for dedup fingerprinting: removes default ports, strips
+// trailing slashes, and lowercases the hostname portion.
+func normalizeEndpointForFingerprint(endpoint string) string {
+	ep := sanitizeEndpoint(endpoint)
+	if ep == "" {
+		return ""
+	}
+	// Remove default ports :80 and :443
+	ep = strings.Replace(ep, ":80/", "/", 1)
+	ep = strings.Replace(ep, ":443/", "/", 1)
+	ep = strings.TrimSuffix(ep, ":80")
+	ep = strings.TrimSuffix(ep, ":443")
+	// Strip trailing slashes for consistent matching
+	ep = strings.TrimRight(ep, "/")
+	// Lowercase the scheme+host portion (path stays case-sensitive)
+	if idx := strings.Index(ep, "://"); idx != -1 {
+		rest := ep[idx+3:]
+		pathStart := strings.IndexByte(rest, '/')
+		if pathStart != -1 {
+			// scheme://HOST/path → lowercase scheme+host, keep path as-is
+			ep = strings.ToLower(ep[:idx+3+pathStart]) + rest[pathStart:]
+		} else {
+			// No path — lowercase entire thing
+			ep = strings.ToLower(ep)
+		}
+	}
+	return ep
+}
+
 // buildFingerprint creates a dedup fingerprint from vuln type and endpoint.
+// Fix ECHO-3: Normalizes the endpoint before fingerprinting so that
+// equivalent endpoints (with/without default ports, trailing slashes,
+// or case differences) produce the same fingerprint.
 func buildFingerprint(vulnType, endpoint string) string {
 	normalized := NormalizeVulnType(vulnType)
-	generalizedEP := generalizeEndpoint(endpoint) // uses dedup.go's version
+	generalizedEP := generalizeEndpoint(normalizeEndpointForFingerprint(endpoint))
 	input := normalized + ":" + generalizedEP
 	hash := sha256.Sum256([]byte(input))
 	return fmt.Sprintf("%x", hash[:8])
