@@ -626,17 +626,10 @@ func (fp *flowProvider) performPentester(
 				return "", fmt.Errorf("failed to unmarshal result: %w", err)
 			}
 
-			// Extract findings from hack_result and register them.
-			if fr := GetFindingRegistry(ctx); fr != nil {
-				resultText := hackResult.Result + " " + hackResult.Message
-				matches := vulnTypeRegex.FindAllStringSubmatch(resultText, -1)
-				for _, match := range matches {
-					if len(match) >= 2 {
-						severity := severityFromVulnType(match[1])
-						fr.CheckAndRegister(match[1], "", truncateString(resultText, 4096), severity, subtaskID, nil)
-					}
-				}
-			}
+			// Finding extraction removed from hack_result handler to prevent duplicates.
+			// Findings are extracted from individual tool responses in performer.go
+			// which has better endpoint data (extracted from tool call arguments).
+			// See performer.go ~line 1241 for the primary extraction path.
 
 			return "hack result successfully processed", nil
 		},
