@@ -581,7 +581,16 @@ func (fp *flowProvider) performAgentChain(
 			// v5: If timebox is active and this is a deadline expiry (not user cancel),
 			// perform graceful force-finish instead of returning a hard error.
 			if timebox != nil && errors.Is(err, context.DeadlineExceeded) {
-				partialResult := timebox.BuildForceFinishResult(toolCallCount, execState)
+				// M7: Use enhanced force-finish that collects all available data
+				// (findings, tool outputs, file paths) so nothing is lost.
+				partialResult := timebox.BuildForceFinishResultFull(&ForceFinishContext{
+					ToolCallCount:   toolCallCount,
+					ExecState:       execState,
+					Chain:           chain,
+					ToolHistory:     toolHistory,
+					FindingRegistry: findingRegistry,
+					CompletedWork:   completedWork,
+				})
 
 				// Save partial results to DB so findings aren't lost.
 				if subtaskID != nil {

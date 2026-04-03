@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/vxcontrol/langchaingo/llms"
 )
 
 // ─── Subtask Time-Boxing Configuration ──────────────────────────────────────
@@ -277,10 +279,34 @@ func (tb *SubtaskTimebox) CheckWarning() string {
 	return ""
 }
 
-// BuildForceFinishResult creates a partial result string for when the timebox
-// expires and the subtask must be force-finished. It includes the category,
-// elapsed time, and instructions for what the partial result contains.
+// ForceFinishContext bundles all data sources available at the time of a
+// force-finish, so BuildForceFinishResult can compose a comprehensive result
+// that preserves tool outputs even when the agent didn't call hack_result.
+type ForceFinishContext struct {
+	ToolCallCount    int
+	ExecState        *ExecutionState
+	Chain            []llms.MessageContent  // full message chain with tool results
+	ToolHistory      *ToolHistory           // recent tool call history
+	FindingRegistry  *FindingRegistry       // registered findings (if any)
+	CompletedWork    *CompletedWorkTracker  // completed work items
+}
+
+// BuildForceFinishResult creates a comprehensive result string for when the
+// timebox expires and the subtask must be force-finished. It extracts all
+// available findings, scan results, file paths, and tool outputs from the
+// execution context so that data survives even if the agent never called
+// hack_result.
 func (tb *SubtaskTimebox) BuildForceFinishResult(toolCallCount int, execState *ExecutionState) string {
+	// Backward-compatible: delegate to the enhanced version with nil context.
+	return tb.BuildForceFinishResultFull(&ForceFinishContext{
+		ToolCallCount: toolCallCount,
+		ExecState:     execState,
+	})
+}
+
+// BuildForceFinishResultFull creates a comprehensive result from all available
+// data sources. This is the enhanced version that preserves tool outputs.
+func (tb *SubtaskTimebox) BuildForceFinishResultFull(ffc *ForceFinishContext) string {
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("[TIMEBOX EXPIRED — %s subtask force-finished after %s]\n\n",
@@ -288,19 +314,121 @@ func (tb *SubtaskTimebox) BuildForceFinishResult(toolCallCount int, execState *E
 	sb.WriteString(fmt.Sprintf("Category: %s\n", tb.Category.String()))
 	sb.WriteString(fmt.Sprintf("Time limit: %s\n", tb.MaxDuration))
 	sb.WriteString(fmt.Sprintf("Actual duration: %s\n", tb.Elapsed().Round(time.Second)))
-	sb.WriteString(fmt.Sprintf("Tool calls made: %d\n\n", toolCallCount))
+	sb.WriteString(fmt.Sprintf("Tool calls made: %d\n\n", ffc.ToolCallCount))
 
+	execState := ffc.ExecState
 	if execState != nil {
 		sb.WriteString(fmt.Sprintf("Phase reached: %s\n", execState.Phase))
 		if len(execState.AttacksDone) > 0 {
 			sb.WriteString(fmt.Sprintf("Tools/attacks executed: %s\n", strings.Join(execState.AttacksDone, ", ")))
 		}
 		sb.WriteString(fmt.Sprintf("Errors encountered: %d\n", execState.ErrorCount))
-		if execState.ResumeContext != "" {
-			sb.WriteString("\n--- Resume Context ---\n")
-			sb.WriteString(execState.ResumeContext)
+	}
+
+	// --- Registered findings (from FindingRegistry) ---
+	if ffc.FindingRegistry != nil && ffc.FindingRegistry.GetFindingCount() > 0 {
+		findings := ffc.FindingRegistry.GetFindings()
+		sb.WriteString(fmt.Sprintf("\n## Registered Findings (%d)\n\n", len(findings)))
+		for i, f := range findings {
+			sb.WriteString(fmt.Sprintf("### Finding %d: %s\n", i+1, f.VulnType))
+			if f.Severity != "" {
+				sb.WriteString(fmt.Sprintf("Severity: %s\n", f.Severity))
+			}
+			if f.Endpoint != "" {
+				sb.WriteString(fmt.Sprintf("Endpoint: %s\n", f.Endpoint))
+			}
+			if f.Description != "" {
+				desc := f.Description
+				if len(desc) > 500 {
+					desc = desc[:500] + "..."
+				}
+				sb.WriteString(fmt.Sprintf("Details: %s\n", desc))
+			}
 			sb.WriteString("\n")
 		}
+	}
+
+	// --- Completed work items ---
+	if ffc.CompletedWork != nil {
+		summary := ffc.CompletedWork.FormatCompletedSummary()
+		if summary != "" {
+			sb.WriteString("\n## Completed Work\n\n")
+			sb.WriteString(summary)
+			sb.WriteString("\n")
+		}
+	}
+
+	// --- Extract findings and scan results from tool history ---
+	if ffc.ToolHistory != nil && ffc.ToolHistory.Len() > 0 {
+		entries := ffc.ToolHistory.GetLast(ffc.ToolHistory.Len())
+		var scanResults []string
+		var filePaths []string
+		seenPaths := make(map[string]bool)
+
+		for _, entry := range entries {
+			if entry.IsError {
+				continue
+			}
+			// Extract scan/finding results from tool outputs
+			if isSignificantToolResult(entry.Name, entry.Result) {
+				snippet := entry.Result
+				if len(snippet) > 300 {
+					snippet = snippet[:300] + "..."
+				}
+				scanResults = append(scanResults, fmt.Sprintf("[%s] %s", entry.Name, snippet))
+			}
+			// Extract file paths written to /work/
+			for _, path := range extractWorkPaths(entry.Result) {
+				if !seenPaths[path] {
+					seenPaths[path] = true
+					filePaths = append(filePaths, path)
+				}
+			}
+			for _, path := range extractWorkPaths(entry.Arguments) {
+				if !seenPaths[path] {
+					seenPaths[path] = true
+					filePaths = append(filePaths, path)
+				}
+			}
+		}
+
+		if len(filePaths) > 0 {
+			sb.WriteString("\n## Files Created/Modified\n\n")
+			for _, p := range filePaths {
+				sb.WriteString(fmt.Sprintf("- %s\n", p))
+			}
+		}
+
+		if len(scanResults) > 0 {
+			// Limit to most recent 15 significant results to avoid bloat
+			if len(scanResults) > 15 {
+				scanResults = scanResults[len(scanResults)-15:]
+			}
+			sb.WriteString("\n## Significant Tool Outputs (auto-collected)\n\n")
+			for _, r := range scanResults {
+				sb.WriteString(r)
+				sb.WriteString("\n\n")
+			}
+		}
+	}
+
+	// --- Extract findings from message chain tool results ---
+	if len(ffc.Chain) > 0 {
+		chainFindings := extractFindingsFromChain(ffc.Chain)
+		if len(chainFindings) > 0 {
+			sb.WriteString("\n## Key Findings from Tool Results\n\n")
+			for _, f := range chainFindings {
+				sb.WriteString(fmt.Sprintf("- **%s**: %s\n", f.toolName, f.summary))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	// --- Resume context from execution state ---
+	if execState != nil && execState.ResumeContext != "" {
+		sb.WriteString("\n--- Resume Context ---\n")
+		sb.WriteString(execState.ResumeContext)
+		sb.WriteString("\n")
 	}
 
 	sb.WriteString("\n⚠ This subtask was force-finished due to time constraints. ")
@@ -308,6 +436,114 @@ func (tb *SubtaskTimebox) BuildForceFinishResult(toolCallCount int, execState *E
 	sb.WriteString("a future flow run.")
 
 	return sb.String()
+}
+
+// chainFinding represents a finding extracted from the message chain.
+type chainFinding struct {
+	toolName string
+	summary  string
+}
+
+// extractFindingsFromChain scans tool result messages in the chain for
+// vulnerability indicators, scan findings, and significant discoveries.
+// Returns at most 20 findings.
+func extractFindingsFromChain(chain []llms.MessageContent) []chainFinding {
+	var findings []chainFinding
+	const maxFindings = 20
+
+	// Patterns that indicate a finding in tool output
+	findingPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)\[VULN(?:ERABILITY)?[_:]\s*([^\]]+)\]`),
+		regexp.MustCompile(`(?i)\[FINDING\]\s*(.+)`),
+		regexp.MustCompile(`(?i)(critical|high|medium)\s+severity`),
+		regexp.MustCompile(`(?i)CVE-\d{4}-\d+`),
+		regexp.MustCompile(`(?i)(?:sql injection|xss|ssrf|idor|rce|lfi|rfi|xxe|csrf)\s+(?:found|detected|confirmed|discovered)`),
+		regexp.MustCompile(`(?i)\[\+\]\s+(.+)`), // nuclei-style positive findings
+	}
+
+	for _, msg := range chain {
+		if msg.Role != llms.ChatMessageTypeTool {
+			continue
+		}
+		for _, part := range msg.Parts {
+			resp, ok := part.(llms.ToolCallResponse)
+			if !ok || resp.Content == "" {
+				continue
+			}
+
+			for _, pattern := range findingPatterns {
+				matches := pattern.FindAllString(resp.Content, 5)
+				for _, match := range matches {
+					if len(findings) >= maxFindings {
+						return findings
+					}
+					findings = append(findings, chainFinding{
+						toolName: resp.Name,
+						summary:  truncStr(match, 200),
+					})
+				}
+			}
+		}
+	}
+
+	return findings
+}
+
+// isSignificantToolResult returns true if a tool result likely contains
+// scan findings, vulnerabilities, or other meaningful output worth preserving.
+func isSignificantToolResult(toolName, result string) bool {
+	if result == "" || len(result) < 20 {
+		return false
+	}
+
+	// Always capture results from offensive tools
+	offensiveTools := map[string]bool{
+		"nuclei_scan": true, "browser_navigate": true,
+	}
+	if offensiveTools[toolName] {
+		return true
+	}
+
+	// Check for vulnerability/finding indicators in the result
+	lower := strings.ToLower(result)
+	indicators := []string{
+		"vuln", "finding", "critical", "high", "medium",
+		"cve-", "injection", "xss", "ssrf", "idor",
+		"open port", "exposed", "leaked", "token",
+		"[+]", "severity", "exploit",
+		"200 ok", "401", "403", "500",
+	}
+	for _, ind := range indicators {
+		if strings.Contains(lower, ind) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// workPathRegex matches file paths under /work/.
+var workPathRegex = regexp.MustCompile(`/work/[\w./-]+`)
+
+// extractWorkPaths extracts unique file paths under /work/ from text.
+func extractWorkPaths(text string) []string {
+	matches := workPathRegex.FindAllString(text, 30)
+	var paths []string
+	for _, m := range matches {
+		// Filter out obviously non-file matches
+		if len(m) > 6 && !strings.HasSuffix(m, "/") {
+			paths = append(paths, m)
+		}
+	}
+	return paths
+}
+
+// truncStr truncates a string to maxLen characters.
+func truncStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
 
 // ─── Context Key for Subtask Metadata ───────────────────────────────────────
