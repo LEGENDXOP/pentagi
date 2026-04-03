@@ -373,10 +373,19 @@ func (fr *FindingRegistry) ParseAndSyncFindingsMD(content string, subtaskID *int
 		}
 		vulnType := vtMatch[1]
 
-		// Extract severity (use CVSS-based default if not found)
+		// Use authoritative CVSS-based severity. Do NOT override with agent-written
+		// severity from FINDINGS.md — agents tend to over-rate as CRITICAL.
 		severity := severityFromVulnType(vulnType)
+		// Agent's written severity is logged but not used (CVSS is authoritative).
 		if sevMatch := findingsMDSeverityRegex.FindStringSubmatch(block); len(sevMatch) >= 2 {
-			severity = strings.ToLower(sevMatch[1])
+			agentSev := strings.ToLower(sevMatch[1])
+			if agentSev != severity {
+				logrus.WithFields(logrus.Fields{
+					"vuln_type":      vulnType,
+					"agent_severity": agentSev,
+					"cvss_severity":  severity,
+				}).Debug("FINDINGS.md sync: agent severity differs from CVSS — using CVSS")
+			}
 		}
 
 		// Extract endpoint
@@ -745,25 +754,9 @@ func severityFromVulnType(vulnType string) string {
 	return "medium" // safe default for unmapped vuln types
 }
 
-// Deprecated: inferSeverityFromResponse guesses severity from response content.
-// This function is broken — it matches "critical" anywhere in response text,
-// including in prompt templates. Use severityFromVulnType() instead.
-// Returns "medium" as default if no clear indicators are found.
-func inferSeverityFromResponse(response string) string {
-	lower := strings.ToLower(response)
-	switch {
-	case strings.Contains(lower, "critical") || strings.Contains(lower, "cvss: 9") || strings.Contains(lower, "cvss: 10"):
-		return "critical"
-	case strings.Contains(lower, "high severity") || strings.Contains(lower, "cvss: 7") || strings.Contains(lower, "cvss: 8"):
-		return "high"
-	case strings.Contains(lower, "low severity") || strings.Contains(lower, "informational"):
-		return "low"
-	case strings.Contains(lower, "info"):
-		return "info"
-	default:
-		return "medium"
-	}
-}
+// inferSeverityFromResponse was removed — it matched "critical" anywhere in
+// response text (including prompt templates), causing all findings to be CRITICAL.
+// Use severityFromVulnType() which uses authoritative CVSS scores instead.
 
 // ─── Context propagation ─────────────────────────────────────────────────────
 
