@@ -620,7 +620,31 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen] + "...[truncated]"
 }
 
-// inferSeverityFromResponse guesses severity from response content.
+// severityFromVulnType determines severity using the authoritative CVSS scores
+// from ComplianceMappings, keyed by normalized vulnerability type. This replaces
+// the broken inferSeverityFromResponse which matched "critical" anywhere in text.
+func severityFromVulnType(vulnType string) string {
+	normalized := NormalizeVulnType(vulnType)
+	if cm := GetComplianceForVulnType(normalized); cm != nil {
+		switch {
+		case cm.CVSSBase >= 9.0:
+			return "critical"
+		case cm.CVSSBase >= 7.0:
+			return "high"
+		case cm.CVSSBase >= 4.0:
+			return "medium"
+		case cm.CVSSBase >= 0.1:
+			return "low"
+		default:
+			return "info"
+		}
+	}
+	return "medium" // safe default for unmapped vuln types
+}
+
+// Deprecated: inferSeverityFromResponse guesses severity from response content.
+// This function is broken — it matches "critical" anywhere in response text,
+// including in prompt templates. Use severityFromVulnType() instead.
 // Returns "medium" as default if no clear indicators are found.
 func inferSeverityFromResponse(response string) string {
 	lower := strings.ToLower(response)

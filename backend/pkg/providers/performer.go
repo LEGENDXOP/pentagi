@@ -1247,7 +1247,7 @@ func (fp *flowProvider) performAgentChain(
 						if toolCall.FunctionCall != nil {
 							endpoint = extractEndpointFromToolCall(funcName, toolCall.FunctionCall.Arguments)
 						}
-						severity := inferSeverityFromResponse(response)
+						severity := severityFromVulnType(vulnType)
 						findingRegistry.CheckAndRegister(vulnType, endpoint, truncateString(response, 4096), severity, subtaskID, nil)
 					}
 				}

@@ -632,7 +632,7 @@ func (fp *flowProvider) performPentester(
 				matches := vulnTypeRegex.FindAllStringSubmatch(resultText, -1)
 				for _, match := range matches {
 					if len(match) >= 2 {
-						severity := inferSeverityFromResponse(resultText)
+						severity := severityFromVulnType(match[1])
 						fr.CheckAndRegister(match[1], "", truncateString(resultText, 4096), severity, subtaskID, nil)
 					}
 				}
