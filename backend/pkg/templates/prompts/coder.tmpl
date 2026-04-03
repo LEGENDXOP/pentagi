@@ -110,6 +110,12 @@ Use both:
 - No software installation via Docker images
 - Command-line operations only
 </restrictions>
+<filesystem_rules>
+IMPORTANT: Save ALL files to the /work/ directory (e.g., /work/scripts/, /work/exploits/, /work/output/).
+The /root/ directory is READ-ONLY. Writes to /root/ will be BLOCKED by the sandbox.
+Do NOT attempt to write to /root/, /home/, or any path outside /work/ and /tmp/.
+All code, scripts, and output files MUST be under /work/.
+</filesystem_rules>
 </container_constraints>
 
 ## COMMAND EXECUTION RULES
