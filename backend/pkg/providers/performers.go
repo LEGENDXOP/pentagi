@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"pentagi/pkg/cast"
@@ -104,9 +105,23 @@ func (fp *flowProvider) performSubtasksGenerator(
 		llms.TextParts(llms.ChatMessageTypeHuman, userGeneratorTmpl),
 	}
 
-	memorist, err := fp.GetMemoristHandler(ctx, &taskID, nil)
+	rawGenMemorist, err := fp.GetMemoristHandler(ctx, &taskID, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get memorist handler: %w", err)
+	}
+
+	// v15: Cap memorist calls in the generator to prevent task-level memory churn.
+	// The generator only needs 1-2 memorist lookups to understand prior context.
+	const maxMemoristPerGenerator = 3
+	var genMemoristCount atomic.Int32
+	memorist := func(ctx context.Context, name string, args json.RawMessage) (string, error) {
+		count := genMemoristCount.Add(1)
+		if count > int32(maxMemoristPerGenerator) {
+			return "⚡ Memorist budget exhausted for task planning (" +
+				fmt.Sprintf("%d/%d", count, maxMemoristPerGenerator) +
+				" calls used). Proceed with subtask_list using gathered context.", nil
+		}
+		return rawGenMemorist(ctx, name, args)
 	}
 
 	searcher, err := fp.GetTaskSearcherHandler(ctx, taskID)
@@ -263,9 +278,33 @@ func (fp *flowProvider) performSubtasksRefiner(
 		}
 	}
 
-	memorist, err := fp.GetMemoristHandler(ctx, &taskID, nil)
+	rawMemorist, err := fp.GetMemoristHandler(ctx, &taskID, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get memorist handler: %w", err)
+	}
+
+	// v15: Cap memorist calls per refiner cycle to prevent excessive memory churn.
+	// Without this, the refiner LLM calls memorist 3-5 times per cycle × 7+ graphiti
+	// searches each = 30+ memory lookups per refinement. Across 9 refiner cycles in
+	// flow 19, this produced 79 graphiti_search + 46 search_in_memory = 125+ wasted
+	// task-level search calls. Cap at 2 memorist calls per refiner cycle — the first
+	// call gathers context, the second can refine. Beyond that, diminishing returns.
+	const maxMemoristPerRefiner = 2
+	var memoristCallCount atomic.Int32
+	memorist := func(ctx context.Context, name string, args json.RawMessage) (string, error) {
+		count := memoristCallCount.Add(1)
+		if count > int32(maxMemoristPerRefiner) {
+			logger.WithFields(logrus.Fields{
+				"memorist_call_count": count,
+				"max_per_refiner":     maxMemoristPerRefiner,
+			}).Warn("v15: memorist call budget exhausted for this refiner cycle")
+			return "⚡ Memorist budget exhausted for this refinement cycle (" +
+				fmt.Sprintf("%d/%d", count, maxMemoristPerRefiner) +
+				" calls used). You already have the context you need — " +
+				"proceed with subtask_patch using the information gathered. " +
+				"Do NOT call memorist again this cycle.", nil
+		}
+		return rawMemorist(ctx, name, args)
 	}
 
 	searcher, err := fp.GetTaskSearcherHandler(ctx, taskID)
