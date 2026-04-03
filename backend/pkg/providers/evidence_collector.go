@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -309,6 +310,108 @@ func (fr *FindingRegistry) GetFindingCount() int {
 		}
 	}
 	return count
+}
+
+// ─── FINDINGS.md Sync (Fallback) ─────────────────────────────────────────────
+
+// findingsMDBlockRegex matches structured finding blocks in FINDINGS.md.
+// Supports the standard format:
+//   [FINDING: F-NNN]
+//   Title: <title>
+//   [VULN_TYPE: <tag>]
+//   Severity: Critical|High|Medium|Low|Info
+//   Target: <endpoint>
+//   Description: <text>
+var findingsMDBlockRegex = regexp.MustCompile(
+	`(?s)\[FINDING:\s*F-\d+\].*?(?:\[FINDING:|\z)`,
+)
+var findingsMDVulnTypeRegex = regexp.MustCompile(`\[VULN_TYPE:\s*(\w+)\]`)
+var findingsMDSeverityRegex = regexp.MustCompile(`(?i)Severity:\s*(Critical|High|Medium|Low|Info)`)
+var findingsMDTargetRegex = regexp.MustCompile(`(?i)Target:\s*(.+)`)
+var findingsMDTitleRegex = regexp.MustCompile(`(?i)Title:\s*(.+)`)
+var findingsMDDescRegex = regexp.MustCompile(`(?i)Description:\s*(.+)`)
+
+// ParseAndSyncFindingsMD parses FINDINGS.md content and registers any findings
+// not already present in the registry. This is a FALLBACK mechanism for flows
+// where the agent wrote findings to FINDINGS.md but did not include [VULN_TYPE:]
+// tags in individual tool responses.
+//
+// Returns the number of new findings registered.
+func (fr *FindingRegistry) ParseAndSyncFindingsMD(content string, subtaskID *int64) int {
+	if strings.TrimSpace(content) == "" {
+		return 0
+	}
+
+	newCount := 0
+	// Split content into finding blocks
+	blocks := findingsMDBlockRegex.FindAllString(content, -1)
+
+	// If no structured blocks found, try a simpler line-by-line approach
+	// looking for VULN_TYPE tags anywhere in the file
+	if len(blocks) == 0 {
+		matches := findingsMDVulnTypeRegex.FindAllStringSubmatch(content, -1)
+		for _, match := range matches {
+			if len(match) >= 2 {
+				vulnType := match[1]
+				severity := severityFromVulnType(vulnType)
+				_, isNew := fr.CheckAndRegister(
+					vulnType, "", truncateString(content, 4096), severity, subtaskID, nil,
+				)
+				if isNew {
+					newCount++
+				}
+			}
+		}
+		return newCount
+	}
+
+	for _, block := range blocks {
+		// Extract VULN_TYPE
+		vtMatch := findingsMDVulnTypeRegex.FindStringSubmatch(block)
+		if len(vtMatch) < 2 {
+			continue // No vuln type = can't register
+		}
+		vulnType := vtMatch[1]
+
+		// Extract severity (use CVSS-based default if not found)
+		severity := severityFromVulnType(vulnType)
+		if sevMatch := findingsMDSeverityRegex.FindStringSubmatch(block); len(sevMatch) >= 2 {
+			severity = strings.ToLower(sevMatch[1])
+		}
+
+		// Extract endpoint
+		endpoint := ""
+		if tgtMatch := findingsMDTargetRegex.FindStringSubmatch(block); len(tgtMatch) >= 2 {
+			endpoint = strings.TrimSpace(tgtMatch[1])
+		}
+
+		// Extract description
+		description := truncateString(block, 4096)
+		if descMatch := findingsMDDescRegex.FindStringSubmatch(block); len(descMatch) >= 2 {
+			description = truncateString(descMatch[1], 4096)
+		}
+
+		// Extract title for logging
+		title := ""
+		if titleMatch := findingsMDTitleRegex.FindStringSubmatch(block); len(titleMatch) >= 2 {
+			title = strings.TrimSpace(titleMatch[1])
+		}
+
+		_, isNew := fr.CheckAndRegister(
+			vulnType, endpoint, description, severity, subtaskID, nil,
+		)
+		if isNew {
+			newCount++
+			logrus.WithFields(logrus.Fields{
+				"vuln_type": vulnType,
+				"severity":  severity,
+				"endpoint":  endpoint,
+				"title":     title,
+			}).Info("FINDINGS.md sync: registered finding missed by primary extraction")
+		}
+	}
+
+	return newCount
 }
 
 // ─── Report Generator ────────────────────────────────────────────────────────

@@ -286,8 +286,40 @@ func (fp *flowProvider) performAgentChain(
 	defer stateWriter.Close()
 
 	// Persist findings to DB on subtask completion (best-effort).
+	// Also sync FINDINGS.md as a fallback for flows where the agent wrote
+	// findings to the file but did not include [VULN_TYPE:] tags in tool responses.
 	defer func() {
-		if findingRegistry != nil && findingRegistry.GetFindingCount() > 0 {
+		if findingRegistry == nil {
+			return
+		}
+
+		// M6 FALLBACK: Try to read FINDINGS.md from the container and sync
+		// any findings that were missed by the primary extraction path.
+		func() {
+			syncCtx := context.WithoutCancel(ctx)
+			syncCtx, syncCancel := context.WithTimeout(syncCtx, 10*time.Second)
+			defer syncCancel()
+
+			readArgs, _ := json.Marshal(map[string]interface{}{
+				"input":   "cat /work/FINDINGS.md 2>/dev/null || echo ''",
+				"timeout": 5,
+			})
+			mdContent, err := executor.Execute(syncCtx, 0, "", "terminal", "", readArgs)
+			if err != nil {
+				logrus.WithError(err).Debug("FINDINGS.md sync: failed to read file (non-fatal)")
+				return
+			}
+			if strings.TrimSpace(mdContent) == "" {
+				return
+			}
+			newCount := findingRegistry.ParseAndSyncFindingsMD(mdContent, subtaskID)
+			if newCount > 0 {
+				logrus.WithField("new_findings", newCount).
+					Info("FINDINGS.md sync: registered findings missed by primary extraction")
+			}
+		}()
+
+		if findingRegistry.GetFindingCount() > 0 {
 			persistCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			findingRegistry.PersistFindings(persistCtx, fp.db)
