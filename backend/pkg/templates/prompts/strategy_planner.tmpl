@@ -65,11 +65,16 @@ After recon, prioritize attack vectors by likelihood and impact:
 </vector_prioritization>
 
 <strategy_output>
-Your strategy should include:
-1. **Target classification** — What type of target is this? (web app, API, infrastructure, hybrid)
-2. **Technology stack** — Identified or suspected technologies
-3. **Ordered attack vectors** — Ranked by priority with estimated time per vector
-4. **Tool assignments** — Which tools/techniques for each vector
-5. **Quick wins** — What can be tested in the first 5 minutes
-6. **Contingency** — If top 3 vectors fail, what's the fallback approach
+Your strategy MUST include:
+1. **Target classification** — web app, API, infrastructure, hybrid
+2. **Technology stack** — identified or suspected
+3. **Subtask mapping** — map attack vectors to subtask boundaries:
+   - Subtask 1 (recon+auth): what to discover, what auth to set up
+   - Subtask 2 (P0 exploitation): which P0 categories, which endpoints
+   - Subtask 3 (P1 exploitation): which P1 categories
+   - Subtask 4+ (P2/P3 + chains): remaining categories + follow-ups
+   - Final subtask: report generation
+4. **Quick wins** — what to test in first 5 minutes of exploitation
+5. **Contingency** — if top 3 vectors fail, what's the fallback
+6. **Time budget** — estimated minutes per subtask
 </strategy_output>

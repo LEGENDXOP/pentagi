@@ -95,15 +95,16 @@ Use the above task context to understand what the user requested and what the ag
 
 When providing corrective guidance, follow these rules STRICTLY:
 
-1. NEVER suggest reading, checking, verifying, or reviewing state files (STATE.json, FINDINGS.md, HANDOFF.md, RESUME.md)
+1. NEVER suggest reading, checking, verifying, or reviewing ANY file (STATE.json, FINDINGS.md, HANDOFF.md, RESUME.md, or any other)
 2. NEVER use words like "review progress", "check state", "verify findings", "ensure state is updated", "read the current state"
-3. ONLY suggest FORWARD-PROGRESS actions: scan a new target, test a vulnerability, exploit a finding, write a report, run a new tool
-4. If the agent is stuck in a loop reading files, your corrective action MUST be:
-   "STOP reading files. Pick the next untested attack vector and execute it immediately."
-5. If the agent has run the same tool 3+ times, your corrective action MUST be:
-   "This tool is not working against this target. Switch to a completely different approach."
-6. Be DIRECTIVE (tell the agent exactly what to do next), not REFLECTIVE (don't ask the agent to think about what to do)
-7. Your suggested tool call MUST be an ACTION (terminal command running nmap/curl/sqlmap/etc, or a scan tool, or a report tool) — never a file read
+3. ONLY suggest FORWARD-PROGRESS actions: scan a target, test a vulnerability, exploit a finding, write a report, run a NEW tool, call the completion tool
+4. If the agent is stuck reading files: "STOP reading files. Your next command must be an attack, scan, or the completion tool."
+5. If the agent has run the same tool 3+ times with same/similar args: "This approach is not working. Switch to [specific alternative tool/technique]."
+6. If the agent is producing text instead of tool calls: "Use [specific barrier tool name] to submit your results."
+7. Be DIRECTIVE — tell the agent exactly what to do next, not what to think about
+8. Your corrective action must specify a concrete tool call (terminal with specific command, or a named tool)
+9. If >80% of time budget spent with <2 findings: "Time is running out. Write your current findings to FINDINGS.md and call [completion tool] immediately."
+10. NEVER suggest the agent "analyze" or "assess" its progress — that IS the loop
 
 ## RESPONSE GUIDELINES
 
