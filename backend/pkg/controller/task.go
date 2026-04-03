@@ -322,6 +322,28 @@ func (tw *taskWorker) PutInput(ctx context.Context, input string) error {
 func (tw *taskWorker) Run(ctx context.Context) error {
 	ctx = tools.PutAgentContext(ctx, database.MsgchainTypePrimaryAgent)
 
+	// Ensure a global execution budget exists at the task level.
+	// This budget is shared across ALL agent chain calls within this task:
+	// subtask execution (PerformAgentChain), refinement (RefineSubtasks),
+	// and final reporting (GetTaskResult). Previously the budget was
+	// created inside PerformAgentChain as a local variable and discarded
+	// on return, so the refiner/reporter fell back to the subtask deadline.
+	if providers.GetBudget(ctx) == nil {
+		budget := providers.NewExecutionBudgetFromEnv()
+		ctx = providers.WithBudget(ctx, budget)
+		logrus.WithFields(logrus.Fields{
+			"task_id":      tw.taskCtx.TaskID,
+			"flow_id":      tw.taskCtx.FlowID,
+			"max_duration": budget.MaxDuration(),
+		}).Info("created global execution budget at task Run level")
+	} else {
+		logrus.WithFields(logrus.Fields{
+			"task_id":        tw.taskCtx.TaskID,
+			"flow_id":        tw.taskCtx.FlowID,
+			"time_remaining": providers.GetBudget(ctx).TimeRemaining(),
+		}).Info("reusing existing global execution budget in task Run")
+	}
+
 	maxRetries := getSubtaskMaxRetries()
 	logger := logrus.WithContext(ctx).WithFields(logrus.Fields{
 		"task_id": tw.taskCtx.TaskID,
@@ -370,7 +392,13 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 
 		if err := tw.stc.RefineSubtasks(ctx); err != nil {
 			if errors.Is(err, context.Canceled) {
-				ctx = context.Background()
+				// Preserve the global budget when recovering from context cancellation
+				// so subsequent subtasks still see the correct time remaining.
+				newCtx := context.Background()
+				if budget := providers.GetBudget(ctx); budget != nil {
+					newCtx = providers.WithBudget(newCtx, budget)
+				}
+				ctx = newCtx
 			}
 
 			// Refiner failure is non-fatal: log the error and continue executing

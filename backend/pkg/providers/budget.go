@@ -56,6 +56,19 @@ func NewExecutionBudget(maxCalls int, maxDuration time.Duration) *ExecutionBudge
 	}
 }
 
+// NewExecutionBudgetFromEnv creates a budget using environment variable configuration
+// (GLOBAL_MAX_TOOL_CALLS and GLOBAL_MAX_DURATION_MINUTES). This is the recommended
+// constructor for task-level budget creation in the controller layer.
+func NewExecutionBudgetFromEnv() *ExecutionBudget {
+	return NewExecutionBudget(getGlobalMaxToolCalls(), getGlobalMaxDuration())
+}
+
+// MaxDuration returns the configured maximum duration for this budget.
+// Useful for logging at creation time.
+func (b *ExecutionBudget) MaxDuration() time.Duration {
+	return b.maxDuration
+}
+
 // Consume records n tool calls and checks both call and time budgets.
 func (b *ExecutionBudget) Consume(n int) error {
 	b.mu.Lock()
