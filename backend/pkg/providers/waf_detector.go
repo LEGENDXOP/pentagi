@@ -50,6 +50,27 @@ func NewWAFDetector() *WAFDetector {
 // knownWAFProducts contains fingerprints for identifying specific WAF products.
 var knownWAFProducts = []WAFProduct{
 	{
+		Name: "DataDome",
+		HeaderPatterns: []string{
+			"x-datadome", "datadome", "set-cookie: datadome",
+			"x-dd-b", "x-dd-type",
+		},
+		BodyPatterns: []string{
+			"datadome", "dd.js", "geo.captcha-delivery.com",
+			"interstitial", "blocked", "robot detection",
+			"captcha-delivery", "dd_check",
+		},
+		BypassTechniques: []string{
+			"DataDome has aggressive bot detection — standard curl/requests will be blocked immediately",
+			"Use a REAL browser (Playwright/Puppeteer with stealth plugins) for ALL requests",
+			"DataDome fingerprints TLS — use a browser TLS stack, not a library",
+			"Residential proxy rotation may help, but DataDome also checks browser fingerprint",
+			"If DataDome blocks auth endpoints, ALL auth-dependent testing is impossible — pivot to unauth vectors",
+			"Focus on: unauthenticated endpoints, data exposure (.git/.env), SSRF, information disclosure",
+			"DO NOT waste time trying to bypass DataDome on auth — it learns and escalates blocks",
+		},
+	},
+	{
 		Name: "Cloudflare",
 		HeaderPatterns: []string{
 			"cf-ray", "cf-cache-status", "server: cloudflare",

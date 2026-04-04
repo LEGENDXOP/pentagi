@@ -287,6 +287,7 @@ type FlowToolsExecutor interface {
 	Prepare(ctx context.Context) error
 	Release(ctx context.Context) error
 	ListWorkspaceFiles(ctx context.Context) ([]FileInfo, error)
+	RescueContainerFiles(ctx context.Context) ([]RescuedFile, error)
 	GetCustomExecutor(cfg CustomExecutorConfig) (ContextToolsExecutor, error)
 	GetAssistantExecutor(cfg AssistantExecutorConfig) (ContextToolsExecutor, error)
 	GetPrimaryExecutor(cfg PrimaryExecutorConfig) (ContextToolsExecutor, error)
@@ -474,6 +475,11 @@ func (fte *flowToolsExecutor) Release(ctx context.Context) error {
 func (fte *flowToolsExecutor) ListWorkspaceFiles(ctx context.Context) ([]FileInfo, error) {
 	containerName := PrimaryTerminalName(fte.flowID)
 	return ListWorkspaceFiles(ctx, fte.docker, containerName, fte.primaryLID, "")
+}
+
+func (fte *flowToolsExecutor) RescueContainerFiles(ctx context.Context) ([]RescuedFile, error) {
+	containerName := PrimaryTerminalName(fte.flowID)
+	return RescueContainerFiles(ctx, fte.docker, containerName, fte.primaryLID)
 }
 
 func (fte *flowToolsExecutor) GetCustomExecutor(cfg CustomExecutorConfig) (ContextToolsExecutor, error) {

@@ -220,6 +220,10 @@ type Config struct {
 	FlowWatchdogInterval   int  `env:"FLOW_WATCHDOG_INTERVAL" envDefault:"300"`    // seconds
 	FlowWatchdogMaxResumes int  `env:"FLOW_WATCHDOG_MAX_RESUMES" envDefault:"5"`
 
+	// Tool call timeout configuration (seconds) — prevents individual tool calls from running indefinitely
+	// Tool call timeouts are configured via TOOL_CALL_TIMEOUT_AGENT and
+	// TOOL_CALL_TIMEOUT_DEFAULT env vars, read directly in pkg/tools/executor.go.
+
 	// Telegram notifications (optional)
 	TelegramBotToken     string `env:"TELEGRAM_BOT_TOKEN"`
 	TelegramChatID       string `env:"TELEGRAM_CHAT_ID"`

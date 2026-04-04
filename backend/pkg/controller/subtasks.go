@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"pentagi/pkg/database"
+
+	"github.com/sirupsen/logrus"
 )
 
 type NewSubtaskInfo struct {
@@ -67,6 +70,55 @@ func (stc *subtaskController) LoadSubtasks(ctx context.Context, taskID int64, up
 	return nil
 }
 
+// vulnClassKeywords maps vulnerability class names to their identifying keywords.
+// Used by warnIfMultiVulnClass to detect subtasks that combine multiple classes.
+var vulnClassKeywords = map[string][]string{
+	"SSRF":            {"ssrf", "server-side request", "server side request", "cloud metadata", "169.254.169.254", "imds"},
+	"IDOR":            {"idor", "bola", "insecure direct object", "broken object level"},
+	"SQLi":            {"sqli", "sql injection", "nosql injection", "sql/nosql"},
+	"XSS":             {"xss", "cross-site scripting", "cross site scripting"},
+	"Auth":            {"auth bypass", "authentication bypass", "jwt", "oauth", "session fixation", "credential"},
+	"RCE":             {"rce", "remote code execution", "command injection", "deserialization", "ssti"},
+	"Race":            {"race condition", "toctou", "double-spend", "double spend", "single-packet"},
+	"BusinessLogic":   {"business logic", "price manipulation", "coupon", "payment manipulation", "amount tampering"},
+	"ATO":             {"account takeover", "ato", "password reset poisoning", "mfa bypass"},
+	"DataHarvest":     {"data harvest", "sensitive data", ".git", ".env", "swagger", "source map", "s3 enum"},
+	"APIAttacks":      {"graphql", "api attack", "batching", "method override", "parameter pollution"},
+	"RequestSmuggling":{"smuggling", "cache poisoning", "cache deception", "cl.te", "te.cl"},
+}
+
+// warnIfMultiVulnClass logs a warning if a subtask description references
+// more than one distinct vulnerability class. This is a safety net — the
+// primary enforcement is in the prompt template.
+func warnIfMultiVulnClass(taskID int64, title, description string) {
+	combined := strings.ToLower(title + " " + description)
+	wordCount := len(strings.Fields(description))
+
+	var matched []string
+	for class, keywords := range vulnClassKeywords {
+		for _, kw := range keywords {
+			if strings.Contains(combined, kw) {
+				matched = append(matched, class)
+				break // one match per class is enough
+			}
+		}
+	}
+
+	logger := logrus.WithFields(logrus.Fields{
+		"task_id":        taskID,
+		"subtask_title":  title,
+		"vuln_classes":   matched,
+		"word_count":     wordCount,
+	})
+
+	if len(matched) > 1 {
+		logger.Warn("[SCOPE_VIOLATION] subtask references >1 vulnerability classes — should be exactly one class per subtask")
+	}
+	if wordCount > 300 {
+		logger.Warn("[SCOPE_VIOLATION] subtask description exceeds 300 words — likely overloaded")
+	}
+}
+
 func (stc *subtaskController) GenerateSubtasks(ctx context.Context) error {
 	plan, err := stc.taskCtx.Provider.GenerateSubtasks(ctx, stc.taskCtx.TaskID)
 	if err != nil {
@@ -75,6 +127,11 @@ func (stc *subtaskController) GenerateSubtasks(ctx context.Context) error {
 
 	if len(plan) == 0 {
 		return fmt.Errorf("no subtasks generated for task %d", stc.taskCtx.TaskID)
+	}
+
+	// Safety-net: warn if any generated subtask spans multiple vulnerability classes.
+	for _, info := range plan {
+		warnIfMultiVulnClass(stc.taskCtx.TaskID, info.Title, info.Description)
 	}
 
 	// TODO: change it to insert subtasks in transaction

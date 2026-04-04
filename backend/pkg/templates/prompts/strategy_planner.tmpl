@@ -16,6 +16,19 @@ Before beginning execution, analyze the target and develop a structured attack s
 <planning_instructions>
 Develop an attack strategy considering the following:
 
+0. **Blocker Detection Phase** (MANDATORY — first 5 minutes of recon)
+   - BEFORE anything else, check for blockers that would waste hours:
+     - Send a simple HTTP request to the target — if it returns a WAF block page (DataDome, Cloudflare challenge, Akamai), note the WAF type and severity
+     - Attempt to access registration/login endpoints — if they require CAPTCHA, phone verification, or external verification (PayPal, KYC), note the gate
+     - Check if rate limiting is aggressive (send 3-5 requests to /api/ endpoints)
+     - Map which endpoints return 200 vs 403/429
+   - AFTER blocker detection, ADJUST your plan:
+     - If WAF blocks ALL requests → drop all exploitation subtasks, focus on WAF bypass or unauthenticated vectors only
+     - If auth requires external verification (PayPal, KYC, phone) → drop all auth-dependent subtasks, focus on unauth testing
+     - If CAPTCHA blocks registration → note as finding, don't waste time on auth-dependent paths
+     - If specific endpoints are 403 → target only accessible endpoints
+   - Report blockers to the user IMMEDIATELY in the first subtask's output
+
 1. **Reconnaissance Phase** (budget: {{.ReconMinutes}} minutes)
    - Identify attack surface: ports, services, technologies
    - Map application structure and entry points

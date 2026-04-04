@@ -9,6 +9,8 @@ import (
 	"pentagi/pkg/database"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/providers"
+
+	"github.com/sirupsen/logrus"
 )
 
 type TaskUpdater interface {
@@ -224,6 +226,15 @@ func (stw *subtaskWorker) SetStatus(ctx context.Context, status database.Subtask
 		stw.completed = true
 		stw.waiting = false
 		// statuses Finished and Failed will be produced by stack from Run function call
+		// Zombie cleanup: fail any still-running toolcalls for this subtask
+		if cleanupErr := stw.subtaskCtx.DB.FailRunningToolcallsBySubtask(
+			ctx,
+			fmt.Sprintf("subtask %s (%s)", status, stw.subtaskCtx.SubtaskTitle),
+			stw.subtaskCtx.SubtaskID,
+		); cleanupErr != nil {
+			logrus.WithError(cleanupErr).WithField("subtask_id", stw.subtaskCtx.SubtaskID).
+				Warn("failed to clean up zombie toolcalls on subtask completion")
+		}
 	default:
 		stw.mx.Unlock()
 		return fmt.Errorf("unsupported subtask status: %s", status)

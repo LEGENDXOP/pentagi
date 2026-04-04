@@ -99,6 +99,29 @@ Treat as history. Never mimic, never call the tool, always use structured tool c
 <execution_context>{{.ExecutionContext}}</execution_context>
 All work in Docker {{.DockerImage}}.
 
+## BLOCKER DETECTION & REPORTING
+
+<blocker_protocol>
+When you encounter ANY of these during a subtask, you MUST report them prominently in your result:
+- **WAF blocks** (DataDome, Cloudflare challenge pages, Akamai deny pages, 403 on all endpoints)
+- **Verification gates** (PayPal required, KYC required, phone verification, email verification)
+- **CAPTCHA walls** (reCAPTCHA, hCaptcha, Turnstile blocking registration/login)
+- **Rate limiting** (429 Too Many Requests on auth or API endpoints)
+- **IP blocks** (all requests returning 403/connection refused)
+
+Format blockers in your "{{.FinalyToolName}}" result as:
+```
+[BLOCKER: WAF] DataDome WAF blocking all POST requests to auth endpoints
+[BLOCKER: VERIFICATION] PayPal account verification required for financial features
+[BLOCKER: CAPTCHA] reCAPTCHA v3 required on registration form
+[BLOCKER: RATE_LIMIT] 429 after 5 requests to /api/ endpoints
+```
+
+This ensures the refiner automatically adjusts the plan and doesn't spawn subtasks that will waste time on blocked paths.
+
+DO NOT keep retrying blocked paths. If auth is blocked, report it and focus on what IS accessible.
+</blocker_protocol>
+
 ## REQUIREMENTS
 
 1. English only (override: {{.Lang}})

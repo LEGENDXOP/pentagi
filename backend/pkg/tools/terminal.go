@@ -696,3 +696,169 @@ func ListWorkspaceFiles(
 
 	return files, nil
 }
+
+// RescuedFile represents a file rescued from a container before it's destroyed.
+type RescuedFile struct {
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	Content string `json:"content"`
+}
+
+// RescueContainerFiles rescues evidence files from a container's filesystem.
+// It scans /work/, /tmp/, and /root/ for files matching evidence patterns
+// (*.md, *.txt, *.json, *.html, *.xml, *.csv) and reads their contents.
+// This is called during subtask expiration to preserve work products before
+// the container is destroyed. Callers must provide a properly-timed context
+// (e.g., context.WithTimeout(context.Background(), 30*time.Second)) since
+// the parent subtask context is typically already expired.
+func RescueContainerFiles(
+	ctx context.Context,
+	dockerClient docker.DockerClient,
+	containerName string,
+	containerLID string,
+) ([]RescuedFile, error) {
+	// Use the caller-provided context directly — callers are responsible for
+	// setting an appropriate timeout (typically 30s via context.WithTimeout).
+	rescueCtx := ctx
+
+	// Check if container is still running
+	isRunning, err := dockerClient.IsContainerRunning(rescueCtx, containerLID)
+	if err != nil || !isRunning {
+		return nil, fmt.Errorf("container not available for rescue: running=%v, err=%v", isRunning, err)
+	}
+
+	// Find evidence files across all key directories
+	// Extensions that typically contain evidence/results
+	cmd := []string{
+		"sh", "-c",
+		`find /work/ /tmp/ /root/ -maxdepth 3 -type f \( ` +
+			`-name '*.md' -o -name '*.txt' -o -name '*.json' -o ` +
+			`-name '*.html' -o -name '*.xml' -o -name '*.csv' -o ` +
+			`-name '*.log' -o -name 'FINDINGS*' -o -name 'RESULTS*' -o ` +
+			`-name 'attack_results*' -o -name 'evidence*' -o -name 'report*' ` +
+			`\) -printf '%s\t%p\n' 2>/dev/null | head -50`,
+	}
+
+	createResp, err := dockerClient.ContainerExecCreate(rescueCtx, containerName, container.ExecOptions{
+		Cmd:          cmd,
+		AttachStdout: true,
+		AttachStderr: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create exec for file rescue: %w", err)
+	}
+
+	resp, err := dockerClient.ContainerExecAttach(rescueCtx, createResp.ID, container.ExecAttachOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to attach to exec for file rescue: %w", err)
+	}
+	defer resp.Close()
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, resp.Reader)
+
+	output := buf.String()
+	if output == "" {
+		return nil, nil // no evidence files found
+	}
+
+	// Parse the file listing
+	type fileEntry struct {
+		path string
+		size int64
+	}
+	var entries []fileEntry
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		var size int64
+		if _, err := fmt.Sscanf(parts[0], "%d", &size); err != nil {
+			size = 0
+		}
+		// Skip files that are too large (>256KB) or empty
+		if size == 0 || size > 256*1024 {
+			continue
+		}
+		entries = append(entries, fileEntry{path: parts[1], size: size})
+	}
+
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	// Read each file's content using CopyFromContainer
+	var rescued []RescuedFile
+	const maxTotalSize = 512 * 1024 // 512KB total budget for all rescued files
+	totalSize := int64(0)
+
+	for _, entry := range entries {
+		if totalSize+entry.size > maxTotalSize {
+			break // budget exhausted
+		}
+
+		reader, _, err := dockerClient.CopyFromContainer(rescueCtx, containerName, entry.path)
+		if err != nil {
+			logrus.WithError(err).WithField("path", entry.path).
+				Debug("rescue: failed to copy file from container")
+			continue
+		}
+
+		// Read tar content
+		tarReader := tar.NewReader(reader)
+		var content string
+		for {
+			tarHeader, err := tarReader.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				break
+			}
+			if tarHeader.FileInfo().IsDir() {
+				continue
+			}
+
+			fileContent := make([]byte, tarHeader.Size)
+			_, err = io.ReadFull(tarReader, fileContent)
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				break
+			}
+
+			// Check for binary content
+			checkLen := min(len(fileContent), 512)
+			isBinary := false
+			for _, b := range fileContent[:checkLen] {
+				if b == 0 {
+					isBinary = true
+					break
+				}
+			}
+			if isBinary {
+				break
+			}
+
+			content = string(fileContent)
+			break // only read first file in tar
+		}
+		reader.Close()
+
+		if content == "" {
+			continue
+		}
+
+		rescued = append(rescued, RescuedFile{
+			Path:    entry.path,
+			Size:    entry.size,
+			Content: content,
+		})
+		totalSize += entry.size
+	}
+
+	return rescued, nil
+}

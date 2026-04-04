@@ -5,6 +5,10 @@
   The <user_task><input> contains the MAIN OBJECTIVE that the user requested - this is the ultimate goal you must achieve.
   All subtasks you create MUST be designed to work together to accomplish this exact user request.
   Focus your subtasks on solving what the user asked for in <user_task><input>, not on tangential activities.
+
+  ⚠️ SCOPE ENFORCEMENT: Each exploitation subtask MUST target exactly ONE vulnerability class.
+  NEVER combine multiple vulnerability types (e.g., SSRF + IDOR + OAuth) in a single subtask.
+  Multi-class subtasks have a 95% timeout rate. Split them into separate single-class subtasks.
   </instruction>
 
   <user_task>

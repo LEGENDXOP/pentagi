@@ -571,6 +571,14 @@ func (fp *flowProvider) RefineSubtasks(ctx context.Context, taskID int64) ([]too
 			refinerContext["user"]["MethodologyCoverage"] = mc.FormatCoverageForRefiner()
 		}
 
+		// Fix 3: Extract blockers from completed subtask execution states and inject
+		// into the refiner so it can drop subtasks that depend on blocked paths.
+		blockerContext := fp.extractBlockersFromSubtasks(ctx, tasksInfo.Subtasks)
+		if blockerContext != "" {
+			refinerContext["user"]["BlockerContext"] = blockerContext
+			logger.WithField("has_blockers", true).Info("injected blocker context into refiner")
+		}
+
 		refinerTmpl, err = fp.prompter.RenderTemplate(templates.PromptTypeSubtasksRefiner, refinerContext["user"])
 		if err != nil {
 			return nil, wrapErrorEndEvaluatorSpan(ctx, refinerEvaluator, "failed to get task subtasks refiner template (2)", err)
@@ -1166,6 +1174,35 @@ func (fp *flowProvider) putAgentLog(
 // returns a formatted cost summary string for inclusion in reporter context.
 // It also supplements with in-memory CostTracker data if available.
 // Returns empty string on error (non-fatal).
+// extractBlockersFromSubtasks scans completed subtask execution states for persisted
+// blockers and aggregates them into a formatted prompt context for the refiner.
+func (fp *flowProvider) extractBlockersFromSubtasks(ctx context.Context, subtasks []database.Subtask) string {
+	tracker := NewBlockerTracker()
+
+	for _, st := range subtasks {
+		if st.Context == "" {
+			continue
+		}
+		if loaded := ParseExecutionState(st.Context); loaded != nil && loaded.Blockers != nil {
+			tracker.RestoreFromJSON(loaded.Blockers)
+		}
+	}
+
+	// Also scan completed subtask results for blocker keywords as a fallback.
+	// This catches cases where the subtask reported a blocker in its result text
+	// but didn't persist it in ExecutionState (e.g., older subtask format).
+	for _, st := range subtasks {
+		if st.Status != database.SubtaskStatusFinished && st.Status != database.SubtaskStatusFailed {
+			continue
+		}
+		if st.Result != "" {
+			tracker.AnalyzeToolOutput("subtask_result", "", st.Result, st.Title)
+		}
+	}
+
+	return tracker.FormatBlockersForPrompt()
+}
+
 func (fp *flowProvider) buildFlowCostSummary(ctx context.Context, taskID int64) string {
 	logger := logrus.WithContext(ctx).WithFields(logrus.Fields{
 		"flow_id": fp.flowID,

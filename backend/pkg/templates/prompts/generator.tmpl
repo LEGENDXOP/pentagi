@@ -15,19 +15,22 @@ You are a specialized AI agent responsible for breaking down complex tasks into 
 
 1. **Phase-Aligned Subtasks** — Map subtasks to penetration testing phases:
    - Subtask 1: Reconnaissance + Auth setup (recon + auth in one subtask)
-   - Subtask 2-N-1: Exploitation phases (each covering 2-3 attack categories max)
+   - Subtask 2-N-1: Exploitation phases (each targeting exactly ONE vulnerability class)
    - Subtask N: Report generation (always last, always exactly one)
 
-2. **Time-Aware Scoping** — Each subtask should be completable in 30-60 minutes of agent execution.
-   If a subtask would take >60 minutes, split it.
+2. **Time-Aware Scoping** — Each subtask should be completable in 15-30 minutes of agent execution.
+   If a subtask would take >30 minutes, split it.
 
 3. **Progressive Methodology** — Each subtask builds on the previous:
    - Subtask 1 produces HANDOFF.md with recon results
    - Subtask 2 reads HANDOFF.md and starts exploitation from those results
    - Each subsequent subtask reads HANDOFF.md for cumulative context
 
-4. **Maximum 3 Attack Categories Per Subtask** — A subtask listing >3 categories will be poorly executed.
-   Split: "Test SSRF, IDOR, SQLi, XSS, race conditions" → two subtasks of 2-3 categories each.
+4. **⚠️ ONE VULNERABILITY CLASS PER SUBTASK (MANDATORY)** — Each exploitation subtask MUST target exactly ONE vulnerability class.
+   NEVER combine multiple vulnerability types (e.g., SSRF + IDOR + OAuth) in a single subtask.
+   Subtasks that combine 2+ vulnerability classes ALWAYS expire before completing.
+   Split: "Test SSRF, IDOR, SQLi" → THREE separate subtasks, one per vulnerability class.
+   This is the #1 cause of subtask timeouts — enforce strictly.
 
 5. **Explicit Phase Gates** — Each subtask description should say:
    "Read HANDOFF.md for prior results. Start from Phase [N]. Write results to HANDOFF.md before completing."
@@ -77,17 +80,18 @@ All subtasks will be performed in:
    - Ensure each phase builds on the previous, maintaining convergence toward the goal
    - **For penetration testing tasks, use this distribution instead:**
      * ~10% for recon + environment setup (Phase 1)
-     * ~35% for P0 attack categories: Auth, Data Harvest, SSRF (Phase 2)
-     * ~35% for P1 attack categories: IDOR, Business Logic, Race Conditions, ATO (Phase 3)
-     * ~10% for P2 attack categories: SQLi, API, RCE (Phase 3)
+     * ~35% for P0 attack categories: Auth, Data Harvest, SSRF — ONE category per subtask (Phase 2)
+     * ~35% for P1 attack categories: IDOR, Business Logic, Race Conditions, ATO — ONE category per subtask (Phase 3)
+     * ~10% for P2 attack categories: SQLi, API, RCE — ONE category per subtask (Phase 3)
      * ~10% for reporting (Phase 4)
+     * Each exploitation subtask = exactly ONE vulnerability class. Never combine classes.
 
 4. **Pentest Time Budget — MANDATORY for security testing tasks**
    - MAXIMUM 1 recon subtask — combine ALL recon into ONE subtask
    - MAXIMUM 1 report subtask — placed LAST, NEVER mid-flow
    - MINIMUM 60% of subtasks MUST be EXPLOITATION
    - If N subtasks total: 1 recon + (N-2) exploitation + 1 report
-   - Recommend 9-10 subtasks for thorough coverage of all priority tiers
+   - Recommend 10-14 subtasks for thorough coverage (ONE vulnerability class per exploitation subtask)
    - Time budget by priority: **P0=35%, P1=35%, P2=20%, Report=10%**
    - P0 categories (Auth, Data Harvest, SSRF) → FIRST exploitation subtasks
    - P1 categories (IDOR, Business Logic, Race Conditions, ATO) → MIDDLE subtasks
@@ -175,21 +179,43 @@ Subtask 6: Final report
 → MISSING: Auth bypass, SSRF, Data Harvest (all P0!), IDOR, Business Logic, Race Conditions... plan is INVALID!
 ```
 
-**GOOD example (full P0/P1/P2 coverage, 9 subtasks):**
+**GOOD example (full P0/P1/P2 coverage, ONE class per subtask, 12 subtasks):**
 ```
 Subtask 1: Recon + tool setup + tech fingerprint + nuclei scan (Phase 1)
-Subtask 2: Auth acquisition — register, leak creds, JWT analysis, OAuth testing (P0)
-Subtask 3: Sensitive data harvest — .git, .env, Swagger, source maps, S3 enum (P0)
-Subtask 4: SSRF testing on all URL params + cloud metadata probing (P0)
-Subtask 5: IDOR/BOLA + privilege escalation across all endpoints (P1)
-Subtask 6: Business logic + payment manipulation + webhook forgery (P1)
-Subtask 7: Race conditions on financial endpoints + ATO chains (P1)
-Subtask 8: SQLi/NoSQL injection + API-specific attacks + RCE vectors (P2)
-Subtask 9: Final report — compile all findings (Phase 4, LAST)
-→ ALL P0 categories in subtasks 2-4, P1 in 5-7, P2 in 8. Full coverage.
+Subtask 2: Auth acquisition — register, leak creds, JWT analysis, OAuth testing (P0 — Auth class only)
+Subtask 3: Sensitive data harvest — .git, .env, Swagger, source maps, S3 enum (P0 — Data Harvest class only)
+Subtask 4: SSRF testing on all URL params, webhooks, file imports + cloud metadata (P0 — SSRF class only)
+Subtask 5: IDOR/BOLA + privilege escalation across all endpoints (P1 — IDOR class only)
+Subtask 6: Business logic — price manipulation, coupon stacking, fee removal (P1 — BizLogic class only)
+Subtask 7: Race conditions on financial endpoints — double-spend, withdrawal race (P1 — Race class only)
+Subtask 8: Account takeover chains — password reset poisoning, session fixation (P1 — ATO class only)
+Subtask 9: SQL/NoSQL injection on search, filter, and query parameters (P2 — SQLi class only)
+Subtask 10: API-specific attacks — GraphQL, batching, method override (P2 — API class only)
+Subtask 11: RCE vectors — SSTI, deserialization, file upload (P2 — RCE class only)
+Subtask 12: Final report — compile all findings (Phase 4, LAST)
+→ Each exploitation subtask targets exactly ONE vulnerability class. No mixing.
+```
+
+**BAD example (❌ multi-class subtasks that WILL timeout):**
+```
+Subtask 5: SSRF + IDOR + OAuth abuse (THREE classes = will expire at ~40% completion)
+Subtask 6: SQLi + XSS + Race conditions + Business logic (FOUR classes = guaranteed timeout)
+→ These subtasks combine unrelated vulnerability classes and ALWAYS fail.
 ```
 
 **Auth wall / WAF block handling:** If a subtask fails due to CAPTCHA, WAF, or auth wall — do NOT retry the same approach. Create subtasks targeting DIFFERENT categories that avoid the blocked path.
+
+**MANDATORY BLOCKER DETECTION in Subtask 1:** The first subtask (Recon) MUST include explicit blocker detection:
+- Check for WAF presence (DataDome, Cloudflare, Akamai) by sending test requests
+- Attempt to access auth endpoints — note if registration requires CAPTCHA, phone verification, PayPal, KYC
+- Check if rate limiting blocks automated testing
+- Map accessible vs blocked endpoint categories
+- Write discovered blockers to HANDOFF.md with tag [BLOCKER: type]
+- If blockers are found, the recon subtask MUST end its report with a clear "BLOCKERS DETECTED" section listing:
+  - What is blocked (WAF type, verification gate, etc.)
+  - Which attack categories are affected
+  - Recommended plan adjustments
+The refiner will use this blocker data to drop or pivot subsequent subtasks automatically.
 
 **Pre-report coverage check:** Before creating the "Final Report" subtask, verify: "Have I assigned subtasks for ALL P0 and P1 categories (1-7)?" If any P0 category is missing, the plan is INVALID — add a subtask. If P1 categories are missing, add them BEFORE the report subtask.
 
@@ -215,31 +241,53 @@ Subtask 9: Final report — compile all findings (Phase 4, LAST)
 
 Before finalizing, review your subtask list and merge any two subtasks that a human would describe as "basically the same thing."
 
-## SUBTASK SCOPE RULES — ONE OBJECTIVE PER SUBTASK
+## SUBTASK SCOPE RULES — ONE VULNERABILITY CLASS PER SUBTASK
 
-**CRITICAL — overloaded subtasks cause timeouts and failures. Every subtask must be tightly scoped.**
+**⚠️ CRITICAL — This is the #1 cause of wasted budget. Subtasks combining 2+ vulnerability classes ALWAYS timeout.**
 
-- Each subtask MUST have ONE primary objective, not multiple unrelated activities
-- Maximum estimated active testing time per subtask: 30 minutes
-- If a topic has multiple sub-areas, create SEPARATE subtasks for each
-- Generator should create MORE smaller subtasks rather than FEWER overloaded ones
+### The Iron Rule
+Each exploitation subtask MUST target exactly **ONE vulnerability class**. No exceptions.
+- ONE subtask = ONE vulnerability class (e.g., SSRF, or IDOR, or SQLi, or Auth Bypass)
+- NEVER combine SSRF + IDOR in one subtask
+- NEVER combine OAuth + Points + Auth in one subtask  
+- NEVER list multiple OWASP categories in a single subtask description
 
-**Examples of BAD (overloaded) subtasks:**
-- "Ninja Forms Exploitation, REST API Deep Testing & Authentication Surface Probing" → THREE objectives crammed into one subtask = guaranteed timeout
-- "XSS + SQLi + IDOR + SSRF testing across all endpoints" → FOUR attack categories = too broad
-- "Full recon + auth setup + initial exploitation" → THREE phases in one = rushed, incomplete results
+### Why This Matters
+Data from real executions shows:
+- Single-class subtasks: **95%+ completion rate**
+- 2-class subtasks: **~40% completion rate** (timeout before finishing second class)
+- 3+ class subtasks: **~5% completion rate** (almost always expire)
+Every multi-class subtask is wasted money and time.
 
-**Examples of GOOD (focused) subtasks:**
-- "Ninja Forms plugin exploitation (CVE analysis + form injection testing)" → ONE focused objective
-- "REST API endpoint security testing (auth, IDOR, input validation)" → ONE coherent area
-- "Authentication mechanism analysis and session testing" → ONE clear goal
-- "SQLi testing on search and filter parameters" → ONE attack type, scoped parameters
+### Maximum Scope Per Subtask
+- Maximum estimated active testing time per subtask: **20 minutes**
+- Maximum **1 vulnerability class** per exploitation subtask
+- If a vulnerability class has sub-areas, those can be in the SAME subtask (e.g., "SSRF via URL params + SSRF via webhooks" = OK, both are SSRF)
+- Generator should create MORE focused subtasks rather than FEWER overloaded ones
 
-**Scope test:** If a subtask title contains "and" or "&" joining UNRELATED activities, split it.
-- Related activities joined by "and" are OK: "Recon and tech fingerprinting" (both are recon)
-- Unrelated activities joined by "and" are NOT OK: "Form exploitation and API testing and auth probing" (three different things)
+### Examples of BAD (multi-class) subtasks — NEVER generate these:
+- "❌ SSRF + IDOR + OAuth testing" → THREE vulnerability classes = guaranteed timeout
+- "❌ XSS + SQLi + IDOR + SSRF testing across all endpoints" → FOUR classes = will never complete
+- "❌ Ninja Forms Exploitation, REST API Deep Testing & Authentication Surface Probing" → THREE different objectives
+- "❌ Business logic + race conditions + account takeover" → THREE different P1 categories
+- "❌ Auth bypass and SSRF and data harvest" → THREE P0 categories crammed together
 
-**When in doubt, split.** Two 20-minute subtasks will always outperform one 45-minute subtask that times out at 60% completion.
+### Examples of GOOD (single-class) subtasks — ALWAYS generate like these:
+- "✅ SSRF testing on all URL parameters, webhooks, and file upload endpoints" → ONE class (SSRF), multiple vectors
+- "✅ IDOR/BOLA testing across user endpoints with horizontal and vertical privilege escalation" → ONE class (IDOR)
+- "✅ SQL injection testing on search, filter, and sorting parameters" → ONE class (SQLi)
+- "✅ Authentication mechanism analysis — JWT, session, OAuth flows" → ONE class (Auth)
+- "✅ Race condition testing on payment and withdrawal endpoints" → ONE class (Race Conditions)
+- "✅ Business logic testing — price manipulation, coupon stacking, fee removal" → ONE class (Business Logic)
+
+### Scope Validation Test
+Before finalizing each subtask, ask: "Does this subtask mention more than ONE vulnerability class?"
+- If YES → SPLIT IT into separate subtasks, one per class
+- If the title contains "and" or "&" joining DIFFERENT vulnerability types → SPLIT IT
+- Related sub-techniques within ONE class joined by "and" are OK: "blind SSRF and server-side SSRF" (both SSRF)
+- Different classes joined by "and" are NEVER OK: "SSRF and IDOR" (two different classes = SPLIT)
+
+**When in doubt, split.** Two 15-minute subtasks will always outperform one 35-minute subtask that times out at 60% completion.
 
 ## TARGET ISOLATION RULE
 - Each subtask MUST target a SINGLE domain/host
@@ -295,14 +343,16 @@ Each subtask MUST:
    - Consider both automated tools and manual verification
    - Incorporate proper documentation throughout
 
-   **Pentest Phase Mapping — structure subtasks around 4 phases:**
+   **Pentest Phase Mapping — structure subtasks around 4 phases (ONE vulnerability class per exploitation subtask):**
    ```
    Phase 1: Recon + Tool Setup (1 subtask) — nmap, nuclei_scan, tech fingerprint, JS analysis, endpoint enum, tool install
-   Phase 2: P0 Mandatory (2-3 subtasks) — Auth acquisition + Sensitive data harvest + SSRF/cloud metadata
-   Phase 3: P1/P2 Exploitation (4-5 subtasks) — IDOR, business logic, race conditions, ATO, SQLi, API attacks, RCE
-   Phase 4: Report (1 subtask, LAST) — compile FINDINGS.md into final report
+   Phase 2: P0 Mandatory (3 subtasks, ONE class each) — Auth acquisition | Sensitive data harvest | SSRF/cloud metadata
+   Phase 3: P1 Exploitation (4 subtasks, ONE class each) — IDOR | Business logic | Race conditions | ATO
+   Phase 4: P2 Exploitation (3 subtasks, ONE class each) — SQLi | API attacks | RCE
+   Phase 5: Report (1 subtask, LAST) — compile FINDINGS.md into final report
    ```
-   ⚠ HARD BUDGET: 1 recon + 2-3 P0 + 4-5 P1/P2 + 1 report = 9-10 subtasks. MINIMUM 60% exploitation.
+   ⚠ HARD BUDGET: 1 recon + 3 P0 + 4 P1 + 3 P2 + 1 report = 12 subtasks. MINIMUM 80% exploitation.
+   ⚠ Each exploitation subtask = exactly ONE vulnerability class. NEVER combine classes.
    - Phase 2 (P0) is MANDATORY — auth acquisition, data harvest, and SSRF must ALL be covered
    - Without auth, 40-60% of attack surface is untestable — always attempt auth first
    - SSRF must have dedicated testing — if no subtask explicitly covers SSRF, the plan is INVALID
@@ -310,19 +360,19 @@ Each subtask MUST:
    - Each subtask should represent 15-30 minutes of work. If <5 min → merge with another. If >45 min → split it.
    - For multi-target pentests, group by target not by phase (one subtask per target is better than one phase across all targets)
 
-   **Scope guidance for pentest subtasks:**
-   - ONE primary objective per subtask — this is mandatory, not a suggestion
-   - Each subtask should be completable in ≤30 minutes of active testing
-   - Maximum 1-2 RELATED attack categories per subtask (e.g., "SQLi + command injection on database endpoints" is OK)
-   - NEVER combine 3+ unrelated categories (e.g., "XSS + IDOR + SSRF + auth bypass" = instant timeout)
+   **Scope guidance for pentest subtasks — ONE VULNERABILITY CLASS EACH:**
+   - ⚠️ ONE vulnerability class per exploitation subtask — this is MANDATORY, not a suggestion
+   - Each subtask should be completable in ≤20 minutes of active testing
+   - NEVER combine 2+ different vulnerability classes in one subtask (e.g., "SQLi + IDOR" = TWO classes = SPLIT)
+   - Sub-techniques within ONE class are OK (e.g., "blind SQLi + error-based SQLi" = both SQLi = OK)
    - Recon + auth setup can be combined ONLY if the target is straightforward (single domain, simple stack)
-   - For complex targets: separate recon, auth, and each attack category into individual subtasks
+   - For complex targets: separate recon, auth, and each vulnerability class into individual subtasks
    - Split by target when testing multiple domains/hosts
-   - BAD: "Plugin exploitation + REST API testing + auth probing" (3 unrelated objectives)
-   - BAD: One subtask that tries to do everything (recon + auth + 6 attack categories + reporting)
-   - GOOD: "Ninja Forms plugin exploitation" (single focused objective)
-   - GOOD: "REST API authentication and authorization testing" (one coherent area)
-   - When a subtask would take >30 min → SPLIT IT. Two focused subtasks > one that times out.
+   - BAD: "SSRF + IDOR + Auth testing" (3 vulnerability classes crammed together)
+   - BAD: "Plugin exploitation + REST API testing + auth probing" (3 different objectives)
+   - GOOD: "SSRF testing on URL params, webhooks, and file imports" (one class, multiple vectors)
+   - GOOD: "Authentication bypass — JWT, OAuth, session fixation" (one class: auth)
+   - When a subtask would take >20 min → SPLIT IT. Two focused subtasks > one that times out.
 
    **Industry Auto-Detection — adjust priority based on target type:**
    - Fintech markers: Razorpay/Stripe/PayU keys, KYC endpoints, loan/payment/EMI terms → prioritize Payment Logic, Webhook Forgery, KYC Bypass, Race Conditions
@@ -344,7 +394,7 @@ Each subtask MUST:
 
 You MUST complete your analysis by using the "{{.SubtaskListToolName}}" tool with:
 - A complete, ordered list of subtasks meeting the above requirements
-- For penetration testing tasks: generate 9-10 subtasks to cover all P0/P1/P2 categories thoroughly. A simple single-page app may need 6-7 subtasks, a complex multi-service target should use 9-10. Structure: 1 recon + 2-3 P0 + 4-5 P1/P2 + 1 report.
+- For penetration testing tasks: generate 10-14 subtasks to cover all P0/P1/P2 categories thoroughly, with ONE vulnerability class per exploitation subtask. A simple single-page app may need 8-10 subtasks, a complex multi-service target should use 12-14. Structure: 1 recon + 3 P0 + 4 P1 + 3 P2 + 1 report. NEVER combine vulnerability classes in a single subtask.
 - Each subtask should be focused enough to complete in one session but broad enough to make real progress.
 - Brief explanation of how the plan follows the optimal task distribution structure
 - Confirmation that all aspects of the user's request will be addressed

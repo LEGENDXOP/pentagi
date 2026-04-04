@@ -261,6 +261,12 @@ type Querier interface {
 	UpdateUserRole(ctx context.Context, arg UpdateUserRoleParams) (User, error)
 	UpdateUserStatus(ctx context.Context, arg UpdateUserStatusParams) (User, error)
 	UpsertUserPreferences(ctx context.Context, arg UpsertUserPreferencesParams) (UserPreference, error)
+	// Zombie cleanup: fail all running toolcalls for a subtask
+	FailRunningToolcallsBySubtask(ctx context.Context, reason string, subtaskID int64) error
+	// Zombie cleanup: fail all running toolcalls for a flow
+	FailRunningToolcallsByFlow(ctx context.Context, reason string, flowID int64) error
+	// Count running toolcalls for a flow
+	CountRunningToolcallsByFlow(ctx context.Context, flowID int64) (int64, error)
 }
 
 var _ Querier = (*Queries)(nil)

@@ -671,6 +671,15 @@ func (fw *flowWorker) Finish(ctx context.Context) (retErr error) {
 		}
 	}
 
+	// Zombie cleanup: fail all remaining running toolcalls for this flow
+	if cleanupErr := fw.flowCtx.DB.FailRunningToolcallsByFlow(
+		ctx,
+		"flow finished",
+		fw.flowCtx.FlowID,
+	); cleanupErr != nil {
+		fw.logger.WithError(cleanupErr).Warn("failed to clean up zombie toolcalls on flow finish")
+	}
+
 	if err := fw.flowCtx.Executor.Release(ctx); err != nil {
 		return fmt.Errorf("failed to release flow %d resources: %w", fw.flowCtx.FlowID, err)
 	}
@@ -701,8 +710,12 @@ func (fw *flowWorker) Stop(ctx context.Context) error {
 
 	select {
 	case <-timer.C:
+		// Even on timeout, clean up zombie toolcalls
+		_ = fw.flowCtx.DB.FailRunningToolcallsByFlow(ctx, "flow stopped (timeout)", fw.flowCtx.FlowID)
 		return fmt.Errorf("task stop timeout")
 	case <-done:
+		// Clean up any remaining running toolcalls
+		_ = fw.flowCtx.DB.FailRunningToolcallsByFlow(ctx, "flow stopped", fw.flowCtx.FlowID)
 		return nil
 	}
 }

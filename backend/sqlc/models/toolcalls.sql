@@ -178,6 +178,28 @@ WHERE tc.created_at >= NOW() - INTERVAL '90 days' AND f.deleted_at IS NULL AND f
 GROUP BY DATE(tc.created_at)
 ORDER BY date DESC;
 
+-- name: FailRunningToolcallsBySubtask :exec
+-- Fail all running toolcalls for a specific subtask (zombie cleanup)
+UPDATE toolcalls
+SET status = 'failed',
+    result = $1,
+    duration_seconds = EXTRACT(EPOCH FROM (NOW() - created_at))
+WHERE subtask_id = $2 AND status = 'running';
+
+-- name: FailRunningToolcallsByFlow :exec
+-- Fail all running toolcalls for a specific flow (zombie cleanup on flow stop/finish)
+UPDATE toolcalls
+SET status = 'failed',
+    result = $1,
+    duration_seconds = EXTRACT(EPOCH FROM (NOW() - created_at))
+WHERE flow_id = $2 AND status = 'running';
+
+-- name: CountRunningToolcallsByFlow :one
+-- Count running toolcalls for a flow (used for zombie detection)
+SELECT COUNT(*)::bigint AS count
+FROM toolcalls
+WHERE flow_id = $1 AND status = 'running';
+
 -- name: GetUserTotalToolcallsStats :one
 -- Get total toolcalls stats for a user
 SELECT

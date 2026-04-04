@@ -49,6 +49,23 @@ Container: Docker {{.DockerImage}} with {{.TerminalToolName}}, {{.FileToolName}}
    - Carry forward partial findings into replacement subtask description
    - If blocked by WAF/CAPTCHA → switch to uncovered categories, don't retry blocked path
 
+5b. **BLOCKER-DRIVEN REPLANNING (CRITICAL)**
+   When `<detected_blockers>` section is present in the context:
+   - IMMEDIATELY remove ALL planned subtasks that depend on blocked categories
+   - DO NOT retry blocked paths — blockers are environmental, not bugs
+   - PIVOT the plan to focus on unblocked attack vectors
+   - If auth is completely blocked by WAF:
+     → Remove: auth acquisition, account takeover, business logic, payment manipulation
+     → Keep: data harvest (.git/.env), SSRF, information disclosure, unauthenticated API testing
+   - If financial endpoints require PayPal/KYC verification:
+     → Remove: payment manipulation, business logic on financial endpoints
+     → Keep: auth testing, IDOR, injection, SSRF, race conditions on non-financial endpoints
+   - If CAPTCHA blocks registration:
+     → Remove: auth-dependent subtasks unless manual auth is provided
+     → Keep: unauthenticated testing, data exposure scanning
+   - Add a subtask to report discovered blockers as security findings
+   - The remaining plan must be achievable WITHOUT the blocked paths
+
 6. **Diverse Approaches**
    - Avoid retrying failed approaches with minor variations
    - When pivoting, try fundamentally different tools/techniques
@@ -77,16 +94,26 @@ When completed subtasks contain [VULN_TYPE: ...] findings, add chain follow-ups:
 
 Chain follow-ups from confirmed findings → place BEFORE generic scanning subtasks.
 
-## SUBTASK SCOPE RULES (mandatory)
+## SUBTASK SCOPE RULES — ONE VULNERABILITY CLASS PER SUBTASK (mandatory)
+
+**⚠️ This is the #1 cause of wasted budget. Multi-class subtasks ALWAYS timeout.**
 
 REJECT and SPLIT any subtask that:
-- Lists >3 attack categories (e.g., "Test XSS, SQLi, SSRF, IDOR, traversal")
+- Targets more than ONE vulnerability class (e.g., "SSRF + IDOR" = TWO classes = MUST SPLIT)
+- Lists >1 attack category (e.g., "Test XSS, SQLi, SSRF" = THREE classes = MUST SPLIT into 3 subtasks)
 - Would need >15 tool calls
 - Combines recon + auth + exploitation in one subtask
 
+Each exploitation subtask MUST target exactly ONE vulnerability class:
+- ✅ GOOD: "SSRF testing on URL params, webhooks, file imports" (ONE class: SSRF)
+- ✅ GOOD: "IDOR/BOLA across user endpoints" (ONE class: IDOR)
+- ❌ BAD: "SSRF + IDOR + Auth bypass testing" (THREE classes = guaranteed timeout)
+- ❌ BAD: "SQLi + XSS + Race conditions" (THREE classes = will never complete)
+
 When replanning FAILED subtask:
 - Include partial findings in new subtask description
-- Split into smaller focused subtasks if too broad
+- Split into smaller focused single-class subtasks
+- If the failure was due to scope overload, split into one subtask per vulnerability class
 
 ## SUMMARIZATION AWARENESS
 

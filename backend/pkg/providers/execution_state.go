@@ -177,6 +177,10 @@ type ExecutionState struct {
 
 	// V2: Tracked operation fingerprints for cross-session dedup
 	TrackedOperations json.RawMessage `json:"tracked_operations,omitempty"`
+
+	// V3: Blocker tracking — persists detected blockers (WAF, auth gates, CAPTCHA, etc.)
+	// so that the refiner and subsequent subtasks know which attack paths are blocked.
+	Blockers json.RawMessage `json:"blockers,omitempty"`
 }
 
 // MarshalJSON serializes the execution state to JSON.
@@ -244,6 +248,19 @@ func (es *ExecutionState) UpdateLoopAlertCount(detector *ReadLoopDetector) {
 	}
 	_, alerts := detector.GetStats()
 	es.LoopAlertCount = alerts
+}
+
+// UpdateBlockers syncs the blocker tracker's state into the execution state
+// for persistence. Call this after Update() and before ToJSON().
+func (es *ExecutionState) UpdateBlockers(tracker *BlockerTracker) {
+	if tracker == nil || !tracker.HasBlockers() {
+		return
+	}
+	data, err := tracker.ToJSON()
+	if err != nil {
+		return
+	}
+	es.Blockers = data
 }
 
 // BuildResumeInjectionMessage creates a human-role message that tells the LLM

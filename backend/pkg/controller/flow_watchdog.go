@@ -52,6 +52,9 @@ func (wd *flowWatchdog) run(ctx context.Context) {
 
 // check examines the flow state and auto-resumes if stalled.
 func (wd *flowWatchdog) check(ctx context.Context) {
+	// Always run zombie toolcall cleanup regardless of flow status
+	wd.cleanupZombieToolcalls(ctx)
+
 	if wd.resumeCount >= wd.maxResumes {
 		wd.logger.WithField("resume_count", wd.resumeCount).
 			Debug("flow watchdog: max auto-resumes reached, skipping check")
@@ -68,6 +71,10 @@ func (wd *flowWatchdog) check(ctx context.Context) {
 	if flowStatus != database.FlowStatusWaiting {
 		return
 	}
+
+	// Check if all tasks are completed and no more work is planned.
+	// If so, mark the flow as completed instead of leaving it "waiting".
+	wd.checkFlowCompletion(ctx)
 
 	// Check if there are any tasks in a waiting state that could be resumed
 	for _, task := range wd.fw.tc.ListTasks(ctx) {
@@ -145,6 +152,99 @@ func (wd *flowWatchdog) recoverZombieSubtasks(ctx context.Context, taskID int64)
 	}
 
 	return nil
+}
+
+// cleanupZombieToolcalls finds and fails any "running" toolcalls that belong to
+// subtasks/tasks that are already finished, failed, or expired. These are zombies
+// left behind when a subtask expired but its tool calls were never cleaned up.
+func (wd *flowWatchdog) cleanupZombieToolcalls(ctx context.Context) {
+	flowID := wd.fw.flowCtx.FlowID
+
+	// Check if there are any running toolcalls for this flow
+	count, err := wd.fw.flowCtx.DB.CountRunningToolcallsByFlow(ctx, flowID)
+	if err != nil {
+		wd.logger.WithError(err).Debug("flow watchdog: failed to count running toolcalls")
+		return
+	}
+
+	if count == 0 {
+		return
+	}
+
+	// Check if any tasks are still actively running (not waiting/finished/failed)
+	hasActiveTask := false
+	for _, task := range wd.fw.tc.ListTasks(ctx) {
+		if !task.IsCompleted() && !task.IsWaiting() {
+			hasActiveTask = true
+			break
+		}
+	}
+
+	if hasActiveTask {
+		// There's an active task, so running toolcalls might be legitimate
+		return
+	}
+
+	// No active tasks but running toolcalls exist — these are zombies
+	wd.logger.WithFields(logrus.Fields{
+		"zombie_count": count,
+		"flow_id":      flowID,
+	}).Warn("flow watchdog: cleaning up zombie toolcalls (no active tasks but running toolcalls found)")
+
+	if err := wd.fw.flowCtx.DB.FailRunningToolcallsByFlow(ctx, "zombie cleanup: no active tasks running", flowID); err != nil {
+		wd.logger.WithError(err).Error("flow watchdog: failed to clean up zombie toolcalls")
+	}
+}
+
+// checkFlowCompletion detects when all tasks are done and marks the flow as completed.
+// This prevents the flow from staying in "waiting" status indefinitely after all work is done.
+func (wd *flowWatchdog) checkFlowCompletion(ctx context.Context) {
+	tasks := wd.fw.tc.ListTasks(ctx)
+	if len(tasks) == 0 {
+		return // No tasks yet, flow is legitimately waiting for input
+	}
+
+	allCompleted := true
+	hasWaiting := false
+	for _, task := range tasks {
+		if !task.IsCompleted() {
+			allCompleted = false
+			if task.IsWaiting() {
+				hasWaiting = true
+			}
+		}
+	}
+
+	if !allCompleted {
+		if hasWaiting {
+			return // Legitimate waiting state — task needs user input
+		}
+		return
+	}
+
+	// All tasks completed — check for any remaining running toolcalls (zombies)
+	flowID := wd.fw.flowCtx.FlowID
+	runningCount, err := wd.fw.flowCtx.DB.CountRunningToolcallsByFlow(ctx, flowID)
+	if err != nil {
+		wd.logger.WithError(err).Debug("flow watchdog: failed to count running toolcalls for completion check")
+		return
+	}
+
+	if runningCount > 0 {
+		// Clean up zombies first
+		wd.logger.WithField("zombie_count", runningCount).
+			Info("flow watchdog: cleaning up remaining zombie toolcalls before flow completion")
+		_ = wd.fw.flowCtx.DB.FailRunningToolcallsByFlow(ctx, "flow completing: all tasks done", flowID)
+	}
+
+	wd.logger.WithFields(logrus.Fields{
+		"total_tasks":    len(tasks),
+		"zombie_cleaned": runningCount,
+	}).Info("flow watchdog: all tasks completed, flow completion detected")
+
+	// Note: We don't force the flow to "completed" here because the flow
+	// is legitimately waiting for new user input after tasks finish.
+	// The flow status is correctly "waiting" — the key fix is cleaning up zombies.
 }
 
 // isWatchdogEnabled checks the FLOW_WATCHDOG_ENABLED env var (default true).

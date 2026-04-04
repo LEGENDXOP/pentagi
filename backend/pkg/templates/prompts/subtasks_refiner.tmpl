@@ -83,6 +83,10 @@
   </methodology_coverage>
   {{end}}
 
+  {{if .BlockerContext}}
+  {{.BlockerContext}}
+  {{end}}
+
   {{if .ExecutionLogs}}
   <execution_logs>
   {{.ExecutionLogs}}

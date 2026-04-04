@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
@@ -26,6 +28,35 @@ import (
 const DefaultResultSizeLimit = 16 * 1024 // 16 KB
 
 const maxArgValueLength = 1024 // 1 KB limit for argument values
+
+// Default tool call timeouts (seconds)
+const (
+	defaultToolCallTimeoutAgent   = 600 // 10 min for agent-type tools (coder, pentester, etc.)
+	defaultToolCallTimeoutDefault = 300 // 5 min for other tools (terminal, browser, etc.)
+)
+
+// getToolCallTimeout returns the configured timeout for a tool call based on its type.
+// Agent tools (coder, pentester, maintenance, search, memorist, advice) get a longer timeout.
+func getToolCallTimeout(toolName string) time.Duration {
+	toolType := GetToolType(toolName)
+	var seconds int
+	switch toolType {
+	case AgentToolType:
+		seconds = getEnvInt("TOOL_CALL_TIMEOUT_AGENT", defaultToolCallTimeoutAgent)
+	default:
+		seconds = getEnvInt("TOOL_CALL_TIMEOUT_DEFAULT", defaultToolCallTimeoutDefault)
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func getEnvInt(key string, defaultVal int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultVal
+}
 
 type dummyMessage struct {
 	Message string `json:"message"`
@@ -329,9 +360,27 @@ func (ce *customExecutor) Execute(
 		return "", fmt.Errorf("failed to create toolcall: %w", err)
 	}
 
+	// Apply per-tool-call timeout to prevent individual calls from running indefinitely.
+	// The timeout is configurable via TOOL_CALL_TIMEOUT_AGENT / TOOL_CALL_TIMEOUT_DEFAULT.
+	toolTimeout := getToolCallTimeout(name)
+	toolCtx, toolCancel := context.WithTimeout(ctx, toolTimeout)
+	defer toolCancel()
+
 	wrapHandler := func(ctx context.Context, name string, args json.RawMessage) (string, database.MsglogResultFormat, error) {
 		resultFormat := getMessageResultFormat(name)
 		result, err := handler(ctx, name, args)
+		if err != nil && ctx.Err() == context.DeadlineExceeded {
+			// Tool call timed out — return a timeout error message instead of
+			// propagating the raw context error. This lets the subtask continue.
+			durationDelta := time.Since(startTime).Seconds()
+			timeoutMsg := fmt.Sprintf("tool call '%s' timed out after %v (limit: %v)", name, time.Since(startTime).Round(time.Second), toolTimeout)
+			_, _ = ce.db.UpdateToolcallFailedResult(context.Background(), database.UpdateToolcallFailedResultParams{
+				Result:          timeoutMsg,
+				DurationSeconds: durationDelta,
+				ID:              tc.ID,
+			})
+			return timeoutMsg, resultFormat, nil // return as result, not error, so subtask continues
+		}
 		if err != nil {
 			durationDelta := time.Since(startTime).Seconds()
 			_, _ = ce.db.UpdateToolcallFailedResult(ctx, database.UpdateToolcallFailedResultParams{
@@ -376,12 +425,12 @@ func (ce *customExecutor) Execute(
 	}
 
 	if msg == "" { // no arg message to log and execute handler immediately
-		result, _, err := wrapHandler(ctx, name, args)
+		result, _, err := wrapHandler(toolCtx, name, args)
 		obsWrapper.end(result, err, time.Since(startTime).Seconds())
 		return result, err
 	}
 
-	result, resultFormat, err := wrapHandler(ctx, name, args)
+	result, resultFormat, err := wrapHandler(toolCtx, name, args)
 	if err != nil {
 		obsWrapper.end(result, err, time.Since(startTime).Seconds())
 		return "", err

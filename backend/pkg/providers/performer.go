@@ -234,6 +234,10 @@ func (fp *flowProvider) performAgentChain(
 		evidenceCollector = NewEvidenceCollector(fp.flowID)
 		findingRegistry   = NewFindingRegistry(fp.flowID)
 
+		// Fix 3: Blocker tracker — detects WAF, auth gates, CAPTCHA, KYC, etc.
+		// and persists them in ExecutionState so the refiner can drop blocked subtasks.
+		blockerTracker = NewBlockerTracker()
+
 		// Intra-subtask terminal dedup: caches idempotent terminal command outputs
 		// (token reads, schema introspection, jq on stored files) to prevent the
 		// agent from re-executing identical commands 15-20x per subtask. The cache
@@ -554,34 +558,89 @@ func (fp *flowProvider) performAgentChain(
 		siblings, sibErr := fp.db.GetTaskSubtasks(ctx, *taskID)
 		if sibErr == nil {
 			var sibCtx strings.Builder
+			var rescuedEvidence strings.Builder
 			for _, sib := range siblings {
 				if sib.ID == *subtaskID || sib.Status != database.SubtaskStatusFinished {
 					continue
 				}
+
+				// Fix 4: Check if this sibling was time-boxed and has rescued evidence
+				// in its result field. Inject rescued file contents so work survives
+				// across subtask boundaries.
+				if sib.Result != "" && strings.Contains(sib.Result, "[TIMEBOX EXPIRED") &&
+					strings.Contains(sib.Result, "Rescued Container Files") {
+					if idx := strings.Index(sib.Result, "## Rescued Container Files"); idx >= 0 {
+						rescuedSection := sib.Result[idx:]
+						if len(rescuedSection) > 16*1024 {
+							rescuedSection = rescuedSection[:16*1024] + "\n[TRUNCATED]\n"
+						}
+						rescuedEvidence.WriteString(fmt.Sprintf("\n### Evidence rescued from expired sibling '%s':\n", sib.Title))
+						rescuedEvidence.WriteString(rescuedSection)
+						rescuedEvidence.WriteString("\n")
+					}
+				}
+
 				if sib.Context == "" {
 					continue
 				}
-				if loaded := ParseExecutionState(sib.Context); loaded != nil && len(loaded.CompletedTasks) > 0 {
-					sibCtx.WriteString(fmt.Sprintf("\n### Already done by '%s':\n", sib.Title))
-					for _, ct := range loaded.CompletedTasks {
-						sibCtx.WriteString(fmt.Sprintf("- ✅ %s", ct.Description))
-						if ct.OutputFile != "" {
-							sibCtx.WriteString(fmt.Sprintf(" (results in %s)", ct.OutputFile))
+				if loaded := ParseExecutionState(sib.Context); loaded != nil {
+					// Restore completed work items
+					if len(loaded.CompletedTasks) > 0 {
+						sibCtx.WriteString(fmt.Sprintf("\n### Already done by '%s':\n", sib.Title))
+						for _, ct := range loaded.CompletedTasks {
+							sibCtx.WriteString(fmt.Sprintf("- ✅ %s", ct.Description))
+							if ct.OutputFile != "" {
+								sibCtx.WriteString(fmt.Sprintf(" (results in %s)", ct.OutputFile))
+							}
+							sibCtx.WriteString("\n")
 						}
-						sibCtx.WriteString("\n")
+					}
+
+					// Fix 3: Restore blockers from sibling subtasks so this subtask
+					// inherits knowledge of WAF blocks, auth gates, etc.
+					if loaded.Blockers != nil {
+						blockerTracker.RestoreFromJSON(loaded.Blockers)
 					}
 				}
 			}
-			if sibCtx.Len() > 0 {
+			if sibCtx.Len() > 0 || rescuedEvidence.Len() > 0 {
+				var injectionText strings.Builder
+				injectionText.WriteString("[WORK ALREADY COMPLETED BY SIBLING SUBTASKS \u2014 DO NOT REPEAT]\n")
+				if sibCtx.Len() > 0 {
+					injectionText.WriteString(sibCtx.String())
+				}
+				if rescuedEvidence.Len() > 0 {
+					injectionText.WriteString("\n[RESCUED EVIDENCE FROM EXPIRED SUBTASKS \u2014 USE THIS DATA, DO NOT RE-COLLECT]\n")
+					injectionText.WriteString(rescuedEvidence.String())
+				}
+				injectionText.WriteString("\nDo NOT re-run any of the above. Start with NEW work only.")
+
 				chain = append(chain, llms.MessageContent{
 					Role: llms.ChatMessageTypeHuman,
 					Parts: []llms.ContentPart{
-						llms.TextContent{Text: "[WORK ALREADY COMPLETED BY SIBLING SUBTASKS \u2014 DO NOT REPEAT]\n" + sibCtx.String() +
-							"\nDo NOT re-run any of the above. Start with NEW work only."},
+						llms.TextContent{Text: injectionText.String()},
 					},
 				})
-				logger.WithField("sibling_count", len(siblings)).
-					Info("injected sibling subtask context")
+				logger.WithFields(logrus.Fields{
+					"sibling_count":          len(siblings),
+					"rescued_evidence_bytes": rescuedEvidence.Len(),
+				}).Info("injected sibling subtask context with rescued evidence")
+			}
+
+			// Fix 3: If blockers were discovered by siblings, inject them into the system prompt
+			// so this subtask avoids attempting blocked paths.
+			if blockerTracker.HasBlockers() {
+				if blockerCtx := blockerTracker.FormatBlockersForSubtask(); blockerCtx != "" {
+					if len(chain) > 0 && chain[0].Role == llms.ChatMessageTypeSystem {
+						if text, ok := chain[0].Parts[0].(llms.TextContent); ok {
+							if !strings.Contains(text.Text, "[KNOWN BLOCKERS") {
+								chain[0].Parts[0] = llms.TextContent{Text: text.Text + "\n\n" + blockerCtx}
+								logger.WithField("blocker_count", len(blockerTracker.GetBlockers())).
+									Info("injected inherited blockers from sibling subtasks into system prompt")
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -601,6 +660,31 @@ func (fp *flowProvider) performAgentChain(
 					FindingRegistry: findingRegistry,
 					CompletedWork:   completedWork,
 				})
+
+				// Fix 4: Rescue container files before they're lost.
+				// Use a fresh background context since the parent is expired.
+				rescueCtx, rescueCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				rescuedFiles, rescueErr := fp.executor.RescueContainerFiles(rescueCtx)
+				rescueCancel()
+				if rescueErr != nil {
+					logger.WithError(rescueErr).Warn("failed to rescue container files on timebox expiry")
+				} else if len(rescuedFiles) > 0 {
+					var rescueSB strings.Builder
+					rescueSB.WriteString(fmt.Sprintf("\n\n## Rescued Container Files (%d files)\n\n", len(rescuedFiles)))
+					for _, rf := range rescuedFiles {
+						rescueSB.WriteString(fmt.Sprintf("### %s (%d bytes)\n", rf.Path, rf.Size))
+						content := rf.Content
+						if len(content) > 8192 {
+							content = content[:8192] + "\n[TRUNCATED]\n"
+						}
+						rescueSB.WriteString("```\n")
+						rescueSB.WriteString(content)
+						rescueSB.WriteString("\n```\n\n")
+					}
+					partialResult += rescueSB.String()
+					logger.WithField("rescued_files", len(rescuedFiles)).
+						Info("rescued container files on timebox expiry")
+				}
 
 				// Save partial results to DB so findings aren't lost.
 				if subtaskID != nil {
@@ -1310,6 +1394,29 @@ func (fp *flowProvider) performAgentChain(
 				}
 			}
 
+			// Fix 3: Blocker detection — analyze tool results for blockers (WAF, auth gates, CAPTCHA, etc.).
+			if blockerTracker != nil && toolCall.FunctionCall != nil {
+				subtaskTitleForBlocker := ""
+				if subtaskID != nil {
+					if dbST, stErr := fp.db.GetSubtask(ctx, *subtaskID); stErr == nil {
+						subtaskTitleForBlocker = dbST.Title
+					}
+				}
+				blockerTracker.AnalyzeToolOutput(funcName, toolCall.FunctionCall.Arguments, response, subtaskTitleForBlocker)
+				if blockerCtx := blockerTracker.FormatBlockersForSubtask(); blockerCtx != "" {
+					// Inject blocker context into system prompt so the agent avoids blocked paths.
+					if len(chain) > 0 && chain[0].Role == llms.ChatMessageTypeSystem {
+						if text, ok := chain[0].Parts[0].(llms.TextContent); ok {
+							if !strings.Contains(text.Text, "[KNOWN BLOCKERS") {
+								chain[0].Parts[0] = llms.TextContent{Text: text.Text + "\n\n" + blockerCtx}
+								logger.WithField("blocker_count", len(blockerTracker.GetBlockers())).
+									Info("injected blocker detection context into system prompt")
+							}
+						}
+					}
+				}
+			}
+
 			// Sprint 3: Evidence collection — capture interesting tool results.
 			if evidenceCollector != nil && toolCall.FunctionCall != nil {
 				evidenceCollector.CollectFromToolCall(funcName, toolCall.FunctionCall.Arguments, response, subtaskID, nil)
@@ -1598,6 +1705,9 @@ func (fp *flowProvider) performAgentChain(
 			// v5: Sync completed work and loop detector state before serialization.
 			execState.UpdateCompletedTasks(completedWork)
 			execState.UpdateLoopAlertCount(loopDetector)
+
+			// Fix 3: Persist blocker information into execution state.
+			execState.UpdateBlockers(blockerTracker)
 
 			// v6/V2: Also persist tracked operations
 			if opsJSON := completedWork.OperationsToJSON(); len(opsJSON) > 0 {
