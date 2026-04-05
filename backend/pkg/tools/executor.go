@@ -32,7 +32,7 @@ const maxArgValueLength = 1024 // 1 KB limit for argument values
 
 // Default tool call timeouts (seconds)
 const (
-	defaultToolCallTimeoutAgent   = 600 // 10 min for agent-type tools (coder, pentester, etc.)
+	defaultToolCallTimeoutAgent   = 2700 // 45 min for agent-type tools (coder, pentester, etc.)
 	defaultToolCallTimeoutDefault = 300 // 5 min for other tools (terminal, browser, etc.)
 )
 

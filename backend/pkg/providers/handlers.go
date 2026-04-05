@@ -123,9 +123,9 @@ func checkDelegationAllowed(ctx context.Context, agentName string) string {
 		remaining := time.Until(deadline)
 
 		// Hard block: depth-aware minimum time requirement
-		hardBlockThreshold := 10 * time.Minute
+		hardBlockThreshold := 8 * time.Minute
 		if depth >= 2 {
-			hardBlockThreshold = 5 * time.Minute
+			hardBlockThreshold = 4 * time.Minute
 		}
 		if remaining < hardBlockThreshold {
 			return fmt.Sprintf(
