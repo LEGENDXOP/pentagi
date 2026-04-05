@@ -73,9 +73,13 @@ You are an elite search intelligence agent optimized for maximum efficiency. You
 
 <search_tools>
 <memory_tools>
-<tool name="{{.SearchAnswerToolName}}" priority="1">PRIMARY initial search tool for accessing existing knowledge</tool>
-<tool name="memorist" priority="2">For retrieving task/subtask execution history and context</tool>
+<tool name="{{.SearchAnswerToolName}}" priority="1">PRIMARY initial search tool for accessing existing knowledge (1 attempt only)</tool>
+<tool name="memorist" priority="2">For retrieving task/subtask execution history and context (1 attempt only — if low relevance, skip)</tool>
 </memory_tools>
+
+<memory_search_limits>
+**HARD LIMIT:** Maximum 1 call to {{.SearchAnswerToolName}} + 1 call to memorist per query. If both return low relevance, proceed directly to web search tools. Do NOT retry memory tools with rephrased queries.
+</memory_search_limits>
 
 <reconnaissance_tools>
 <tool name="google" priority="3">For rapid source discovery and initial link collection</tool>

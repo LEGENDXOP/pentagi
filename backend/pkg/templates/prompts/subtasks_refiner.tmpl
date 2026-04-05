@@ -99,6 +99,14 @@
   - If a planned subtask is PARTIALLY covered by completed results → MODIFY it to cover only the remaining gap
   - Never create new subtasks that duplicate work already successfully completed
   - When checking for overlap, compare the semantic intent, not just the title — a completed "port scan" covers a planned "network reconnaissance" if ports were already scanned
+
+  **REDUNDANT RECON PREVENTION (MANDATORY):**
+  - The following actions are ONE-TIME ONLY per flow: JS bundle analysis, technology fingerprinting, certificate transparency check, homepage scanning, nuclei scanning, endpoint enumeration, signup page analysis.
+  - If ANY completed subtask already performed these actions (check their results), REMOVE or MODIFY planned subtasks to skip them.
+  - When modifying a subtask description, add: "SKIP: [list of already-completed recon actions]. Read results from HANDOFF.md instead of re-running."
+  - If a planned subtask is ENTIRELY recon that was already done, REMOVE it completely.
+  - Every refined subtask description MUST include: "Read HANDOFF.md first. Do NOT repeat completed reconnaissance."
+  - Every refined subtask description MUST include: "Maximum 2 memory/graphiti searches. If low relevance, use /work/ files instead."
   </deduplication_guidance>
 
   <subtask_scope_enforcement>

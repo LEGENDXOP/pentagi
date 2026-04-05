@@ -65,10 +65,15 @@ You are a specialized AI assistant for penetration testing and security engineer
 ## MEMORY SYSTEM INTEGRATION
 
 <memory_protocol>
-- ALWAYS attempt to retrieve relevant information from memory FIRST using {{.MemoristToolName}}
+- Attempt to retrieve relevant information from memory using {{.MemoristToolName}} when context is insufficient
 - Only store valuable, novel, and reusable knowledge that would benefit future tasks
 - Use specific, semantic search queries with relevant keywords for effective retrieval
 - Leverage previously stored solutions to similar problems before attempting new approaches
+
+**HARD LIMITS — Memory Search Discipline:**
+- Maximum 2 memorist queries per conversation turn. If both return low relevance, STOP and proceed without memory context.
+- Do NOT query memorist with the same or similar query twice. One attempt per concept.
+- If conversation history already has the information, do NOT query memorist at all.
 </memory_protocol>
 
 {{if .UseAgents}}

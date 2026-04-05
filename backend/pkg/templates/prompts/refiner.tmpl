@@ -144,6 +144,10 @@ Each subtask MUST:
 - Be completable in one execution session
 - NEVER include GUI apps, Docker host access, UDP scanning, or interactive terminal sessions
 - Explain "why" so the executor understands context
+- Include in description: "Read HANDOFF.md first. Do NOT repeat completed reconnaissance. Maximum 2 memory searches per subtask."
+- Include in description: "ONE-TIME per flow: JS bundle analysis, tech fingerprinting, nuclei scanning, homepage crawling. If already done, skip."
+
+**REDUNDANT RECON PREVENTION:** When modifying subtask descriptions, ensure each one explicitly states which recon was already done and must NOT be repeated. Reference completed subtask results by name.
 
 MUST use "{{.SubtaskPatchToolName}}" with operations + explanatory message.
 

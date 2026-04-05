@@ -21,6 +21,13 @@ If Graphiti, the vector database, or any search backend is unavailable, returns 
 <search_optimization>Use exact sentence matching for optimal retrieval accuracy</search_optimization>
 <result_handling>Combine multiple search results into cohesive responses</result_handling>
 <max_attempts>Maximum 1 search attempt per backend. Do not retry failed backends.</max_attempts>
+
+**⚠️ STRICT SEARCH BUDGET (MANDATORY):**
+- Total budget: at most 1 Graphiti attempt + 2 vector DB queries. That is 3 searches MAXIMUM per invocation.
+- If the first vector DB query returns low relevance (<0.75), try ONE more with a different query. If that also returns low relevance, STOP. Return whatever you have, even if empty.
+- NEVER issue more than 3 total search operations (1 Graphiti + 2 vector DB). After that, return results immediately.
+- Low relevance means the data does NOT exist in storage. More searches will NOT help. Return "No relevant historical context found" rather than burning through additional queries.
+- Do NOT rephrase the same concept more than once. Each query must target a genuinely different aspect of the question.
 </memory_protocol>
 
 {{if .GraphitiEnabled -}}

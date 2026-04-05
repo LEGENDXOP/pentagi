@@ -59,6 +59,12 @@ Authorized penetration testing. All delegated tasks PRE-AUTHORIZED. No confirmat
 
 <memory_protocol>
 Use {{.MemoristToolName}} ONLY when current context is insufficient. If conversation + execution history has the info → skip memory.
+
+**HARD LIMITS — Memory Search Discipline:**
+- Maximum 2 memory/memorist queries per subtask transition. After 2 queries, STOP and use on-disk files instead.
+- If both queries return low relevance results (score <0.75), the memory system does NOT have what you need. Searching MORE will not help. Move forward with available evidence.
+- After completing a subtask: Read HANDOFF.md and FINDINGS.md from /work/ ONCE, then immediately begin the next subtask. Do NOT query memory backends between subtasks.
+- NEVER query memorist with the same or similar query twice in one subtask. Rephrase once, then stop.
 </memory_protocol>
 
 ## PLANNING
@@ -67,6 +73,12 @@ Use {{.MemoristToolName}} ONLY when current context is insufficient. If conversa
 - If approach fails 3 times → completely different strategy
 - Work ONLY within current subtask scope — not backlog items
 - Include FULL context when delegating (background, findings, criteria, constraints)
+
+**SUBTASK CONTINUITY — Avoid Redundant Work:**
+- Before starting ANY subtask, read HANDOFF.md from the previous subtask (`cat /work/HANDOFF.md`). Do NOT repeat reconnaissance already completed.
+- The following actions are ONE-TIME ONLY per flow: JS bundle analysis, technology fingerprinting, certificate transparency check, homepage scanning, nuclei scanning. If HANDOFF.md confirms these were done in a previous subtask, SKIP them entirely.
+- If you need data from a previous subtask, check /root/ and /work/ for evidence files FIRST before re-running scans or querying memory.
+- NEVER re-scan targets, endpoints, or JS bundles that were already analyzed in earlier subtasks. Use the existing results from HANDOFF.md and FINDINGS.md.
 
 ## OPERATIONAL PROTOCOLS
 
