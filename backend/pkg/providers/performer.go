@@ -647,6 +647,41 @@ func (fp *flowProvider) performAgentChain(
 		}
 	}
 
+	// SURGEON-3: Inject workspace file listing at subtask start so the agent
+	// knows what evidence files exist in /work/ from previous attempts or
+	// sibling subtasks. This is critical for:
+	// (a) Subtask retries — previous attempt saved evidence but execution state was lost
+	// (b) Subtask transitions — earlier subtask saved files that this subtask should use
+	// The file listing is always injected (not just retries) because it's cheap and
+	// prevents the common failure mode of agents re-doing recon when files exist.
+	if subtaskID != nil {
+		fileListCtx, fileListCancel := context.WithTimeout(ctx, 10*time.Second)
+		fileListArgs, _ := json.Marshal(map[string]interface{}{
+			"input":   `find /work/ -maxdepth 2 -type f \( -name "*.txt" -o -name "*.md" -o -name "*.json" -o -name "*.csv" -o -name "*.xml" -o -name "*.html" \) -printf '%s\t%TY-%Tm-%Td %TH:%TM\t%p\n' 2>/dev/null | sort -t$'\t' -k3 | head -50`,
+			"timeout": 5,
+		})
+		fileListResult, fileListErr := executor.Execute(fileListCtx, 0, "", "terminal", "", fileListArgs)
+		fileListCancel()
+
+		if fileListErr == nil && strings.TrimSpace(fileListResult) != "" {
+			var filesInjection strings.Builder
+			filesInjection.WriteString("[WORKSPACE FILES IN /work/ — EVIDENCE FROM PREVIOUS WORK]\n")
+			filesInjection.WriteString("These files already exist in your workspace. READ them before re-doing any work:\n\n")
+			filesInjection.WriteString(fileListResult)
+			filesInjection.WriteString("\n\n⚠️ If evidence files exist (FINDINGS.md, HANDOFF.md, *_results.txt), ")
+			filesInjection.WriteString("read them FIRST and document/synthesize their contents rather than re-collecting data.")
+
+			chain = append(chain, llms.MessageContent{
+				Role: llms.ChatMessageTypeHuman,
+				Parts: []llms.ContentPart{
+					llms.TextContent{Text: filesInjection.String()},
+				},
+			})
+			logger.WithField("file_list_bytes", len(fileListResult)).
+				Info("SURGEON-3: injected /work/ file listing into subtask chain")
+		}
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			// v5: If timebox is active and this is a deadline expiry (not user cancel),

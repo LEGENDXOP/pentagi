@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -536,33 +537,69 @@ func (tw *taskWorker) runSubtaskWithRetry(
 			case <-time.After(delay):
 			}
 
-			// Reset subtask status to created for re-run
+			// FIX (SURGEON-3): Read and preserve execution state BEFORE clearing
+			// the subtask status. Previously, SetStatus(Created) wiped the context
+			// to "", and then this code tried to read it — finding nothing. This
+			// caused complete context loss on retry: no resume injection, no
+			// completed work items, no evidence file awareness.
+			var preservedState *providers.ExecutionState
+			if subtaskDB, getErr := tw.taskCtx.DB.GetSubtask(ctx, st.GetSubtaskID()); getErr == nil && subtaskDB.Context != "" {
+				preservedState = providers.ParseExecutionState(subtaskDB.Context)
+			}
+
+			// Reset subtask status to created for re-run.
+			// NOTE: This clears subtask.context to "" in the DB.
 			if err := st.SetStatus(ctx, database.SubtaskStatusCreated); err != nil {
 				logger.WithError(err).Error("failed to reset subtask status for retry")
 				return err
 			}
 
-			// Reset execution state (including tool_call_count) so the retry
-			// starts fresh instead of immediately hitting limits again.
-			if subtaskDB, getErr := tw.taskCtx.DB.GetSubtask(ctx, st.GetSubtaskID()); getErr == nil && subtaskDB.Context != "" {
-				if parsed := providers.ParseExecutionState(subtaskDB.Context); parsed != nil {
-					oldCount := parsed.ToolCallCount
-					parsed.ToolCallCount = 0
-					parsed.ErrorCount = 0
-					parsed.Phase = "retry"
-					parsed.AttacksDone = nil
-					parsed.CurrentAttack = ""
-					if stateJSON, jsonErr := parsed.ToJSON(); jsonErr == nil {
-						tw.taskCtx.DB.UpdateSubtaskContextWithTimestamp(ctx, database.UpdateSubtaskContextWithTimestampParams{
-							ID:      st.GetSubtaskID(),
-							Context: stateJSON,
-						})
-					}
-					logger.WithFields(logrus.Fields{
-						"subtask_id":     st.GetSubtaskID(),
-						"old_tool_count": oldCount,
-					}).Info("retrying subtask, resetting tool call count from old value to 0")
+			// Restore execution state with reset counters so the retry starts
+			// fresh but retains completed work items, evidence files, and phase
+			// context. This enables resume injection in performAgentChain.
+			if preservedState != nil {
+				oldCount := preservedState.ToolCallCount
+				oldPhase := preservedState.Phase
+				// Reset counters that would cause immediate limit hits
+				preservedState.ToolCallCount = 0
+				preservedState.ErrorCount = 0
+				preservedState.Phase = "retry"
+				// KEEP these fields — they carry evidence context:
+				// - CompletedTasks: what work was done
+				// - AttacksDone: which tools were already used
+				// - ResumeContext: any saved context string
+				// - TrackedOperations: V2 operation tracking
+				// Reset only the "current" pointer, not the history
+				preservedState.CurrentAttack = ""
+				// Build a resume context summarizing the previous attempt
+				var resumeLines []string
+				resumeLines = append(resumeLines, fmt.Sprintf("Previous attempt completed %d tool calls in phase '%s' before failure.", oldCount, oldPhase))
+				if len(preservedState.AttacksDone) > 0 {
+					resumeLines = append(resumeLines, fmt.Sprintf("Tools/attacks already executed: %s", strings.Join(preservedState.AttacksDone, ", ")))
 				}
+				if len(preservedState.CompletedTasks) > 0 {
+					resumeLines = append(resumeLines, fmt.Sprintf("%d work items were completed. Check /work/ directory for evidence files.", len(preservedState.CompletedTasks)))
+				}
+				preservedState.ResumeContext = strings.Join(resumeLines, "\n")
+				// Set ToolCallCount to 1 (not 0) so the resume injection check
+				// in performAgentChain fires (it requires ToolCallCount > 0).
+				preservedState.ToolCallCount = 1
+				if stateJSON, jsonErr := preservedState.ToJSON(); jsonErr == nil {
+					tw.taskCtx.DB.UpdateSubtaskContextWithTimestamp(ctx, database.UpdateSubtaskContextWithTimestampParams{
+						ID:      st.GetSubtaskID(),
+						Context: stateJSON,
+					})
+				}
+				logger.WithFields(logrus.Fields{
+					"subtask_id":      st.GetSubtaskID(),
+					"old_tool_count":  oldCount,
+					"old_phase":       oldPhase,
+					"completed_tasks": len(preservedState.CompletedTasks),
+					"attacks_done":    len(preservedState.AttacksDone),
+				}).Info("SURGEON-3: preserved execution state for retry with reset counters")
+			} else {
+				logger.WithField("subtask_id", st.GetSubtaskID()).
+					Warn("SURGEON-3: no execution state to preserve on retry (previous attempt may not have saved state)")
 			}
 		}
 
