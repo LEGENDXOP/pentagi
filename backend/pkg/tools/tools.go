@@ -148,6 +148,10 @@ type flowToolsExecutor struct {
 	primaryLID     string
 	functions      *Functions
 
+	// Fix Pattern-14: Memory search hard limiter shared across all executors in this flow.
+	// Prevents obsessive memory/graphiti searches that waste 35-40% of flow runtime.
+	memorySearchLimiter *MemorySearchLimiter
+
 	definitions map[string]llms.FunctionDefinition
 	handlers    map[string]ExecutorHandler
 }
@@ -310,13 +314,14 @@ func NewFlowToolsExecutor(
 	flowID int64,
 ) (FlowToolsExecutor, error) {
 	return &flowToolsExecutor{
-		db:          db,
-		docker:      docker,
-		functions:   functions,
-		cfg:         cfg,
-		flowID:      flowID,
-		definitions: make(map[string]llms.FunctionDefinition),
-		handlers:    make(map[string]ExecutorHandler),
+		db:                  db,
+		docker:              docker,
+		functions:           functions,
+		cfg:                 cfg,
+		flowID:              flowID,
+		memorySearchLimiter: NewDefaultMemorySearchLimiter(),
+		definitions:         make(map[string]llms.FunctionDefinition),
+		handlers:            make(map[string]ExecutorHandler),
 	}, nil
 }
 
@@ -511,6 +516,7 @@ func (fte *flowToolsExecutor) GetCustomExecutor(cfg CustomExecutorConfig) (Conte
 	}
 
 	return &customExecutor{
+		memorySearchLimiter: fte.memorySearchLimiter,
 		flowID:      fte.flowID,
 		taskID:      cfg.TaskID,
 		subtaskID:   cfg.SubtaskID,
@@ -739,6 +745,7 @@ func (fte *flowToolsExecutor) GetAssistantExecutor(cfg AssistantExecutorConfig) 
 	}
 
 	ce := &customExecutor{
+		memorySearchLimiter: fte.memorySearchLimiter,
 		flowID:      fte.flowID,
 		mlp:         fte.mlp,
 		vslp:        fte.vslp,
@@ -783,6 +790,7 @@ func (fte *flowToolsExecutor) GetPrimaryExecutor(cfg PrimaryExecutorConfig) (Con
 	}
 
 	ce := &customExecutor{
+		memorySearchLimiter: fte.memorySearchLimiter,
 		flowID:    fte.flowID,
 		taskID:    &cfg.TaskID,
 		subtaskID: &cfg.SubtaskID,
@@ -856,6 +864,7 @@ func (fte *flowToolsExecutor) GetInstallerExecutor(cfg InstallerExecutorConfig) 
 	}
 
 	ce := &customExecutor{
+		memorySearchLimiter: fte.memorySearchLimiter,
 		flowID:    fte.flowID,
 		taskID:    cfg.TaskID,
 		subtaskID: cfg.SubtaskID,
@@ -938,6 +947,7 @@ func (fte *flowToolsExecutor) GetCoderExecutor(cfg CoderExecutorConfig) (Context
 	}
 
 	ce := &customExecutor{
+		memorySearchLimiter: fte.memorySearchLimiter,
 		flowID:    fte.flowID,
 		taskID:    cfg.TaskID,
 		subtaskID: cfg.SubtaskID,
@@ -1048,6 +1058,7 @@ func (fte *flowToolsExecutor) GetPentesterExecutor(cfg PentesterExecutorConfig) 
 	}
 
 	ce := &customExecutor{
+		memorySearchLimiter: fte.memorySearchLimiter,
 		flowID:    fte.flowID,
 		taskID:    cfg.TaskID,
 		subtaskID: cfg.SubtaskID,
@@ -1269,6 +1280,7 @@ func (fte *flowToolsExecutor) GetSearcherExecutor(cfg SearcherExecutorConfig) (C
 	}
 
 	ce := &customExecutor{
+		memorySearchLimiter: fte.memorySearchLimiter,
 		flowID:    fte.flowID,
 		taskID:    cfg.TaskID,
 		subtaskID: cfg.SubtaskID,
@@ -1452,6 +1464,7 @@ func (fte *flowToolsExecutor) GetGeneratorExecutor(cfg GeneratorExecutorConfig) 
 	}
 
 	ce := &customExecutor{
+		memorySearchLimiter: fte.memorySearchLimiter,
 		flowID: fte.flowID,
 		taskID: &cfg.TaskID,
 		mlp:    fte.mlp,
@@ -1515,6 +1528,7 @@ func (fte *flowToolsExecutor) GetRefinerExecutor(cfg RefinerExecutorConfig) (Con
 	}
 
 	ce := &customExecutor{
+		memorySearchLimiter: fte.memorySearchLimiter,
 		flowID: fte.flowID,
 		taskID: &cfg.TaskID,
 		mlp:    fte.mlp,
@@ -1575,6 +1589,7 @@ func (fte *flowToolsExecutor) GetMemoristExecutor(cfg MemoristExecutorConfig) (C
 	}
 
 	ce := &customExecutor{
+		memorySearchLimiter: fte.memorySearchLimiter,
 		flowID:    fte.flowID,
 		taskID:    cfg.TaskID,
 		subtaskID: cfg.SubtaskID,
@@ -1636,6 +1651,7 @@ func (fte *flowToolsExecutor) GetEnricherExecutor(cfg EnricherExecutorConfig) (C
 	}
 
 	return &customExecutor{
+		memorySearchLimiter: fte.memorySearchLimiter,
 		flowID:    fte.flowID,
 		taskID:    cfg.TaskID,
 		subtaskID: cfg.SubtaskID,
@@ -1663,6 +1679,7 @@ func (fte *flowToolsExecutor) GetReporterExecutor(cfg ReporterExecutorConfig) (C
 	}
 
 	return &customExecutor{
+		memorySearchLimiter: fte.memorySearchLimiter,
 		flowID:      fte.flowID,
 		taskID:      cfg.TaskID,
 		subtaskID:   cfg.SubtaskID,

@@ -665,10 +665,17 @@ func (fp *flowProvider) performPentester(
 				return "", fmt.Errorf("failed to unmarshal result: %w", err)
 			}
 
-			// Finding extraction removed from hack_result handler to prevent duplicates.
-			// Findings are extracted from individual tool responses in performer.go
-			// which has better endpoint data (extracted from tool call arguments).
-			// See performer.go ~line 1241 for the primary extraction path.
+			// Fix SURGEON-2: Extract findings from hack_result text.
+			// Agents include [VULN_TYPE: xxx] tags in their result summaries.
+			// The FindingRegistry's dedup prevents double-counting with
+			// findings already captured by the primary extraction path.
+			if fr := GetFindingRegistry(ctx); fr != nil && hackResult.Result != "" {
+				newCount := fr.ParseAndSyncFindingsMD(hackResult.Result, subtaskID)
+				if newCount > 0 {
+					logrus.WithField("new_findings", newCount).
+						Info("hack_result: extracted findings from result text")
+				}
+			}
 
 			return "hack result successfully processed", nil
 		},

@@ -353,21 +353,28 @@ func (fr *FindingRegistry) GetFindingCount() int {
 // ─── FINDINGS.md Sync (Fallback) ─────────────────────────────────────────────
 
 // findingsMDBlockRegex matches structured finding blocks in FINDINGS.md.
-// Supports the standard format:
-//   [FINDING: F-NNN]
-//   Title: <title>
-//   [VULN_TYPE: <tag>]
-//   Severity: Critical|High|Medium|Low|Info
-//   Target: <endpoint>
-//   Description: <text>
+// Supports two formats:
+//   Format A (legacy): [FINDING: F-NNN] ... [FINDING: | EOF
+//   Format B (actual agent output): ### [SEV] [CONFIDENCE] F-NNN: <title>
 var findingsMDBlockRegex = regexp.MustCompile(
 	`(?s)\[FINDING:\s*F-\d+\].*?(?:\[FINDING:|\z)`,
 )
+
+// findingsMDHeaderBlockRegex matches the format agents actually write per the
+// pentester.tmpl template:
+//   ### [CRITICAL] [CONFIRMED] F-001: Title here
+//   [VULN_TYPE: sqli]
+//   - **Target:** https://example.com/api
+// It splits on ### headers that contain F-NNN patterns.
+var findingsMDHeaderBlockRegex = regexp.MustCompile(
+	`(?m)^###\s+\[.+?\]\s+(?:\[.+?\]\s+)?F-\d+`,
+)
+
 var findingsMDVulnTypeRegex = regexp.MustCompile(`\[VULN_TYPE:\s*(\w+)\]`)
-var findingsMDSeverityRegex = regexp.MustCompile(`(?i)Severity:\s*(Critical|High|Medium|Low|Info)`)
-var findingsMDTargetRegex = regexp.MustCompile(`(?i)Target:\s*(.+)`)
-var findingsMDTitleRegex = regexp.MustCompile(`(?i)Title:\s*(.+)`)
-var findingsMDDescRegex = regexp.MustCompile(`(?i)Description:\s*(.+)`)
+var findingsMDSeverityRegex = regexp.MustCompile(`(?i)(?:Severity:\s*|###\s*\[)(Critical|High|Medium|Low|Info)`)
+var findingsMDTargetRegex = regexp.MustCompile(`(?i)(?:Target:|\*\*Target:\*\*)\s*(.+)`)
+var findingsMDTitleRegex = regexp.MustCompile(`(?i)(?:Title:\s*|F-\d+:\s*)(.+)`)
+var findingsMDDescRegex = regexp.MustCompile(`(?i)(?:Description:|\*\*Impact:\*\*)\s*(.+)`)
 
 // ParseAndSyncFindingsMD parses FINDINGS.md content and registers any findings
 // not already present in the registry. This is a FALLBACK mechanism for flows
@@ -381,11 +388,16 @@ func (fr *FindingRegistry) ParseAndSyncFindingsMD(content string, subtaskID *int
 	}
 
 	newCount := 0
-	// Split content into finding blocks
+	// Strategy 1: Try [FINDING: F-NNN] block format (legacy)
 	blocks := findingsMDBlockRegex.FindAllString(content, -1)
 
-	// If no structured blocks found, try a simpler line-by-line approach
-	// looking for VULN_TYPE tags anywhere in the file
+	// Strategy 2: If no legacy blocks, try ### header format (actual agent output)
+	// Agents write: ### [SEV] [CONFIDENCE] F-NNN: <title>
+	if len(blocks) == 0 {
+		blocks = splitByHeaderBlocks(content)
+	}
+
+	// Strategy 3: If still no blocks, scan for bare [VULN_TYPE:] tags anywhere
 	if len(blocks) == 0 {
 		matches := findingsMDVulnTypeRegex.FindAllStringSubmatch(content, -1)
 		for _, match := range matches {
@@ -460,6 +472,33 @@ func (fr *FindingRegistry) ParseAndSyncFindingsMD(content string, subtaskID *int
 	}
 
 	return newCount
+}
+
+// splitByHeaderBlocks splits FINDINGS.md content into blocks using the
+// ### header format that agents actually produce per the pentester.tmpl template.
+// Each block starts at a ### line containing F-NNN and ends before the next
+// such header (or EOF). Only returns blocks that contain [VULN_TYPE: xxx].
+func splitByHeaderBlocks(content string) []string {
+	// Find all header positions
+	locs := findingsMDHeaderBlockRegex.FindAllStringIndex(content, -1)
+	if len(locs) == 0 {
+		return nil
+	}
+
+	var blocks []string
+	for i, loc := range locs {
+		start := loc[0]
+		end := len(content)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		block := content[start:end]
+		// Only include blocks that have a VULN_TYPE tag (required for registration)
+		if findingsMDVulnTypeRegex.MatchString(block) {
+			blocks = append(blocks, block)
+		}
+	}
+	return blocks
 }
 
 // ─── Report Generator ────────────────────────────────────────────────────────

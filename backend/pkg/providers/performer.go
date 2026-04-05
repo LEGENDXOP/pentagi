@@ -299,15 +299,17 @@ func (fp *flowProvider) performAgentChain(
 
 		// M6 FALLBACK: Try to read FINDINGS.md from the container and sync
 		// any findings that were missed by the primary extraction path.
-		// Fix ECHO-1: Skip M6 fallback entirely when the primary extraction
-		// path already captured findings for this subtask. This prevents the
-		// double-extraction that creates duplicates (primary captures with
-		// empty endpoint, M6 re-captures with ${port}${path} endpoint).
+		// Fix SURGEON-2: ALWAYS run FINDINGS.md sync regardless of primary
+		// extraction count. The FindingRegistry's semantic dedup (fingerprint +
+		// same-host matching) prevents duplicates, so running this is safe.
+		// Previously, ECHO-1 skipped this when primary extraction caught any
+		// finding — causing agents' documented findings to never reach the DB
+		// when only a subset was caught inline.
 		func() {
-			if findingRegistry.GetFindingCount() > 0 {
-				logrus.WithField("existing_findings", findingRegistry.GetFindingCount()).
-					Info("FINDINGS.md sync skipped: primary extraction already captured findings")
-				return
+			priorCount := findingRegistry.GetFindingCount()
+			if priorCount > 0 {
+				logrus.WithField("existing_findings", priorCount).
+					Info("FINDINGS.md sync: primary extraction found findings, running sync for any missed")
 			}
 
 			syncCtx := context.WithoutCancel(ctx)

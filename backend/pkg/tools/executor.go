@@ -18,6 +18,7 @@ import (
 	"pentagi/pkg/observability/langfuse"
 	"pentagi/pkg/schema"
 
+	"github.com/sirupsen/logrus"
 	"github.com/vxcontrol/langchaingo/documentloaders"
 	"github.com/vxcontrol/langchaingo/llms"
 	"github.com/vxcontrol/langchaingo/textsplitter"
@@ -190,6 +191,9 @@ type customExecutor struct {
 	store *pgvector.Store
 	vslp  VectorStoreLogProvider
 
+	// Fix Pattern-14: Memory search hard limiter (shared per-flow instance)
+	memorySearchLimiter *MemorySearchLimiter
+
 	definitions []llms.FunctionDefinition
 	handlers    map[string]ExecutorHandler
 	barriers    map[string]struct{}
@@ -305,6 +309,20 @@ func (ce *customExecutor) Execute(
 	var raw any
 	if err := json.Unmarshal(args, &raw); err != nil {
 		return fmt.Sprintf("failed to unmarshal '%s' tool call arguments: %v: fix it", name, err), nil
+	}
+
+	// Fix Pattern-14: Check memory search limiter BEFORE executing the tool.
+	// This prevents obsessive memory/graphiti searches that waste 35-40% of flow runtime.
+	if ce.memorySearchLimiter != nil {
+		if blocked, msg := ce.memorySearchLimiter.CheckAndRecord(name, ce.subtaskID); blocked {
+			logrus.WithFields(logrus.Fields{
+				"flow_id":    ce.flowID,
+				"tool":       name,
+				"task_id":    ce.taskID,
+				"subtask_id": ce.subtaskID,
+			}).Warn("memory search limiter: tool call blocked")
+			return msg, nil
+		}
 	}
 
 	// Create observation based on tool type
