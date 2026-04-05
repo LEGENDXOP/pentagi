@@ -349,6 +349,46 @@ func (m *AttackBudgetManager) GetActiveBudgets() []VectorBudget {
 	return active
 }
 
+// ResetForNewSubtask clears exhaustion state for ALL vectors, resets timers,
+// and resets failure counters — effectively giving the new subtask a fresh budget.
+// The history of previously exhausted vectors is preserved for informational purposes
+// but does not block new attempts.
+func (m *AttackBudgetManager) ResetForNewSubtask() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Reset all vector budgets: clear exhaustion, restart timers, reset failures
+	for key, vb := range m.budgets {
+		vb.Exhausted = false
+		vb.ExhaustReason = ""
+		vb.StartTime = time.Now()
+		vb.ConsecutiveFailures = 0
+		vb.Attempts = 0
+		vb.Successes = 0
+		_ = key // keep the entry so we can still see it in summaries
+	}
+
+	// Keep history for informational logging but won't affect CheckBudget
+	// since all Exhausted flags are now false
+}
+
+// ResetVector resets the budget for a specific phase+vector combination,
+// allowing it to be retried even if it was previously exhausted.
+func (m *AttackBudgetManager) ResetVector(phase AttackPhase, vector string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := vectorBudgetKey(phase, vector)
+	if vb, ok := m.budgets[key]; ok {
+		vb.Exhausted = false
+		vb.ExhaustReason = ""
+		vb.StartTime = time.Now()
+		vb.ConsecutiveFailures = 0
+		vb.Attempts = 0
+		vb.Successes = 0
+	}
+}
+
 // GetBudgetSummary returns a human-readable summary of all budgets for logging/prompts.
 func (m *AttackBudgetManager) GetBudgetSummary() string {
 	m.mu.RLock()

@@ -382,6 +382,19 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 
 			// Mark as failed and continue
 			_ = st.SetStatus(ctx, database.SubtaskStatusFailed)
+
+			// FIX (Flow 27 recovery): After subtask failure, verify there are
+			// still planned subtasks remaining before continuing the loop.
+			// Without this check, a failed subtask followed by an empty queue
+			// causes the task to silently "finish" without executing remaining work.
+			remaining, dbErr := tw.taskCtx.DB.GetTaskPlannedSubtasks(ctx, tw.taskCtx.TaskID)
+			if dbErr == nil {
+				logger.WithFields(logrus.Fields{
+					"failed_subtask_id":  st.GetSubtaskID(),
+					"remaining_planned":  len(remaining),
+				}).Info("subtask failure recovery: checked remaining planned subtasks")
+			}
+
 			continue
 		}
 

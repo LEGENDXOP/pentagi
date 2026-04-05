@@ -283,6 +283,9 @@ func (fr *FindingRegistry) GetFindingsBySeverity() map[string][]ReportFinding {
 
 // PersistFindings writes all accumulated findings to the database.
 // Uses best-effort semantics: logs errors but does not fail.
+// Fix AUDITOR-4: Added semantic dedup at DB level to prevent cross-subtask
+// duplicates where the same vulnerability is found by different subtasks with
+// slightly different endpoints (e.g., with URL vs without URL).
 func (fr *FindingRegistry) PersistFindings(ctx context.Context, db database.Querier) {
 	fr.mu.Lock()
 	findings := make([]ReportFinding, len(fr.findings))
@@ -293,14 +296,35 @@ func (fr *FindingRegistry) PersistFindings(ctx context.Context, db database.Quer
 		return
 	}
 
+	// Load existing DB findings for this flow ONCE for semantic cross-subtask dedup.
+	existingFindings, err := db.GetFlowFindings(ctx, fr.flowID)
+	if err != nil {
+		logrus.WithError(err).Warn("PersistFindings: failed to load existing findings for dedup (proceeding with fingerprint-only dedup)")
+		existingFindings = nil
+	}
+
 	for _, f := range findings {
-		// Check if already persisted (dedup by fingerprint + flow_id).
+		// Check 1: Exact fingerprint dedup.
 		_, err := db.GetFindingByFingerprint(ctx, database.GetFindingByFingerprintParams{
 			Fingerprint: f.Fingerprint,
 			FlowID:      f.FlowID,
 		})
 		if err == nil {
-			continue // Already exists.
+			continue // Already exists (exact fingerprint match).
+		}
+
+		// Check 2: Semantic cross-subtask dedup — same vuln_type + same host.
+		// This catches the Flow 25 bug where the same finding was stored twice:
+		// once with a URL (from primary extraction) and once without (from
+		// FINDINGS.md sync), producing different fingerprints but representing
+		// the same vulnerability.
+		if isSemanticDBDuplicate(f, existingFindings) {
+			logrus.WithFields(logrus.Fields{
+				"vuln_type":   f.VulnType,
+				"endpoint":    f.Endpoint,
+				"fingerprint": f.Fingerprint,
+			}).Debug("PersistFindings: semantic dedup — skipping cross-subtask duplicate")
+			continue
 		}
 
 		var subtaskID sql.NullInt64
@@ -309,7 +333,10 @@ func (fr *FindingRegistry) PersistFindings(ctx context.Context, db database.Quer
 		}
 		var rootCauseID sql.NullInt64
 
-		_, err = db.CreateFinding(ctx, database.CreateFindingParams{
+		// Fix AUDITOR-4: Auto-confirm findings with strong evidence patterns.
+		confirmed := f.Confirmed || autoConfirmFromEvidence(f)
+
+		newFinding, createErr := db.CreateFinding(ctx, database.CreateFindingParams{
 			FlowID:        f.FlowID,
 			SubtaskID:     subtaskID,
 			VulnType:      f.VulnType,
@@ -322,18 +349,162 @@ func (fr *FindingRegistry) PersistFindings(ctx context.Context, db database.Quer
 			CWE:           f.CWE,
 			CVSSBase:      f.CVSSBase,
 			Remediation:   f.Remediation,
-			Confirmed:     f.Confirmed,
+			Confirmed:     confirmed,
 			FalsePositive: f.FalsePositive,
 			RootCauseID:   rootCauseID,
 		})
-		if err != nil {
-			logrus.WithError(err).WithFields(logrus.Fields{
+		if createErr != nil {
+			logrus.WithError(createErr).WithFields(logrus.Fields{
 				"flow_id":     f.FlowID,
 				"vuln_type":   f.VulnType,
 				"fingerprint": f.Fingerprint,
 			}).Warn("failed to persist finding to DB")
+		} else {
+			// Add to existing findings so subsequent findings in this batch
+			// can also be deduped against it.
+			existingFindings = append(existingFindings, database.Finding{
+				ID:          newFinding.ID,
+				FlowID:      f.FlowID,
+				VulnType:    f.VulnType,
+				Endpoint:    f.Endpoint,
+				Fingerprint: f.Fingerprint,
+			})
 		}
 	}
+}
+
+// isSemanticDBDuplicate checks whether a finding is a semantic duplicate of any
+// existing DB finding. Two findings are semantic duplicates if they have the same
+// normalized vuln_type AND either:
+//   - one has an empty endpoint and the other doesn't (same finding, different detail level)
+//   - both share the same hostname
+//
+// This mirrors the in-memory semantic dedup in CheckAndRegister but operates
+// against the DB state, catching cross-subtask duplicates.
+func isSemanticDBDuplicate(f ReportFinding, existing []database.Finding) bool {
+	if len(existing) == 0 {
+		return false
+	}
+
+	newVT := NormalizeVulnType(f.VulnType)
+	newEP := normalizeEndpointForFingerprint(f.Endpoint)
+	newHost := extractHost(newEP)
+
+	for _, ex := range existing {
+		exVT := NormalizeVulnType(ex.VulnType)
+		if exVT != newVT {
+			continue
+		}
+
+		exEP := normalizeEndpointForFingerprint(ex.Endpoint)
+
+		// Same vuln type + one endpoint empty → semantic duplicate
+		if exEP == "" || newEP == "" {
+			return true
+		}
+
+		// Same vuln type + same host → semantic duplicate
+		exHost := extractHost(exEP)
+		if exHost != "" && newHost != "" && exHost == newHost {
+			return true
+		}
+	}
+	return false
+}
+
+// autoConfirmFromEvidence checks whether a finding's description/evidence contains
+// strong indicators that the vulnerability was actually exploited (not just detected).
+// This addresses the Flow 25 bug where 0% of findings were confirmed despite having
+// clear PoC evidence (baseline 401 vs injected 500, data extraction, etc.).
+func autoConfirmFromEvidence(f ReportFinding) bool {
+	// Combine description and all evidence content for analysis
+	var textToCheck string
+	textToCheck = f.Description
+	for _, ev := range f.Evidence {
+		textToCheck += " " + ev.Content
+	}
+
+	lower := strings.ToLower(textToCheck)
+
+	// Pattern 1: Error differential (baseline vs injected)
+	errorDiffPatterns := []string{
+		"baseline",
+		"vs injected",
+		"response differ",
+		"status code changed",
+		"different response",
+		"error differ",
+	}
+
+	// Pattern 2: HTTP status differentials that indicate exploitation
+	statusPatterns := []string{
+		"401 to 200", "403 to 200", "401→200", "403→200",
+		"returned 500", "returned 200", "got 500", "got 200",
+		"status 500", "status 200",
+		"500 internal server error",
+	}
+
+	// Pattern 3: Data extraction evidence
+	dataPatterns := []string{
+		"extracted", "dumped", "leaked", "disclosed",
+		"password", "token", "secret", "credential",
+		"successfully", "confirmed",
+	}
+
+	// Pattern 4: Active exploitation evidence
+	exploitPatterns := []string{
+		"poc", "proof of concept", "proof-of-concept",
+		"exploit", "payload executed", "injection successful",
+		"alert(1)", "alert(xss)", "<script",
+		"union select", "' or 1=1", "' or '1'='1",
+		"whoami", "uid=", "root:",
+		"/etc/passwd",
+		"oob callback", "interactsh", "out-of-band",
+	}
+
+	// Check each pattern group — require match from at least one strong group
+	for _, p := range exploitPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+
+	// Error differential + status pattern = confirmed
+	hasErrorDiff := false
+	for _, p := range errorDiffPatterns {
+		if strings.Contains(lower, p) {
+			hasErrorDiff = true
+			break
+		}
+	}
+	hasStatusChange := false
+	for _, p := range statusPatterns {
+		if strings.Contains(lower, p) {
+			hasStatusChange = true
+			break
+		}
+	}
+	if hasErrorDiff && hasStatusChange {
+		return true
+	}
+
+	// Data extraction + another indicator = confirmed
+	dataMatches := 0
+	for _, p := range dataPatterns {
+		if strings.Contains(lower, p) {
+			dataMatches++
+		}
+	}
+	if dataMatches >= 2 {
+		return true
+	}
+
+	// Agent explicitly says [CONFIRMED] in finding text
+	if strings.Contains(lower, "[confirmed]") {
+		return true
+	}
+
+	return false
 }
 
 // GetFindingCount returns the total number of non-false-positive findings.
@@ -423,13 +594,23 @@ func (fr *FindingRegistry) ParseAndSyncFindingsMD(content string, subtaskID *int
 		}
 		vulnType := vtMatch[1]
 
-		// Use authoritative CVSS-based severity. Do NOT override with agent-written
-		// severity from FINDINGS.md — agents tend to over-rate as CRITICAL.
+		// Fix AUDITOR-4: Use CVSS-based severity as primary, but fall back to
+		// agent's written severity when the vuln type is not in ComplianceMappings.
+		// This fixes the Flow 25 bug where agent classified as MEDIUM/LOW but DB
+		// stored "info" — which happened because unmapped vuln types defaulted to
+		// "medium" via severityFromVulnType, but in edge cases could produce "info".
 		severity := severityFromVulnType(vulnType)
-		// Agent's written severity is logged but not used (CVSS is authoritative).
 		if sevMatch := findingsMDSeverityRegex.FindStringSubmatch(block); len(sevMatch) >= 2 {
 			agentSev := strings.ToLower(sevMatch[1])
-			if agentSev != severity {
+			// If the vuln type is not in ComplianceMappings, prefer the agent's
+			// severity — the agent has context about the specific finding.
+			if GetComplianceForVulnType(vulnType) == nil && agentSev != "" {
+				severity = agentSev
+				logrus.WithFields(logrus.Fields{
+					"vuln_type":      vulnType,
+					"agent_severity": agentSev,
+				}).Debug("FINDINGS.md sync: using agent severity for unmapped vuln type")
+			} else if agentSev != severity {
 				logrus.WithFields(logrus.Fields{
 					"vuln_type":      vulnType,
 					"agent_severity": agentSev,

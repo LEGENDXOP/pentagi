@@ -1040,6 +1040,19 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 	// Sub-agents inherit the manager from their parent via context.
 	if GetAttackBudget(ctx) == nil {
 		ctx = WithAttackBudget(ctx, NewAttackBudgetManager(LoadAttackBudgetConfigFromEnv()))
+	} else {
+		// FIX: Reset attack budget for each new subtask so that exhaustion from
+		// a previous subtask (e.g., recon consuming the entire budget) does not
+		// permanently block tools for subsequent subtasks. Each subtask gets
+		// a fresh budget with reset timers and failure counters.
+		if abm := GetAttackBudget(ctx); abm != nil {
+			logrus.WithFields(logrus.Fields{
+				"task_id":            taskID,
+				"subtask_id":         subtaskID,
+				"exhausted_vectors":  abm.GetExhaustedVectors(),
+			}).Info("resetting attack budget for new subtask")
+			abm.ResetForNewSubtask()
+		}
 	}
 
 	ctx = tools.PutAgentContext(ctx, msgChainType)

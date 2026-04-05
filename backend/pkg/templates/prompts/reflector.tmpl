@@ -105,7 +105,7 @@ When providing corrective guidance, follow these rules STRICTLY:
 8. Your corrective action must specify a concrete tool call (terminal with specific command, or a named tool)
 9. If >80% of time budget spent with <2 findings: "Time is running out. Write your current findings to FINDINGS.md and call [completion tool] immediately."
 10. NEVER suggest the agent "analyze" or "assess" its progress — that IS the loop
-11. **MEMORY SEARCH ADDICTION DETECTION:** If the agent has called memorist, graphiti_search, search_in_memory, or vector search 3+ times in the current subtask: "STOP searching memory. You have exceeded the search budget. The data is NOT in memory. Use files in /work/ and /root/ instead. Your next action must be a terminal command, attack, or the completion tool."
+11. **MEMORY SEARCH ADDICTION DETECTION:** If the agent has called memorist, graphiti_search, search_in_memory, search_answer, search_code, search_guide, or ANY memory/vector search tool 3+ times in the current subtask: "STOP searching memory. You have exceeded the search budget. The data is NOT in memory. Use files in /work/ and /root/ instead. Your next action must be a terminal command, attack, or the completion tool."
 12. NEVER suggest the agent search memory, query graphiti, or check vector DB as a corrective action. Memory search is NEVER the fix for being stuck.
 
 ## RESPONSE GUIDELINES
@@ -197,7 +197,7 @@ Before concluding this is a loop, verify these conditions:
 2. Are the recent calls using DIFFERENT arguments (different URLs, IPs, ports, payloads, paths)? If so, this is likely legitimate methodical work, NOT a loop.
 3. Are the calls truly IDENTICAL — same tool, same arguments, same results/errors? Only this constitutes a real loop.
 4. Is the agent making progress toward the subtask objective?
-5. **MEMORY SEARCH LOOP (Pattern 9 — always a TRUE loop):** If the most_frequent_tool is memorist, graphiti_search, search_in_memory, or any memory/vector search tool, and it has been called 3+ times: this is ALWAYS a true loop regardless of argument differences. Memory searches with slightly different phrasings of the same concept are NOT legitimate enumeration — they are addiction behavior. Always choose CHANGE_APPROACH or STOP. Direct the agent to use /work/ files instead.
+5. **MEMORY SEARCH LOOP (Pattern 9 — always a TRUE loop):** If the most_frequent_tool is memorist, graphiti_search, search_in_memory, search_answer, search_code, search_guide, or any memory/vector search tool, and it has been called 3+ times: this is ALWAYS a true loop regardless of argument differences. Memory searches with slightly different phrasings of the same concept are NOT legitimate enumeration — they are addiction behavior. Always choose CHANGE_APPROACH or STOP. Direct the agent to use /work/ files instead.
 
 **Key distinction:** Similar tool usage ≠ repetitive loop. A pentester running curl against 10 different endpoints, or nmap against different port ranges, is doing their job. Only intervene when the agent is genuinely stuck repeating the exact same action expecting different results.
 

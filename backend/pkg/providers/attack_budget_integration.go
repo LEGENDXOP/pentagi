@@ -149,7 +149,11 @@ func CheckAndBuildPivot(
 	if err != nil {
 		logrus.WithContext(ctx).WithError(err).Warn("failed to render pivot template, using fallback message")
 		pivotMessage = fmt.Sprintf(
-			"[AUTO-PIVOT] Budget exhausted for %s/%s: %s. Switch to a different attack vector immediately.",
+			"[AUTO-PIVOT] Budget exhausted for %s/%s: %s. "+
+				"Switch to a different attack vector immediately. "+
+				"IMPORTANT: Use the terminal tool DIRECTLY (curl, nmap, nuclei, dig) "+
+				"instead of delegating to specialist agents. Direct terminal execution "+
+				"is faster and avoids budget overhead.",
 			result.Phase, result.Vector, result.Reason,
 		)
 	}

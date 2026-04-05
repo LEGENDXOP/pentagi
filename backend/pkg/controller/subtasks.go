@@ -172,6 +172,32 @@ func (stc *subtaskController) RefineSubtasks(ctx context.Context) error {
 		}
 	}
 
+	// FIX: Prevent the refiner from wiping all planned subtasks.
+	// If the refiner returns fewer subtasks than a safety threshold AND the
+	// original plan had significantly more, keep the original plan to avoid
+	// the premature-finishing bug (Flow 26: 0/9 exploitation subtasks started
+	// because refiner returned empty plan after recon).
+	if len(subtaskIDs) > 0 && len(plan) == 0 {
+		logrus.WithFields(logrus.Fields{
+			"task_id":                stc.taskCtx.TaskID,
+			"original_planned_count": len(subtaskIDs),
+			"refiner_returned_count": 0,
+		}).Warn("refiner returned ZERO subtasks — keeping original plan to prevent premature finishing")
+		return nil
+	}
+
+	// FIX: Also guard against refiner dramatically shrinking the plan.
+	// If the original plan has 3+ subtasks and the refiner returns less than
+	// 25% of the original, log a warning and keep the original plan.
+	if len(subtaskIDs) >= 3 && len(plan)*4 < len(subtaskIDs) {
+		logrus.WithFields(logrus.Fields{
+			"task_id":                stc.taskCtx.TaskID,
+			"original_planned_count": len(subtaskIDs),
+			"refiner_returned_count": len(plan),
+		}).Warn("refiner dramatically reduced subtask count (>75% reduction) — keeping original plan")
+		return nil
+	}
+
 	err = stc.taskCtx.DB.DeleteSubtasks(ctx, subtaskIDs)
 	if err != nil {
 		return fmt.Errorf("failed to delete subtasks for task %d: %w", stc.taskCtx.TaskID, err)

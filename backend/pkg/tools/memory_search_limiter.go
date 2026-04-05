@@ -178,7 +178,8 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 
 			return true, fmt.Sprintf(
 				"Memory search budget exhausted for this flow (%d/%d tool calls = %.0f%% memory searches, limit: %.0f%%). "+
-					"Continue with direct testing and exploitation. Use on-disk evidence files if you need prior results.",
+					"ALTERNATIVE: Use files on disk instead — `cat /work/HANDOFF.md`, `cat /work/FINDINGS.md`, `ls /work/`. "+
+					"Or use terminal/browser tools directly to continue testing.",
 				msl.totalMemorySearches, msl.totalToolCalls, budgetUsed*100, msl.memoryBudgetPercent*100,
 			)
 		}
@@ -193,8 +194,9 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 
 		return true, fmt.Sprintf(
 			"Memory search limit reached (%d/%d consecutive searches). "+
-				"Use evidence files on disk instead. Proceed with your next action — "+
-				"use terminal, browser, file write, or any non-memory tool to reset this limit.",
+				"ALTERNATIVE: Use files on disk instead — `cat /work/HANDOFF.md`, `cat /work/FINDINGS.md`, `ls /work/`. "+
+				"Or use terminal, browser, or any non-memory tool directly to continue. "+
+				"Using a non-memory tool resets this limit.",
 			msl.consecutiveSearches, msl.maxConsecutiveSearches,
 		)
 	}
@@ -209,8 +211,9 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 
 		return true, fmt.Sprintf(
 			"Memory search limit reached (%d/%d consecutive searches). "+
-				"Use evidence files on disk instead. Proceed with your next action — "+
-				"use terminal, browser, file write, or any non-memory tool to reset this limit.",
+				"ALTERNATIVE: Use files on disk instead — `cat /work/HANDOFF.md`, `cat /work/FINDINGS.md`, `ls /work/`. "+
+				"Or use terminal, browser, or any non-memory tool directly to continue. "+
+				"Using a non-memory tool resets this limit.",
 			msl.maxConsecutiveSearches, msl.maxConsecutiveSearches,
 		)
 	}
@@ -224,8 +227,9 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 
 		return true, fmt.Sprintf(
 			"Memory searches returning low relevance (<%.2f) for %d consecutive searches. "+
-				"Memory system doesn't have what you need. Use on-disk evidence files. "+
-				"Use a non-memory tool (terminal, browser, etc.) to reset this limit.",
+				"The data does NOT exist in memory. Searching more will NOT help. "+
+				"ALTERNATIVE: Use files on disk — `cat /work/HANDOFF.md`, `cat /work/FINDINGS.md`, `ls /work/`. "+
+				"Or use terminal/browser directly to continue testing.",
 			msl.lowRelevanceScore, msl.consecutiveLowRelevance,
 		)
 	}

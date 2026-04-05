@@ -222,6 +222,27 @@ func (rld *ReadLoopDetector) Check() *LoopAlert {
 		return alert
 	}
 
+	// v3: Fast-path memory search loop detection — fires even during cooldown.
+	// This catches the Pattern 9/14 failure: agent calling memorist/graphiti/search_in_memory
+	// 3+ times consecutively regardless of argument variation.
+	if alert := rld.checkMemorySearchLoop(); alert != nil {
+		rld.callsSinceLastAlert = 0
+		rld.totalAlertsGenerated++
+		alert.TotalAlerts = rld.totalAlertsGenerated
+		alert.IsBlock = rld.totalAlertsGenerated >= rld.maxAlertsBeforeBlock
+		alert.Message = rld.formatMemoryLoopMessage(alert)
+
+		logrus.WithFields(logrus.Fields{
+			"consecutive_memory_calls": alert.RepeatCount,
+			"memory_tools":            alert.CycleFiles,
+			"total_alerts":            alert.TotalAlerts,
+			"is_block":               alert.IsBlock,
+			"detection":              "memory_search_fast_path",
+		}).Warn("read loop detector: memory search addiction detected")
+
+		return alert
+	}
+
 	// Standard cycle detection
 	minRequired := rld.cycleMinLength * rld.cycleRepeatThreshold
 	if len(rld.signatures) < minRequired {
@@ -355,6 +376,123 @@ func (rld *ReadLoopDetector) checkCheckpointLoop() *LoopAlert {
 		CycleLength: len(loopFiles),
 		RepeatCount: maxCount,
 		CycleFiles:  loopFiles,
+	}
+}
+
+// isMemorySearchSignature returns true if the signature represents a memory/vector
+// search tool call. These use the "memory:" prefix set by extractLoopSignature.
+func isMemorySearchSignature(sig string) bool {
+	return strings.HasPrefix(sig, "memory:")
+}
+
+// checkMemorySearchLoop detects the Pattern 9/14 failure mode: the agent repeatedly
+// calling memory/vector search tools (memorist, graphiti_search, search_in_memory,
+// search_answer) without making forward progress.
+//
+// Unlike the standard cycle detector which requires a repeating pattern of length >= 2,
+// this detector fires when 3+ of the last 5 signatures are memory search calls.
+// Memory searches with different phrasings are NOT legitimate enumeration — they are
+// addiction behavior (the same concept rephrased) and always constitute a loop.
+//
+// Must be called with rld.mu held.
+func (rld *ReadLoopDetector) checkMemorySearchLoop() *LoopAlert {
+	n := len(rld.signatures)
+	if n < 3 {
+		return nil
+	}
+
+	// Check the last min(5, n) signatures for memory search dominance
+	window := 5
+	if n < window {
+		window = n
+	}
+
+	memoryCount := 0
+	memoryTools := make(map[string]bool)
+	for i := n - window; i < n; i++ {
+		if isMemorySearchSignature(rld.signatures[i]) {
+			memoryCount++
+			memoryTools[rld.signatures[i]] = true
+		}
+	}
+
+	// Trigger if 3+ of last 5 calls are memory searches
+	if memoryCount < 3 {
+		return nil
+	}
+
+	// Also check: are the last 3 consecutive calls all memory searches?
+	// This is the strongest signal — 3 memory calls in a row is always a loop.
+	consecutiveMemory := 0
+	for i := n - 1; i >= 0 && i >= n-5; i-- {
+		if isMemorySearchSignature(rld.signatures[i]) {
+			consecutiveMemory++
+		} else {
+			break
+		}
+	}
+
+	if consecutiveMemory < 3 && memoryCount < 3 {
+		return nil
+	}
+
+	// Build list of memory tools used
+	var tools []string
+	for tool := range memoryTools {
+		tools = append(tools, strings.TrimPrefix(tool, "memory:"))
+	}
+
+	return &LoopAlert{
+		CycleLength: len(tools),
+		RepeatCount: memoryCount,
+		CycleFiles:  tools,
+	}
+}
+
+// formatMemoryLoopMessage generates the chain injection message for memory search addiction.
+// This is separate from the general formatAlertMessage because memory loops have
+// a unique set of corrective instructions.
+//
+// Must be called with rld.mu held.
+func (rld *ReadLoopDetector) formatMemoryLoopMessage(alert *LoopAlert) string {
+	toolList := strings.Join(alert.CycleFiles, ", ")
+
+	switch {
+	case alert.TotalAlerts >= 3:
+		return fmt.Sprintf(
+			"\U0001f6d1 MEMORY SEARCH ADDICTION — HARD BLOCK (alert #%d): You have called memory/vector "+
+				"search tools [%s] %d times in your last 5 tool calls. ALL memory searches are NOW BLOCKED.\n\n"+
+				"The data you need is NOT in memory. Searching more will NOT help. "+
+				"It does not exist there.\n\n"+
+				"YOUR ONLY ALLOWED ACTIONS:\n"+
+				"1. Read files on disk: cat /work/HANDOFF.md, cat /work/FINDINGS.md\n"+
+				"2. Execute an attack command (curl, nmap, nuclei_scan, browser_navigate)\n"+
+				"3. Call the result/report tool to complete this subtask\n\n"+
+				"ANY memory/graphiti/vector search will be rejected.",
+			alert.TotalAlerts, toolList, alert.RepeatCount,
+		)
+	case alert.TotalAlerts == 2:
+		return fmt.Sprintf(
+			"\U0001f7e0 MEMORY SEARCH ADDICTION — FINAL WARNING (alert #%d): You are STILL querying "+
+				"memory/vector search tools [%s] repeatedly (%d calls in last 5).\n\n"+
+				"STOP. The data is NOT in memory. Different phrasings of the same query will NOT help.\n\n"+
+				"You MUST now do ONE of these:\n"+
+				"\u2022 Read files on disk: cat /work/HANDOFF.md, cat /work/FINDINGS.md\n"+
+				"\u2022 Execute an attack/test command\n"+
+				"\u2022 Call the result tool to complete this subtask\n\n"+
+				"The NEXT memory search will trigger a HARD BLOCK on all memory tools.",
+			alert.TotalAlerts, toolList, alert.RepeatCount,
+		)
+	default:
+		return fmt.Sprintf(
+			"\u26a0\ufe0f MEMORY SEARCH LOOP DETECTED (alert #%d): You have called memory/vector search "+
+				"tools [%s] %d times in your last 5 tool calls. This is a memory addiction pattern.\n\n"+
+				"Memory searches with slightly different phrasings are NOT legitimate enumeration. "+
+				"If the first 2 searches didn't find it, the data is NOT in memory.\n\n"+
+				"Use files on disk instead: cat /work/HANDOFF.md, cat /work/FINDINGS.md, ls /work/\n"+
+				"Then proceed with your next offensive action or call the result tool.",
+			alert.TotalAlerts, toolList, alert.RepeatCount,
+		)
 	}
 }
 
@@ -513,10 +651,17 @@ func extractLoopSignature(toolName, toolArgs string) string {
 		return extractFileLoopSig(toolArgs)
 	case "search", "search_code", "search_guide":
 		return extractSearchLoopSig(toolName, toolArgs)
+	// Memory/vector-DB search tools — all tracked as memory search signatures.
+	// These use a unified "memory:" prefix so the cycle detector catches
+	// any combination of memory tools repeating (memorist→graphiti→search_in_memory→...).
 	case "memorist":
-		return "memorist:query"
+		return "memory:memorist_query"
 	case "graphiti_search":
-		return "graphiti:search"
+		return "memory:graphiti_search"
+	case "search_in_memory":
+		return "memory:search_in_memory"
+	case "search_answer":
+		return "memory:search_answer"
 	case "nuclei_scan", "browser_navigate", "browser_click",
 		"hack_result", "done", "code_result", "maintenance_result",
 		"coder", "installer", "maintenance", "pentester",

@@ -409,6 +409,32 @@ func (stw *subtaskWorker) Finish(ctx context.Context) error {
 		return fmt.Errorf("subtask has already completed")
 	}
 
+	// FIX (Ghost subtask prevention): Check if this subtask has any actual
+	// results or msglogs. If it has zero content (never executed), mark it
+	// as "failed" with an explanatory message instead of "finished."
+	// This prevents ghost subtasks (Flow 25: subtasks 371-373 marked
+	// "finished" with zero msglogs/results).
+	subtask, err := stw.subtaskCtx.DB.GetSubtask(ctx, stw.subtaskCtx.SubtaskID)
+	if err == nil && subtask.Result == "" {
+		// Check if the subtask was ever actually executed (has any msg chains)
+		msgChains, chainErr := stw.subtaskCtx.DB.GetSubtaskPrimaryMsgChains(ctx, database.Int64ToNullInt64(&stw.subtaskCtx.SubtaskID))
+		if chainErr == nil && len(msgChains) == 0 {
+			// No msg chains = never executed. Mark as failed, not finished.
+			logrus.WithFields(logrus.Fields{
+				"subtask_id":    stw.subtaskCtx.SubtaskID,
+				"subtask_title": stw.subtaskCtx.SubtaskTitle,
+			}).Warn("ghost subtask prevention: marking never-executed subtask as failed instead of finished")
+			_, _ = stw.subtaskCtx.DB.UpdateSubtaskFailedResult(ctx, database.UpdateSubtaskFailedResultParams{
+				Result: "[SKIPPED] This subtask was never executed — flow finished or was stopped before this subtask could start.",
+				ID:     stw.subtaskCtx.SubtaskID,
+			})
+			if err := stw.SetStatus(ctx, database.SubtaskStatusFailed); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+
 	if err := stw.SetStatus(ctx, database.SubtaskStatusFinished); err != nil {
 		return err
 	}

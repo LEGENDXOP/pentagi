@@ -1151,6 +1151,38 @@ func (fp *flowProvider) performAgentChain(
 				}
 			}
 
+			// FIX: Pre-execution budget check — if this specific tool's budget is
+			// exhausted (time or failure limit), block the call and return a clear
+			// message telling the agent to use terminal directly instead.
+			// Only applies to non-agent tools (agent delegation has its own blocking).
+			var budgetIntercepted bool
+			var budgetResponse string
+			if !v5Intercepted && attackBudget != nil && toolTypeMapping[funcName] != tools.AgentToolType {
+				phase := ClassifyToolPhase(funcName)
+				vector := ClassifyToolVector(funcName)
+				budgetResult := attackBudget.CheckBudget(phase, vector)
+				if !budgetResult.OK {
+					budgetIntercepted = true
+					budgetResponse = fmt.Sprintf(
+						"\u26d4 Budget exhausted for %s (phase: %s). Reason: %s\n\n"+
+							"This tool call has been BLOCKED to save time and resources.\n"+
+							"USE TERMINAL DIRECTLY instead:\n"+
+							"- curl, wget for HTTP requests\n"+
+							"- nmap for port scanning\n"+
+							"- nuclei for vulnerability scanning\n"+
+							"- dig, whois for DNS/domain info\n"+
+							"- python3 for custom scripts\n\n"+
+							"Or call the result tool to complete this subtask with current findings.",
+						funcName, phase, budgetResult.Reason,
+					)
+					logger.WithFields(logrus.Fields{
+						"budget_phase":  phase,
+						"budget_vector": vector,
+						"budget_reason": budgetResult.Reason,
+					}).Warn("attack budget pre-execution block: tool call blocked due to exhausted budget")
+				}
+			}
+
 			// v14: Memorist circuit breaker — block memorist calls after 2+ failures.
 			// This operates at the CALLING AGENT level, preventing the LLM from
 			// invoking memorist when the service is known to be down.
@@ -1169,6 +1201,8 @@ func (fp *flowProvider) performAgentChain(
 			var err error
 			if v5Intercepted {
 				response = v5Response
+			} else if budgetIntercepted {
+				response = budgetResponse
 			} else if memoristIntercepted {
 				response = memoristResponse
 			} else {

@@ -242,6 +242,25 @@ func (wd *flowWatchdog) checkFlowCompletion(ctx context.Context) {
 		"zombie_cleaned": runningCount,
 	}).Info("flow watchdog: all tasks completed, flow completion detected")
 
+	// FIX: Check if any completed task still has unexecuted planned subtasks.
+	// This catches the premature-finishing bug where a task "completes" but
+	// planned subtasks were never started (Flow 26 scenario).
+	for _, task := range tasks {
+		if !task.IsCompleted() {
+			continue
+		}
+		planned, dbErr := wd.fw.flowCtx.DB.GetTaskPlannedSubtasks(ctx, task.GetTaskID())
+		if dbErr != nil {
+			continue
+		}
+		if len(planned) > 0 {
+			wd.logger.WithFields(logrus.Fields{
+				"task_id":            task.GetTaskID(),
+				"unexecuted_planned": len(planned),
+			}).Warn("flow watchdog: completed task still has unexecuted planned subtasks — potential premature finish")
+		}
+	}
+
 	// Note: We don't force the flow to "completed" here because the flow
 	// is legitimately waiting for new user input after tasks finish.
 	// The flow status is correctly "waiting" — the key fix is cleaning up zombies.

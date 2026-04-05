@@ -35,6 +35,8 @@ The following attack vectors are recommended based on attack chain analysis:
 5. Apply lessons learned from the failed vector to inform your next approach
 6. If this is the 3rd consecutive pivot, consider whether the target has limited attack surface — report partial results rather than continuing to burn budget
 7. Report your pivot decision and reasoning using the appropriate result tool
+8. **CRITICAL: If delegation to specialist tools (pentester, coder, installer) was consuming too much budget, use the terminal tool DIRECTLY instead.** Run curl, nmap, nuclei, dig, whatweb, and other CLI tools through the terminal — this avoids nested agent overhead and is faster.
+9. Budget exhaustion for a specific tool does NOT mean you cannot achieve the same goal — use terminal commands directly (e.g., `curl`, `nmap -sV`, `nuclei -u`, `dig`, `whois`) instead of delegating.
 </pivot_rules>
 
 <tactical_pivot_patterns>
