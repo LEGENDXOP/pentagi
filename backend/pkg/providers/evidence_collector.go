@@ -962,6 +962,11 @@ func sanitizeEndpoint(endpoint string) string {
 		return ""
 	}
 
+	// Step 0: Replace literal escaped newlines (\n, \r) with actual newlines
+	// LLM agents often emit "\n" as a literal 2-char string rather than a real newline
+	ep = strings.ReplaceAll(ep, "\\n", "\n")
+	ep = strings.ReplaceAll(ep, "\\r", "\r")
+
 	// Step 1: Remove markdown formatting artifacts
 	ep = markdownCleanRegex.ReplaceAllString(ep, "")
 
