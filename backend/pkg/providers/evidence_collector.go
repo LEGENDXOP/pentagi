@@ -160,6 +160,36 @@ func NewFindingRegistry(flowID int64) *FindingRegistry {
 	}
 }
 
+// PreloadFromDB seeds the FindingRegistry with findings already persisted in the
+// database from prior subtasks. This ensures that cross-subtask duplicates are
+// caught in-memory during the primary extraction path, not just at PersistFindings() time.
+//
+// SURGEON Fix #1: This is the primary fix for the duplicate findings issue.
+// Without this, each subtask starts with an empty seenFingerprints map
+// and only deduplicates against DB at the very end (defer PersistFindings).
+func (fr *FindingRegistry) PreloadFromDB(existing []database.Finding) {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+
+	for _, f := range existing {
+		// Register exact fingerprint
+		fr.seenFingerprints[f.Fingerprint] = true
+
+		// Also register the finding in the findings slice for semantic dedup
+		fr.findings = append(fr.findings, ReportFinding{
+			ID:          fmt.Sprintf("DB-%d", f.ID),
+			FlowID:      f.FlowID,
+			VulnType:    NormalizeVulnType(f.VulnType),
+			Endpoint:    f.Endpoint,
+			Fingerprint: f.Fingerprint,
+			Severity:    f.Severity,
+		})
+	}
+
+	logrus.WithField("preloaded_count", len(existing)).
+		Debug("FindingRegistry: preloaded DB findings for cross-subtask dedup")
+}
+
 // CheckAndRegister attempts to register a new finding. Returns true if the finding
 // is new (not a duplicate), false if it's a duplicate.
 // Fix ECHO-4: Adds semantic dedup — if a finding has the same normalized vuln_type
@@ -175,8 +205,8 @@ func (fr *FindingRegistry) CheckAndRegister(
 	subtaskID *int64,
 	evidence []Evidence,
 ) (*ReportFinding, bool) {
-	// Sanitize endpoint before any processing
-	endpoint = sanitizeEndpoint(endpoint)
+	// SURGEON Fix #4: Use validateEndpoint for defense-in-depth sanitization + validation
+	endpoint = validateEndpoint(endpoint)
 
 	fp := buildFingerprint(vulnType, endpoint)
 
@@ -304,6 +334,11 @@ func (fr *FindingRegistry) PersistFindings(ctx context.Context, db database.Quer
 	}
 
 	for _, f := range findings {
+		// SURGEON Fix #1: Skip preloaded DB findings — they already exist in the database.
+		if strings.HasPrefix(f.ID, "DB-") {
+			continue
+		}
+
 		// Check 1: Exact fingerprint dedup.
 		_, err := db.GetFindingByFingerprint(ctx, database.GetFindingByFingerprintParams{
 			Fingerprint: f.Fingerprint,
@@ -326,6 +361,9 @@ func (fr *FindingRegistry) PersistFindings(ctx context.Context, db database.Quer
 			}).Debug("PersistFindings: semantic dedup — skipping cross-subtask duplicate")
 			continue
 		}
+
+		// SURGEON Fix #4: Final validation before DB insert — defense-in-depth
+		f.Endpoint = validateEndpoint(f.Endpoint)
 
 		var subtaskID sql.NullInt64
 		if f.SubtaskID != nil {
@@ -912,27 +950,165 @@ func classifyEvidenceType(toolName string) EvidenceType {
 	}
 }
 
-// sanitizeEndpoint strips shell-style template variables (${port}, $path, etc.),
-// trailing backslashes, and other artifacts the LLM may inject into endpoints.
-// This prevents raw template strings like "https://example.com:${port}${path}\"
-// from entering the findings database.
+// sanitizeEndpoint strips shell-style template variables, trailing artifacts,
+// credentials, markdown formatting, and multiline content from endpoint strings.
+// Ensures the endpoint field contains ONLY a clean URL or path.
+//
+// SURGEON Fix #4: Enhanced sanitization to prevent credentials, API keys,
+// and markdown artifacts from leaking into the findings database.
 func sanitizeEndpoint(endpoint string) string {
 	ep := strings.TrimSpace(endpoint)
 	if ep == "" {
 		return ""
 	}
-	// Remove shell-style template variables: ${port}, ${path}, $port, $path
+
+	// Step 1: Remove markdown formatting artifacts
+	ep = markdownCleanRegex.ReplaceAllString(ep, "")
+
+	// Step 2: Take only the first line (prevent multiline content)
+	if idx := strings.IndexByte(ep, '\n'); idx != -1 {
+		ep = ep[:idx]
+	}
+
+	// Step 3: Extract the URL portion — stop at first space, parenthesis,
+	// or credential-indicator after the URL.
+	// If the string contains a URL, extract just the URL.
+	if urlMatch := endpointURLExtractRegex.FindString(ep); urlMatch != "" {
+		ep = urlMatch
+	} else {
+		// No URL found — might be a bare path like /api/users/123
+		// Take content up to first space or parenthesis
+		if idx := strings.IndexAny(ep, " \t("); idx != -1 {
+			ep = ep[:idx]
+		}
+	}
+
+	// Step 4: Remove shell-style template variables: ${port}, ${path}, $port, $path
 	ep = shellVarRegex.ReplaceAllString(ep, "")
-	// Remove trailing backslashes (common LLM artifact)
+
+	// Step 5: Remove trailing backslashes (common LLM artifact)
 	ep = strings.TrimRight(ep, "\\")
-	// Remove trailing colons left after stripping :${port}
+
+	// Step 6: Remove trailing colons left after stripping :${port}
 	ep = strings.TrimRight(ep, ":")
-	// Clean up any double slashes in path (but preserve ://)
+
+	// Step 7: Clean up any triple+ slashes in path (but preserve ://)
 	for strings.Contains(ep, "///") {
 		ep = strings.ReplaceAll(ep, "///", "//")
 	}
+
+	// Step 8: Final credential scrub — if anything credential-like leaked through,
+	// truncate at the credential boundary
+	ep = credentialBoundaryRegex.ReplaceAllString(ep, "")
+
+	// Step 9: Remove trailing punctuation that's not part of a URL
+	ep = strings.TrimRight(ep, " \t,;|>")
+
 	return strings.TrimSpace(ep)
 }
+
+// validateEndpoint enforces strict format rules on the endpoint field:
+// - Must be a valid URL (with scheme) or a relative path starting with /
+// - Must not contain embedded credentials, tokens, or markdown
+// - Must not exceed 2048 characters
+// - Must be single-line
+//
+// Returns the cleaned endpoint, or empty string if the input is irrecoverable.
+//
+// SURGEON Fix #4: Strict validation as a defense-in-depth layer.
+func validateEndpoint(endpoint string) string {
+	// First apply sanitization
+	ep := sanitizeEndpoint(endpoint)
+	if ep == "" {
+		return ""
+	}
+
+	// Length check — URLs shouldn't be longer than 2048 chars
+	if len(ep) > 2048 {
+		ep = ep[:2048]
+	}
+
+	// Must be single-line
+	if strings.ContainsAny(ep, "\n\r") {
+		// Take first line only
+		lines := strings.SplitN(ep, "\n", 2)
+		ep = strings.TrimSpace(lines[0])
+	}
+
+	// Validate format: must be a URL or a path
+	isURL := strings.HasPrefix(ep, "http://") || strings.HasPrefix(ep, "https://")
+	isPath := strings.HasPrefix(ep, "/")
+	isHostPort := hostPortRegex.MatchString(ep)
+
+	if !isURL && !isPath && !isHostPort {
+		// Not a recognizable endpoint format — try to extract a URL
+		if urlMatch := endpointURLExtractRegex.FindString(ep); urlMatch != "" {
+			return urlMatch
+		}
+		// Cannot salvage — return empty
+		logrus.WithField("raw_endpoint", truncateString(ep, 200)).
+			Warn("SURGEON-4: endpoint failed validation — discarding")
+		return ""
+	}
+
+	// Credential detection — reject if obvious credentials are embedded
+	if containsCredentialPattern(ep) {
+		// Try to extract just the URL portion before the credential
+		if urlMatch := endpointURLExtractRegex.FindString(ep); urlMatch != "" {
+			return urlMatch
+		}
+		logrus.WithField("raw_endpoint", truncateString(ep, 200)).
+			Warn("SURGEON-4: endpoint contains credentials — truncating to URL only")
+		return ""
+	}
+
+	return ep
+}
+
+// containsCredentialPattern checks if a string contains obvious credential patterns.
+func containsCredentialPattern(s string) bool {
+	lower := strings.ToLower(s)
+	credPatterns := []string{
+		"password", "passwd", "pwd",
+		"api_key", "apikey", "api-key",
+		"secret", "token",
+		"anon key", "anon_key",
+		"bearer ", "authorization:",
+	}
+	for _, p := range credPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	// Check for JWT tokens (eyJ...)
+	if strings.Contains(s, "eyJ") && len(s) > 50 {
+		return true
+	}
+	return false
+}
+
+// markdownCleanRegex strips common markdown artifacts from endpoint strings.
+var markdownCleanRegex = regexp.MustCompile(`(?:\*{1,2}|#{1,6}|` + "`" + `|~{2,3})`)
+
+// endpointURLExtractRegex matches a URL (scheme + authority + optional path/query).
+// Stops at whitespace, parentheses, or common credential delimiters.
+var endpointURLExtractRegex = regexp.MustCompile(
+	`https?://[^\s<>()"'` + "`" + `]+`,
+)
+
+// credentialBoundaryRegex matches patterns that indicate the start of credential
+// data appended after a URL. Truncates everything from the match onward.
+var credentialBoundaryRegex = regexp.MustCompile(
+	`(?i)\s*(?:` +
+		`\((?:anon|api|auth|bearer|token|key|secret|password|cred)` + // (Anon Key: ...
+		`|(?:anon|api|auth|bearer|token|key|secret|password|cred)\s*[:=]` + // token: xxx, key=xxx
+		`|eyJ[A-Za-z0-9_-]{10,}` + // JWT tokens (start with eyJ)
+		`|[A-Za-z0-9+/]{40,}={0,2}` + // Long base64 strings (likely tokens)
+		`).*$`,
+)
+
+// hostPortRegex matches host:port patterns like "api.example.com:8443"
+var hostPortRegex = regexp.MustCompile(`^[a-zA-Z0-9][-a-zA-Z0-9.]*:\d{1,5}(?:/.*)?$`)
 
 // shellVarRegex matches shell-style template variables like ${port}, $path, ${HOST}
 var shellVarRegex = regexp.MustCompile(`\$\{?\w+\}?`)

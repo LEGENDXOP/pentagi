@@ -233,7 +233,26 @@ func (fp *flowProvider) performAgentChain(
 		exploitState      = NewExploitDevelopmentState(fp.flowID)
 		evidenceCollector = NewEvidenceCollector(fp.flowID)
 		findingRegistry   = NewFindingRegistry(fp.flowID)
+	)
 
+	// SURGEON Fix #1: Pre-load existing DB findings into the in-memory registry
+	// so cross-subtask duplicates are caught immediately during extraction,
+	// not just at PersistFindings() time. This prevents the same vuln from being
+	// registered N times across N subtasks.
+	if fp.db != nil {
+		preloadCtx, preloadCancel := context.WithTimeout(ctx, 10*time.Second)
+		existingDBFindings, preloadErr := fp.db.GetFlowFindings(preloadCtx, fp.flowID)
+		preloadCancel()
+		if preloadErr != nil {
+			logrus.WithError(preloadErr).Warn("SURGEON-1: failed to pre-load DB findings for dedup (proceeding without)")
+		} else if len(existingDBFindings) > 0 {
+			findingRegistry.PreloadFromDB(existingDBFindings)
+			logrus.WithField("preloaded_findings", len(existingDBFindings)).
+				Info("SURGEON-1: pre-loaded DB findings into FindingRegistry for cross-subtask dedup")
+		}
+	}
+
+	var (
 		// Fix 3: Blocker tracker — detects WAF, auth gates, CAPTCHA, KYC, etc.
 		// and persists them in ExecutionState so the refiner can drop blocked subtasks.
 		blockerTracker = NewBlockerTracker()
@@ -267,6 +286,12 @@ func (fp *flowProvider) performAgentChain(
 		callsSinceLastDelegation    = 0
 		delegationResultReceived    = false
 		autoDoneWarningInjected     = false
+
+		// SURGEON Fix #2: Nested agent closure enforcement — tracks whether
+		// progressive warnings have been injected for depth>0 agents that are
+		// consuming their tool-call or time budget without calling the result tool.
+		nestedWarningInjected         = false
+		nestedCriticalWarningInjected = false
 
 		// Hard loop breaker: counts consecutive read-only tool calls.
 		// Resets on any write/execute/offensive/barrier tool call.
@@ -1751,6 +1776,144 @@ func (fp *flowProvider) performAgentChain(
 				}
 
 				return fmt.Errorf("fix13: subtask force-finished — agent did not call done after %d calls post-delegation", callsSinceLastDelegation)
+			}
+		}
+
+		// ── SURGEON Fix #2: Nested agent closure enforcement ──
+		// The primary agent (depth==0) has Fix 13's auto-done after delegation results,
+		// but nested agents (pentester, coder, etc. at depth>0) have NO progressive
+		// closure mechanism — only the hard timebox deadline. This fix injects escalating
+		// warnings based on hybrid urgency (max of time-used% and call-count%) and
+		// force-finishes the subtask at 95% to preserve partial results.
+		if depth > 0 && !wantToStop {
+			maxCalls := getMaxToolCallsPerSubtask()
+			callPct := float64(toolCallCount) / float64(maxCalls) * 100.0
+
+			// Compute time-based urgency using the nested timeout for this depth.
+			// metricsStartTime was set at chain start; getNestedTimeout(depth) is
+			// the same value used to create this agent's context deadline.
+			nestedTimeout := getNestedTimeout(depth)
+			timeUsedPct := float64(time.Since(metricsStartTime)) / float64(nestedTimeout) * 100.0
+
+			// Hybrid urgency: whichever resource is more consumed drives the warnings.
+			urgencyPct := callPct
+			if timeUsedPct > urgencyPct {
+				urgencyPct = timeUsedPct
+			}
+
+			if urgencyPct >= 95 {
+				// ── Force-finish: nested agent consumed 95%+ of its budget ──
+				logger.WithFields(logrus.Fields{
+					"tool_call_count": toolCallCount,
+					"max_calls":       maxCalls,
+					"call_pct":        fmt.Sprintf("%.1f", callPct),
+					"time_used_pct":   fmt.Sprintf("%.1f", timeUsedPct),
+					"urgency_pct":     fmt.Sprintf("%.1f", urgencyPct),
+					"depth":           depth,
+				}).Error("SURGEON-2: force-finishing nested agent — 95% of budget consumed without calling result tool")
+
+				if subtaskID != nil {
+					partialResult := fmt.Sprintf(
+						"[SURGEON-2: Nested agent force-finished — consumed %.0f%% of budget without calling result tool]\n"+
+							"Tool calls: %d/%d (%.0f%%) | Time: %.0f%% of %s\n\n",
+						urgencyPct, toolCallCount, maxCalls, callPct,
+						timeUsedPct, nestedTimeout.Round(time.Second),
+					)
+					// Collect last 5 tool results as evidence of work done
+					partialResult += "Last 5 tool results:\n"
+					toolResultCount := 0
+					for i := len(chain) - 1; i >= 0 && toolResultCount < 5; i-- {
+						if chain[i].Role == llms.ChatMessageTypeTool {
+							for _, part := range chain[i].Parts {
+								if resp, ok := part.(llms.ToolCallResponse); ok {
+									snippet := resp.Content
+									if len(snippet) > 200 {
+										snippet = snippet[:200] + "..."
+									}
+									partialResult += fmt.Sprintf("- %s: %s\n", resp.Name, snippet)
+									toolResultCount++
+								}
+							}
+						}
+					}
+					// Append finding count if available
+					if findingRegistry != nil {
+						partialResult += fmt.Sprintf("\nFindings registered: %d\n", findingRegistry.GetFindingCount())
+					}
+					bgCtx, bgCancel := context.WithTimeout(context.Background(), 10*time.Second)
+					if _, dbErr := fp.db.UpdateSubtaskResult(bgCtx, database.UpdateSubtaskResultParams{
+						Result: partialResult,
+						ID:     *subtaskID,
+					}); dbErr != nil {
+						logger.WithError(dbErr).Error("SURGEON-2: failed to save partial results on nested agent force-finish")
+					}
+					bgCancel()
+				}
+
+				return fmt.Errorf("SURGEON-2: nested agent force-finished after %d tool calls (%.0f%% urgency) without calling result tool", toolCallCount, urgencyPct)
+
+			} else if urgencyPct >= 85 && !nestedCriticalWarningInjected {
+				nestedCriticalWarningInjected = true
+				remaining := nestedTimeout - time.Since(metricsStartTime)
+				if remaining < 0 {
+					remaining = 0
+				}
+				critMsg := fmt.Sprintf(
+					"[⛔ CRITICAL — NESTED AGENT CLOSURE REQUIRED]\n"+
+						"Tool calls: %d/%d (%.0f%%) | Time remaining: %s\n"+
+						"You MUST call your result tool (hack_result/code_result/maintenance_result) IMMEDIATELY.\n"+
+						"Do NOT start any new tests, scans, or exploits.\n"+
+						"The system will FORCE-FINISH this agent in %d more tool calls if you do not comply.",
+					toolCallCount, maxCalls, callPct,
+					remaining.Round(time.Second),
+					maxCalls-toolCallCount,
+				)
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: critMsg},
+					},
+				})
+				if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+					logger.WithError(err).Error("SURGEON-2: failed to update msg chain after critical nested warning")
+				}
+				logger.WithFields(logrus.Fields{
+					"tool_call_count": toolCallCount,
+					"urgency_pct":     fmt.Sprintf("%.1f", urgencyPct),
+					"depth":           depth,
+				}).Warn("SURGEON-2: injected CRITICAL nested agent closure warning")
+
+			} else if urgencyPct >= 70 && !nestedWarningInjected {
+				nestedWarningInjected = true
+				remaining := nestedTimeout - time.Since(metricsStartTime)
+				if remaining < 0 {
+					remaining = 0
+				}
+				warnMsg := fmt.Sprintf(
+					"[⚠️ NESTED AGENT TIME WARNING]\n"+
+						"Tool calls: %d/%d (%.0f%%) | Time remaining: %s\n"+
+						"Begin wrapping up your work:\n"+
+						"1. Save any remaining findings to /work/FINDINGS.md\n"+
+						"2. Prepare your result summary\n"+
+						"3. Call your result tool (hack_result/code_result/maintenance_result)\n"+
+						"Do NOT start new long-running scans or exploits.",
+					toolCallCount, maxCalls, callPct,
+					remaining.Round(time.Second),
+				)
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: warnMsg},
+					},
+				})
+				if err := fp.updateMsgChain(ctx, chainID, chain, rollLastUpdateTime()); err != nil {
+					logger.WithError(err).Error("SURGEON-2: failed to update msg chain after nested warning")
+				}
+				logger.WithFields(logrus.Fields{
+					"tool_call_count": toolCallCount,
+					"urgency_pct":     fmt.Sprintf("%.1f", urgencyPct),
+					"depth":           depth,
+				}).Warn("SURGEON-2: injected nested agent closure warning at 70%")
 			}
 		}
 
