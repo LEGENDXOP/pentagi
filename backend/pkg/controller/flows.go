@@ -87,6 +87,11 @@ func NewFlowController(
 	flowCtrl := NewFlowControlManager()
 
 	// Initialize Master Agent supervisor if enabled
+	logrus.WithFields(logrus.Fields{
+		"master_agent_enabled": cfg.MasterAgentEnabled,
+		"master_agent_interval": cfg.MasterAgentInterval,
+		"master_agent_model": cfg.MasterAgentModel,
+	}).Info("master agent config values")
 	var maSupervisor *masteragent.Supervisor
 	if cfg.MasterAgentEnabled {
 		maCfg := masteragent.MasterAgentConfig{
