@@ -64,10 +64,36 @@ func NewAgent(
 	}
 }
 
+// isFlowTerminal checks the flow status in the DB and returns true if the flow
+// is no longer active (finished, failed, or created). This is a cheap safety net
+// to avoid expensive data gathering and LLM calls on dead flows.
+func (a *Agent) isFlowTerminal(ctx context.Context) (bool, string) {
+	flow, err := a.db.GetFlow(ctx, a.flowID)
+	if err != nil {
+		a.logger.WithError(err).Warn("failed to check flow status (terminal check), assuming non-terminal")
+		return false, ""
+	}
+	switch flow.Status {
+	case database.FlowStatusFinished, database.FlowStatusFailed, database.FlowStatusCreated:
+		return true, string(flow.Status)
+	default:
+		return false, ""
+	}
+}
+
 // RunCycle executes a single supervision cycle: gather → analyze → decide → act.
 func (a *Agent) RunCycle(ctx context.Context) error {
 	cycle := a.state.IncrementCycle()
 	a.logger.WithField("cycle", cycle).Info("starting master agent cycle")
+
+	// 0. Early terminal check — cheap DB query to avoid wasting LLM calls on dead flows
+	if terminal, status := a.isFlowTerminal(ctx); terminal {
+		a.logger.WithFields(logrus.Fields{
+			"cycle":  cycle,
+			"status": status,
+		}).Info("flow is terminal before cycle, skipping entirely")
+		return nil
+	}
 
 	// 1. Gather flow data
 	data, err := a.gatherFlowData(ctx)

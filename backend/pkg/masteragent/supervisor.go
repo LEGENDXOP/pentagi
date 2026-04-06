@@ -134,13 +134,26 @@ func (s *Supervisor) runLoop(ctx context.Context, flowID int64, agent *Agent) {
 	defer ticker.Stop()
 
 	for {
+		// Pre-cycle terminal check — avoid RunCycle entirely if flow is already dead.
+		// This catches flows that were aborted/finished between ticks.
+		flow, err := s.db.GetFlow(ctx, flowID)
+		if err != nil {
+			logger.WithError(err).Warn("failed to check flow status before cycle")
+		} else if flow.Status == database.FlowStatusFinished || flow.Status == database.FlowStatusFailed || flow.Status == database.FlowStatusCreated {
+			logger.WithField("status", flow.Status).Info("flow is terminal before cycle, stopping master agent")
+			s.mx.Lock()
+			delete(s.agents, flowID)
+			s.mx.Unlock()
+			return
+		}
+
 		// Run a cycle
 		if err := agent.RunCycle(ctx); err != nil {
 			logger.WithError(err).Error("master agent cycle failed")
 		}
 
-		// Check if the flow has ended (terminal state)
-		flow, err := s.db.GetFlow(ctx, flowID)
+		// Post-cycle terminal check — stop if flow ended during the cycle.
+		flow, err = s.db.GetFlow(ctx, flowID)
 		if err != nil {
 			logger.WithError(err).Warn("failed to check flow status after cycle")
 		} else if flow.Status == database.FlowStatusFinished || flow.Status == database.FlowStatusFailed {
