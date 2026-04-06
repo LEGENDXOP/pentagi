@@ -229,6 +229,11 @@ type Config struct {
 	TelegramChatID       string `env:"TELEGRAM_CHAT_ID"`
 	TelegramNotify       bool   `env:"TELEGRAM_NOTIFY" envDefault:"false"`
 	TelegramPollInterval int    `env:"TELEGRAM_POLL_INTERVAL" envDefault:"2"` // minutes between FINDINGS.md polls
+
+	// Master Agent (standalone internal supervisor)
+	MasterAgentEnabled  bool   `env:"MASTER_AGENT" envDefault:"false"`
+	MasterAgentInterval int    `env:"MASTER_AGENT_INTERVAL" envDefault:"480"` // seconds between cycles
+	MasterAgentModel    string `env:"MASTER_AGENT_MODEL" envDefault:"claude-sonnet-4-20250514"`
 }
 
 func NewConfig() (*Config, error) {

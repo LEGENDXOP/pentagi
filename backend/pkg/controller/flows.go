@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"pentagi/pkg/config"
 	"pentagi/pkg/database"
 	"pentagi/pkg/docker"
 	"pentagi/pkg/graph/subscriptions"
+	"pentagi/pkg/masteragent"
 	"pentagi/pkg/notifications"
 	"pentagi/pkg/providers"
 	"pentagi/pkg/providers/provider"
@@ -55,22 +57,23 @@ type FlowController interface {
 }
 
 type flowController struct {
-	db          database.Querier
-	mx          *sync.Mutex
-	cfg         *config.Config
-	flows       map[int64]FlowWorker
-	docker      docker.DockerClient
-	provs       providers.ProviderController
-	subs        subscriptions.SubscriptionsController
-	flowControl FlowControlManager
-	notifier    *notifications.NotificationManager
-	alc         AgentLogController
-	mlc         MsgLogController
-	aslc        AssistantLogController
-	slc         SearchLogController
-	tlc         TermLogController
-	vslc        VectorStoreLogController
-	sc          ScreenshotController
+	db              database.Querier
+	mx              *sync.Mutex
+	cfg             *config.Config
+	flows           map[int64]FlowWorker
+	docker          docker.DockerClient
+	provs           providers.ProviderController
+	subs            subscriptions.SubscriptionsController
+	flowControl     FlowControlManager
+	notifier        *notifications.NotificationManager
+	masterSupervisor *masteragent.Supervisor
+	alc             AgentLogController
+	mlc             MsgLogController
+	aslc            AssistantLogController
+	slc             SearchLogController
+	tlc             TermLogController
+	vslc            VectorStoreLogController
+	sc              ScreenshotController
 }
 
 func NewFlowController(
@@ -81,23 +84,45 @@ func NewFlowController(
 	subs subscriptions.SubscriptionsController,
 	notifier *notifications.NotificationManager,
 ) FlowController {
+	flowCtrl := NewFlowControlManager()
+
+	// Initialize Master Agent supervisor if enabled
+	var maSupervisor *masteragent.Supervisor
+	if cfg.MasterAgentEnabled {
+		maCfg := masteragent.MasterAgentConfig{
+			Enabled:            true,
+			Interval:           time.Duration(cfg.MasterAgentInterval) * time.Second,
+			Model:              cfg.MasterAgentModel,
+			AnthropicAPIKey:    cfg.AnthropicAPIKey,
+			AnthropicServerURL: cfg.AnthropicServerURL,
+			TelegramBotToken:   cfg.TelegramBotToken,
+			TelegramChatID:     cfg.TelegramChatID,
+		}
+		maSupervisor = masteragent.NewSupervisor(cfg, maCfg, db, NewFlowControlMasterAgentAdapter(flowCtrl), notifier)
+		logrus.WithFields(logrus.Fields{
+			"interval": maCfg.Interval.String(),
+			"model":    maCfg.Model,
+		}).Info("master agent supervisor initialized")
+	}
+
 	return &flowController{
-		db:          db,
-		mx:          &sync.Mutex{},
-		cfg:         cfg,
-		flows:       make(map[int64]FlowWorker),
-		docker:      docker,
-		provs:       provs,
-		subs:        subs,
-		flowControl: NewFlowControlManager(),
-		notifier:    notifier,
-		alc:         NewAgentLogController(db),
-		mlc:         NewMsgLogController(db),
-		aslc:        NewAssistantLogController(db),
-		slc:         NewSearchLogController(db),
-		tlc:         NewTermLogController(db),
-		vslc:        NewVectorStoreLogController(db),
-		sc:          NewScreenshotController(db),
+		db:               db,
+		mx:               &sync.Mutex{},
+		cfg:              cfg,
+		flows:            make(map[int64]FlowWorker),
+		docker:           docker,
+		provs:            provs,
+		subs:             subs,
+		flowControl:      flowCtrl,
+		notifier:         notifier,
+		masterSupervisor: maSupervisor,
+		alc:              NewAgentLogController(db),
+		mlc:              NewMsgLogController(db),
+		aslc:             NewAssistantLogController(db),
+		slc:              NewSearchLogController(db),
+		tlc:              NewTermLogController(db),
+		vslc:             NewVectorStoreLogController(db),
+		sc:               NewScreenshotController(db),
 	}
 }
 
@@ -144,6 +169,11 @@ func (fc *flowController) LoadFlows(ctx context.Context) error {
 		}
 
 		fc.flows[flow.ID] = fw
+
+		// Start Master Agent for running flows
+		if fc.masterSupervisor != nil && (flow.Status == database.FlowStatusRunning || flow.Status == database.FlowStatusWaiting) {
+			fc.masterSupervisor.StartForFlow(flow.ID)
+		}
 	}
 
 	return nil
@@ -190,6 +220,11 @@ func (fc *flowController) CreateFlow(
 	}
 
 	fc.flows[fw.GetFlowID()] = fw
+
+	// Start Master Agent for this flow
+	if fc.masterSupervisor != nil {
+		fc.masterSupervisor.StartForFlow(fw.GetFlowID())
+	}
 
 	return fw, nil
 }
@@ -458,6 +493,11 @@ func (fc *flowController) StopFlow(ctx context.Context, flowID int64) error {
 		return ErrFlowNotFound
 	}
 
+	// Stop Master Agent for this flow
+	if fc.masterSupervisor != nil {
+		fc.masterSupervisor.StopForFlow(flowID)
+	}
+
 	err := flow.Stop(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to stop flow %d: %w", flowID, err)
@@ -473,6 +513,11 @@ func (fc *flowController) FinishFlow(ctx context.Context, flowID int64) error {
 	flow, ok := fc.flows[flowID]
 	if !ok {
 		return ErrFlowNotFound
+	}
+
+	// Stop Master Agent for this flow
+	if fc.masterSupervisor != nil {
+		fc.masterSupervisor.StopForFlow(flowID)
 	}
 
 	err := flow.Finish(ctx)
