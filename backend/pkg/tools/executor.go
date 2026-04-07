@@ -33,7 +33,7 @@ const maxArgValueLength = 1024 // 1 KB limit for argument values
 
 // Default tool call timeouts (seconds)
 const (
-	defaultToolCallTimeoutAgent   = 1200 // Fix Issue-11: reduced from 2700 (45 min) to 1200 (20 min) — 45 min was excessive for nested agents
+	defaultToolCallTimeoutAgent   = 2700 // 45 min — must be >= nestedTimeoutDepth1 (45 min) in performer.go because mergedContext takes min(parent, nested). The nested timeout system (45/25/15 min per depth) handles per-depth time management.
 	defaultToolCallTimeoutDefault = 300  // 5 min for other tools (terminal, browser, etc.)
 	defaultToolCallTimeoutNuclei  = 720  // Fix Issue-4: dedicated nuclei timeout (12 min) — longer than default 5 min but shorter than agent
 )

@@ -796,6 +796,10 @@ func (fw *flowWorker) worker() {
 		}
 	}
 
+	if fw.checkAndFinishIfDone() {
+		return
+	}
+
 	// process user input in regular job
 	for flin := range fw.input {
 		if task, err := fw.processInput(flin); err != nil {
@@ -811,7 +815,79 @@ func (fw *flowWorker) worker() {
 		} else {
 			getLogger(flin.input, task).Info("user input processed")
 		}
+
+		if fw.checkAndFinishIfDone() {
+			return
+		}
 	}
+}
+
+// checkAndFinishIfDone checks whether all tasks in the flow have completed.
+// If so, it performs full flow cleanup (assistants, zombie toolcalls, Docker
+// containers) and signals the worker to exit.  We cannot call fw.Finish()
+// directly because we are running inside a goroutine tracked by fw.wg —
+// Finish() → finish() → wg.Wait() would deadlock.  Instead we perform the
+// cleanup steps inline and cancel/close so the worker and watchdog exit
+// naturally.
+func (fw *flowWorker) checkAndFinishIfDone() bool {
+	tasks := fw.tc.ListTasks(fw.ctx)
+	if len(tasks) == 0 {
+		return false
+	}
+
+	for _, task := range tasks {
+		if !task.IsCompleted() {
+			return false
+		}
+	}
+
+	fw.logger.Info("all tasks completed — performing inline flow cleanup")
+
+	// Use a background context for cleanup so it isn't cancelled prematurely.
+	cleanupCtx := context.Background()
+
+	// Finish incomplete tasks (should be none, but belt-and-suspenders).
+	for _, task := range tasks {
+		if !task.IsCompleted() {
+			if err := task.Finish(cleanupCtx); err != nil {
+				fw.logger.WithError(err).Errorf("cleanup: failed to finish task %d", task.GetTaskID())
+			}
+		}
+	}
+
+	// Finish assistants.
+	fw.awsMX.Lock()
+	for _, aw := range fw.aws {
+		if err := aw.Finish(cleanupCtx); err != nil {
+			fw.logger.WithError(err).Errorf("cleanup: failed to finish assistant %d", aw.GetAssistantID())
+		}
+	}
+	fw.awsMX.Unlock()
+
+	// Zombie toolcall cleanup.
+	if err := fw.flowCtx.DB.FailRunningToolcallsByFlow(
+		cleanupCtx,
+		"flow finished: all tasks completed",
+		fw.flowCtx.FlowID,
+	); err != nil {
+		fw.logger.WithError(err).Warn("cleanup: failed to clean up zombie toolcalls")
+	}
+
+	// Release Docker containers / executor resources.
+	if err := fw.flowCtx.Executor.Release(cleanupCtx); err != nil {
+		fw.logger.WithError(err).Error("cleanup: failed to release executor resources")
+	}
+
+	// Set final status.
+	if err := fw.SetStatus(cleanupCtx, database.FlowStatusFinished); err != nil {
+		fw.logger.WithError(err).Error("cleanup: failed to set flow status to finished")
+	}
+
+	// Cancel context and close input so worker + watchdog exit cleanly.
+	fw.cancel()
+	fw.closeOnce.Do(func() { close(fw.input) })
+
+	return true
 }
 
 func (fw *flowWorker) processInput(flin flowInput) (TaskWorker, error) {

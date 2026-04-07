@@ -261,9 +261,15 @@ func (wd *flowWatchdog) checkFlowCompletion(ctx context.Context) {
 		}
 	}
 
-	// Note: We don't force the flow to "completed" here because the flow
-	// is legitimately waiting for new user input after tasks finish.
-	// The flow status is correctly "waiting" — the key fix is cleaning up zombies.
+	// All tasks done — trigger inline flow cleanup.
+	// We cannot call fw.Finish() from the watchdog because the watchdog
+	// goroutine is tracked by fw.wg and Finish() → finish() → wg.Wait()
+	// would deadlock.  Use the worker's checkAndFinishIfDone() which
+	// performs cleanup inline and cancels the context so both worker and
+	// watchdog exit cleanly.
+	if wd.fw.checkAndFinishIfDone() {
+		wd.logger.Info("flow watchdog: flow completion triggered successfully")
+	}
 }
 
 // isWatchdogEnabled checks the FLOW_WATCHDOG_ENABLED env var (default true).

@@ -581,13 +581,14 @@ func (rd *repeatingDetector) clearCallArguments(toolCall *llms.FunctionCall) llm
 
 	delete(v, "message")
 
-	// For delegation tools, strip the "question" field so that repeated
-	// delegation attempts (with different phrasings) hash to the same key.
-	// This allows the repeating detector to catch delegation loops where
-	// the agent retries with rephrased questions.
+	// For delegation tools, we keep "question" because it contains the unique
+	// task description that differentiates legitimate calls. Only "message"
+	// (the large identical prompt template) is stripped above. Without
+	// "question", all calls hash identically (e.g. 'coder{}'), which triggers
+	// the repeating detector after just 3 calls and blocks all subsequent use.
 	switch toolCall.Name {
 	case "coder", "installer", "maintenance", "pentester":
-		delete(v, "question")
+		// "question" preserved intentionally — see comment above
 	}
 
 	canonical, err := json.Marshal(v)
