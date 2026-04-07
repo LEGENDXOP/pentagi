@@ -277,7 +277,11 @@ func (n *nucleiTool) buildCommand(action NucleiScanAction) string {
 	return strings.Join(parts, " ")
 }
 
-// execInContainer runs a command inside the primary container and returns stdout
+// execInContainer runs a command inside the primary container and returns stdout.
+// Fix Issue-4: Added context-aware timeout alignment and process kill on cancellation.
+// The scanner.Scan() loop can block indefinitely because Docker exec attach readers
+// don't respect Go context cancellation. We use a goroutine + select pattern to
+// unblock on timeout, and explicitly kill the nuclei process inside the container.
 func (n *nucleiTool) execInContainer(ctx context.Context, containerName, command string) (string, error) {
 	isRunning, err := n.dockerClient.IsContainerRunning(ctx, n.containerLID)
 	if err != nil {
@@ -287,7 +291,19 @@ func (n *nucleiTool) execInContainer(ctx context.Context, containerName, command
 		return "", fmt.Errorf("container is not running")
 	}
 
+	// Fix Issue-4: Respect parent context deadline. If the parent (executor tool timeout)
+	// has a shorter deadline than nuclei's internal timeout, use the parent's with a
+	// 30-second cleanup buffer. Minimum viable scan time is 2 minutes.
 	timeout := nucleiDefaultTimeout + nucleiExtraTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		parentRemaining := time.Until(deadline)
+		if parentRemaining < timeout {
+			timeout = parentRemaining - 30*time.Second // leave 30s for cleanup
+			if timeout < 2*time.Minute {
+				timeout = 2 * time.Minute // minimum viable scan time
+			}
+		}
+	}
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -310,18 +326,58 @@ func (n *nucleiTool) execInContainer(ctx context.Context, containerName, command
 	if err != nil {
 		return "", fmt.Errorf("failed to attach to nuclei exec process: %w", err)
 	}
-	defer resp.Close()
 
-	var buf strings.Builder
-	scanner := bufio.NewScanner(resp.Reader)
-	scanner.Buffer(make([]byte, 64*1024), nucleiMaxOutputSize)
-	for scanner.Scan() {
-		if buf.Len() > nucleiMaxOutputSize {
-			buf.WriteString("\n[OUTPUT TRUNCATED: exceeded size limit]")
-			break
+	// Fix Issue-4: Start a goroutine that kills the nuclei process when context is cancelled.
+	// Docker exec attach readers don't respect context cancellation, so scanner.Scan()
+	// would block indefinitely without this. We use pkill to kill the process inside
+	// the container (NOT ContainerExecResize which only resizes the TTY).
+	go func() {
+		<-execCtx.Done()
+		// Kill the nuclei process by name inside the container
+		killCtx, killCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer killCancel()
+		killCmd := []string{"sh", "-c", "pkill -9 -f nuclei 2>/dev/null || true"}
+		killExec, killErr := n.dockerClient.ContainerExecCreate(killCtx, containerName, container.ExecOptions{
+			Cmd:          killCmd,
+			AttachStdout: true,
+			AttachStderr: true,
+		})
+		if killErr == nil {
+			// Use Attach to start the exec (Start is not in the DockerClient interface)
+			killResp, attachErr := n.dockerClient.ContainerExecAttach(killCtx, killExec.ID, container.ExecAttachOptions{})
+			if attachErr == nil {
+				killResp.Close()
+			}
 		}
-		buf.WriteString(scanner.Text())
-		buf.WriteString("\n")
+		// Close the reader to unblock scanner.Scan()
+		resp.Close()
+	}()
+
+	// Fix Issue-4: Run scanner in a goroutine with select to unblock on context cancellation.
+	var buf strings.Builder
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		scanner := bufio.NewScanner(resp.Reader)
+		scanner.Buffer(make([]byte, 64*1024), nucleiMaxOutputSize)
+		for scanner.Scan() {
+			if buf.Len() > nucleiMaxOutputSize {
+				buf.WriteString("\n[OUTPUT TRUNCATED: exceeded size limit]")
+				break
+			}
+			buf.WriteString(scanner.Text())
+			buf.WriteString("\n")
+		}
+	}()
+
+	select {
+	case <-doneCh:
+		// Scanner finished normally
+	case <-execCtx.Done():
+		// Context expired — the kill goroutine will close resp, unblocking scanner
+		<-doneCh // Wait for scanner goroutine to finish after reader closes
+		logrus.WithContext(ctx).Warn("nuclei exec timed out, process killed")
+		return buf.String(), fmt.Errorf("nuclei execution timed out after %v: %w", timeout, context.DeadlineExceeded)
 	}
 
 	// Check exec exit code

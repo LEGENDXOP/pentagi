@@ -19,6 +19,21 @@ import (
 	"github.com/vxcontrol/langchaingo/llms/reasoning"
 )
 
+// wrapAdviserWithGracefulDegradation wraps an advice handler so that runtime
+// errors are converted to result strings instead of propagating as Go errors.
+// Fix Issue-6: This ensures advice failures don't kill the calling agent chain
+// (coder, installer, pentester). Scoped per-performer per VERDICT direction.
+func wrapAdviserWithGracefulDegradation(handler tools.ExecutorHandler) tools.ExecutorHandler {
+	return func(ctx context.Context, name string, args json.RawMessage) (string, error) {
+		result, err := handler(ctx, name, args)
+		if err != nil {
+			logrus.WithContext(ctx).WithError(err).Warn("advice tool failed at runtime, returning error as result")
+			return fmt.Sprintf("The advice tool encountered an error: %s. Please proceed without it.", err.Error()), nil
+		}
+		return result, nil
+	}
+}
+
 func (fp *flowProvider) performTaskResultReporter(
 	ctx context.Context,
 	taskID, subtaskID *int64,
@@ -406,8 +421,17 @@ func (fp *flowProvider) performCoder(
 
 	adviser, err := fp.GetAskAdviceHandler(ctx, taskID, subtaskID)
 	if err != nil {
-		return "", fmt.Errorf("failed to get adviser handler: %w", err)
+		// Fix Issue-6: Per-performer wrapper — if advice handler setup fails,
+		// use a stub that returns a helpful message instead of failing the entire coder.
+		// VERDICT: scoped to per-performer, NOT a global executor change.
+		logrus.WithContext(ctx).WithError(err).Warn("advice handler unavailable for coder, using stub")
+		adviser = func(ctx context.Context, name string, args json.RawMessage) (string, error) {
+			return "The advice tool is currently unavailable. Please proceed without it.", nil
+		}
 	}
+	// Fix Issue-6: Wrap adviser to convert runtime errors to result strings,
+	// so advice failures don't kill the coder agent chain.
+	adviser = wrapAdviserWithGracefulDegradation(adviser)
 
 	installer, err := fp.GetInstallerHandler(ctx, taskID, subtaskID)
 	if err != nil {
@@ -490,8 +514,13 @@ func (fp *flowProvider) performInstaller(
 
 	adviser, err := fp.GetAskAdviceHandler(ctx, taskID, subtaskID)
 	if err != nil {
-		return "", fmt.Errorf("failed to get adviser handler: %w", err)
+		// Fix Issue-6: Per-performer wrapper for installer — same pattern as coder.
+		logrus.WithContext(ctx).WithError(err).Warn("advice handler unavailable for installer, using stub")
+		adviser = func(ctx context.Context, name string, args json.RawMessage) (string, error) {
+			return "The advice tool is currently unavailable. Please proceed without it.", nil
+		}
 	}
+	adviser = wrapAdviserWithGracefulDegradation(adviser)
 
 	memorist, err := fp.GetMemoristHandler(ctx, taskID, subtaskID)
 	if err != nil {
@@ -628,8 +657,13 @@ func (fp *flowProvider) performPentester(
 
 	adviser, err := fp.GetAskAdviceHandler(ctx, taskID, subtaskID)
 	if err != nil {
-		return "", fmt.Errorf("failed to get adviser handler: %w", err)
+		// Fix Issue-6: Per-performer wrapper for pentester — same pattern as coder.
+		logrus.WithContext(ctx).WithError(err).Warn("advice handler unavailable for pentester, using stub")
+		adviser = func(ctx context.Context, name string, args json.RawMessage) (string, error) {
+			return "The advice tool is currently unavailable. Please proceed without it.", nil
+		}
 	}
+	adviser = wrapAdviserWithGracefulDegradation(adviser)
 
 	coder, err := fp.GetCoderHandler(ctx, taskID, subtaskID)
 	if err != nil {
@@ -836,8 +870,15 @@ func (fp *flowProvider) performEnricher(
 		return "", fmt.Errorf("failed to get task enricher result: %w", err)
 	}
 
+	// Fix Issue-3: Return minimal enrichment instead of hard error when enricher
+	// agent chain completes without calling the enricher_result barrier tool.
+	// This happens when sub-tools (e.g. DuckDuckGo search) fail repeatedly.
 	if enricherResult.Result == "" {
-		return "", fmt.Errorf("agent chain completed without producing an enricher result")
+		logrus.WithContext(ctx).Warn("enricher agent chain completed without result, using minimal enrichment")
+		return fmt.Sprintf(
+			"(No additional context was available for enrichment. The original question should be addressed directly.)\nQuestion: %s",
+			question,
+		), nil
 	}
 
 	if agentCtx, ok := tools.GetAgentContext(ctx); ok {

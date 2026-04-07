@@ -236,8 +236,39 @@ func (tw *taskWorker) SetStatus(ctx context.Context, status database.TaskStatus)
 	case database.TaskStatusFinished, database.TaskStatusFailed:
 		tw.completed = true
 		tw.waiting = false
-		// the last task was done, set flow status to Waiting new user input
-		flowStatus = database.FlowStatusWaiting
+		// FIX Issue-7: Check if ALL tasks in this flow are done. If so,
+		// transition the flow to Finished instead of Waiting. Previously the
+		// flow stayed in Waiting forever after all tasks completed, causing
+		// the Master Agent supervisor to cycle indefinitely (62+ wasted LLM calls).
+		// For interactive flows, PutInput on a finished flow will reopen it.
+		allDone := true
+		flowTasks, dbErr := tw.taskCtx.DB.GetFlowTasks(ctx, tw.taskCtx.FlowID)
+		if dbErr != nil {
+			// On DB error, fall back to safe Waiting status
+			logrus.WithError(dbErr).WithField("flow_id", tw.taskCtx.FlowID).
+				Warn("Issue-7: failed to check flow tasks, falling back to Waiting")
+			allDone = false
+		} else {
+			for _, ft := range flowTasks {
+				if ft.ID == tw.taskCtx.TaskID {
+					continue // skip the current task — we already know its status
+				}
+				if ft.Status != database.TaskStatusFinished && ft.Status != database.TaskStatusFailed {
+					allDone = false
+					break
+				}
+			}
+		}
+		if allDone {
+			flowStatus = database.FlowStatusFinished
+			logrus.WithFields(logrus.Fields{
+				"flow_id":    tw.taskCtx.FlowID,
+				"task_id":    tw.taskCtx.TaskID,
+				"task_count": len(flowTasks),
+			}).Info("Issue-7: all tasks done — transitioning flow to Finished")
+		} else {
+			flowStatus = database.FlowStatusWaiting
+		}
 	default:
 		tw.mx.Unlock()
 		// status Created is not possible to set by this call

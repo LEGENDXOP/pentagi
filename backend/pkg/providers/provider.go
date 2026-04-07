@@ -1072,15 +1072,21 @@ func (fp *flowProvider) PerformAgentChain(ctx context.Context, taskID, subtaskID
 
 	// v5: If the agent chain completed without calling the barrier function
 	// (e.g., timebox force-finish), promote to Done if partial results exist.
+	// Fix Issue-10: Use marker-based checks ONLY (not len(Result) > 500 heuristic).
+	// VERDICT: length-based promotion is too fragile and could promote genuinely
+	// failed subtasks with long error messages. Only promote when explicit
+	// timebox/deadline markers are present.
 	result := PerformResult(performResultVal.Load())
 	if result == PerformResultError {
 		if st, dbErr := fp.db.GetSubtask(ctx, subtaskID); dbErr == nil && st.Result != "" {
-			if strings.Contains(st.Result, "[TIMEBOX EXPIRED") {
+			if strings.Contains(st.Result, "[TIMEBOX EXPIRED") ||
+				strings.Contains(st.Result, "[DEADLINE EXPIRED") {
 				result = PerformResultDone
 				logrus.WithContext(ctx).WithFields(logrus.Fields{
-					"subtask_id": subtaskID,
-					"task_id":    taskID,
-				}).Info("subtask timebox force-finished, promoting to Done")
+					"subtask_id":    subtaskID,
+					"task_id":       taskID,
+					"result_length": len(st.Result),
+				}).Info("subtask force-finished with partial results, promoting to Done")
 			}
 		}
 	}

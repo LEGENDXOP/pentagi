@@ -21,7 +21,7 @@ import (
 
 const (
 	duckduckgoMaxResults = 10
-	duckduckgoMaxRetries = 3
+	duckduckgoMaxRetries = 4 // Fix Issue-13: increased from 3 to 4 for resilience against transient DDG failures
 	duckduckgoSearchURL  = "https://html.duckduckgo.com/html/"
 	duckduckgoTimeout    = 30 * time.Second
 	duckduckgoUserAgent  = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -186,23 +186,34 @@ func (d *duckduckgo) search(ctx context.Context, query string, maxResults int) (
 			if attempt == duckduckgoMaxRetries-1 {
 				return "", fmt.Errorf("failed to execute search after %d attempts: %w", duckduckgoMaxRetries, err)
 			}
+			// Fix Issue-13: exponential backoff (2s, 4s, 8s, ...) instead of fixed 1s delay
 			select {
 			case <-ctx.Done():
 				return "", ctx.Err()
-			case <-time.After(time.Second):
+			case <-time.After(time.Duration(2<<uint(attempt)) * time.Second):
 			}
 			continue
 		}
 
-		if resp.StatusCode != http.StatusOK {
+		// Fix Issue-13: Accept any 2xx status code (200-299) instead of strict == 200.
+		// DuckDuckGo now returns HTTP 202 (Accepted) for some requests but the response
+		// body still contains valid search results.
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			logrus.WithFields(logrus.Fields{
+				"status_code": resp.StatusCode,
+				"body_len":    len(body),
+				"attempt":     attempt,
+			}).Warn("duckduckgo: non-2xx status code")
 			if attempt == duckduckgoMaxRetries-1 {
-				return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+				return "", fmt.Errorf("unexpected status code: %d (body: %s)", resp.StatusCode, string(body[:min(len(body), 200)]))
 			}
+			// Fix Issue-13: exponential backoff on non-2xx responses
 			select {
 			case <-ctx.Done():
 				return "", ctx.Err()
-			case <-time.After(time.Second):
+			case <-time.After(time.Duration(2<<uint(attempt)) * time.Second):
 			}
 			continue
 		}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -38,9 +39,13 @@ const (
 	defaultMaxToolCallsPerSubtask = 100              // hard cap per subtask (configurable via MAX_TOOL_CALLS_PER_SUBTASK)
 	defaultSubtaskDuration      = 90 * time.Minute   // default hard time limit per subtask (raised: 60m caused 78% expiry)
 	defaultMaxNestingDepth      = 4                   // primary_agent(0) → pentester(1) → coder(2) → installer(3) all allowed
-	nestedTimeoutDepth1         = 75 * time.Minute    // timeout for depth-1 nested agents (raised: must fit within parent timebox)
-	nestedTimeoutDepth2         = 50 * time.Minute    // timeout for depth-2 nested agents (raised: coder needs room for real work)
-	nestedTimeoutDepth3         = 30 * time.Minute    // timeout for depth-3 nested agents (raised: installer can run long commands)
+	// Fix Issue-11: Reduced nested timeouts from 75/50/30 to 45/25/15 min.
+	// VERDICT specified these values to maintain margin between tool timeout (20 min)
+	// and nested timeout at each depth level (depth-2 = 25 min > tool timeout = 20 min).
+	// The stall detector (Fix 11C) was REJECTED by VERDICT — not implemented.
+	nestedTimeoutDepth1         = 45 * time.Minute    // timeout for depth-1 nested agents
+	nestedTimeoutDepth2         = 25 * time.Minute    // timeout for depth-2 nested agents (coder)
+	nestedTimeoutDepth3         = 15 * time.Minute    // timeout for depth-3 nested agents (installer)
 
 	// toolCallLimitWarningBuffer is how many calls before the limit we inject
 	// a "wrap up" warning into the chain, giving the agent a chance to save findings.
@@ -280,6 +285,15 @@ func (fp *flowProvider) performAgentChain(
 		bootstrapCompleted = false
 		bootstrapCallCount = 0
 
+		// FIX Issue-2: Script failure abandonment threshold.
+		// Tracks consecutive script execution failures. After maxScriptFailures,
+		// an abandonment message is injected telling the LLM to use a different approach.
+		// This prevents the 30/33 min retry loop where a coder agent keeps tweaking
+		// the same broken Python script. Uses JSON-aware extraction per VERDICT
+		// (not crude string matching).
+		scriptFailureCount = 0
+		maxScriptFailures  = 3
+
 		// Fix 13: Auto-done safety net — tracks calls since the last
 		// delegation tool returned results. If the primary agent keeps
 		// working without calling done, we inject warnings then force-finish.
@@ -299,6 +313,16 @@ func (fp *flowProvider) performAgentChain(
 		readStreakWarnThreshold  = getReadStreakWarnThreshold()  // default: 5
 		readStreakBlockThreshold = getReadStreakBlockThreshold() // default: 8
 		readStreakForceThreshold = getReadStreakForceThreshold() // default: 15
+
+		// Fix Issue-5: Per-subtask tool circuit breaker to prevent retry storms.
+		// After 3 consecutive failures of the same tool, block further calls for 5 min.
+		toolCB = NewToolCircuitBreaker(3)
+
+		// FIX Issue-9: Write deduplicator prevents agents from writing identical
+		// content to the same file repeatedly (e.g., FINDINGS.md written 7x).
+		// Complements isWriteOperation() in helpers.go which exempts writes from
+		// the repeat detector — this catches same-content loops specifically.
+		writeDedup = NewWriteDeduplicator()
 	)
 
 	// Silence unused variable warnings for guard booleans (set inside loop).
@@ -1257,6 +1281,17 @@ func (fp *flowProvider) performAgentChain(
 				}
 			}
 
+			// FIX Issue-9: Check write deduplicator before executing tool calls.
+			// Blocks identical file writes (same path + same content hash).
+			var writeDedupIntercepted bool
+			var writeDedupResponse string
+			if writeDedup != nil && toolCall.FunctionCall != nil {
+				if msg, blocked := writeDedup.CheckWrite(funcName, toolCall.FunctionCall.Arguments); blocked {
+					writeDedupIntercepted = true
+					writeDedupResponse = msg
+				}
+			}
+
 			var response string
 			var err error
 			if v5Intercepted {
@@ -1265,8 +1300,10 @@ func (fp *flowProvider) performAgentChain(
 				response = budgetResponse
 			} else if memoristIntercepted {
 				response = memoristResponse
+			} else if writeDedupIntercepted {
+				response = writeDedupResponse
 			} else {
-				response, err = fp.execToolCall(ctx, chainID, idx, result, detector, executor, nTracker, terminalCache, knownData)
+				response, err = fp.execToolCall(ctx, chainID, idx, result, detector, executor, nTracker, terminalCache, knownData, toolCB)
 			}
 
 			// v14: Track memorist unavailability at the flow level.
@@ -1534,6 +1571,21 @@ func (fp *flowProvider) performAgentChain(
 				}
 			}
 
+			// FIX Issue-12 RC3: Extract findings from WRITE operations (tool arguments).
+			// When the agent writes to FINDINGS.md via heredoc or file tool, the
+			// [VULN_TYPE:] tags are in the CONTENT being written, not in stdout.
+			// This captures findings at write-time, eliminating reliance on deferred sync.
+			if findingRegistry != nil && toolCall.FunctionCall != nil {
+				writtenContent := extractWrittenFindingsContent(funcName, toolCall.FunctionCall.Arguments)
+				if writtenContent != "" && findingsMDVulnTypeRegex.MatchString(writtenContent) {
+					newCount := findingRegistry.ParseAndSyncFindingsMD(truncateString(writtenContent, 32768), subtaskID)
+					if newCount > 0 {
+						logger.WithField("new_findings", newCount).
+							Info("Issue-12 RC3: extracted findings from FINDINGS.md write operation")
+					}
+				}
+			}
+
 			// Sprint 3: Exploit trigger — track failures for custom exploit development.
 			if exploitState != nil && toolCall.FunctionCall != nil && isToolCallFailure(response) {
 				if trigger := exploitState.RecordToolFailure(funcName, toolCall.FunctionCall.Arguments, response); trigger != nil {
@@ -1546,6 +1598,36 @@ func (fp *flowProvider) performAgentChain(
 					})
 					logger.WithField("endpoint", trigger.Endpoint).
 						Info("exploit development triggered for failing endpoint")
+				}
+			}
+
+			// FIX Issue-2: Track script execution failures. When consecutive failures
+			// exceed maxScriptFailures, inject an abandonment message forcing the LLM
+			// to use a completely different approach (not just tweak the same script).
+			if funcName == "terminal" && toolCall.FunctionCall != nil && !v5Intercepted {
+				if isScriptExecution(toolCall.FunctionCall.Arguments) {
+					if isScriptFailure(response) {
+						scriptFailureCount++
+						if scriptFailureCount >= maxScriptFailures {
+							abandonMsg := fmt.Sprintf(
+								"⚠️ [SCRIPT FAILURE LIMIT: %d consecutive script executions have failed] "+
+									"ABANDON this approach entirely. Do NOT attempt another script. "+
+									"Use a completely different method — write results directly using terminal "+
+									"heredoc, use curl/wget directly, or call your result tool with what you have so far.",
+								scriptFailureCount,
+							)
+							chain = append(chain, llms.MessageContent{
+								Role: llms.ChatMessageTypeHuman,
+								Parts: []llms.ContentPart{
+									llms.TextContent{Text: abandonMsg},
+								},
+							})
+							logger.WithField("script_failures", scriptFailureCount).
+								Warn("Issue-2: script failure limit hit — injecting abandonment message")
+						}
+					} else {
+						scriptFailureCount = 0 // Reset on success
+					}
 				}
 			}
 
@@ -2203,6 +2285,7 @@ func (fp *flowProvider) execToolCall(
 	nTracker *nucleiTracker,
 	terminalCache *TerminalOutputCache,
 	knownData *knownDataTracker,
+	toolCB *ToolCircuitBreaker, // Fix Issue-5: per-subtask tool circuit breaker
 ) (string, error) {
 	var (
 		streamID int64
@@ -2344,15 +2427,35 @@ func (fp *flowProvider) execToolCall(
 		}
 	}
 
+	// Fix Issue-5: Circuit breaker check — block tools that have failed repeatedly.
+	// Placed before the retry loop per VERDICT direction.
+	if toolCB != nil {
+		if blocked, cbMsg := toolCB.Check(funcName); blocked {
+			logger.WithField("circuit_breaker", "blocked").Warn("tool blocked by circuit breaker")
+			return cbMsg, nil
+		}
+	}
+
 	var (
 		err      error
 		response string
 	)
 
-	for idx := 0; idx <= maxRetriesToCallFunction; idx++ {
-		if idx == maxRetriesToCallFunction {
+	// Fix Issue-5 (Fix 5B): Agent-type tools have their own internal retry logic,
+	// so outer retries are redundant and waste time. Reduce to 1 retry for agent tools.
+	maxRetries := maxRetriesToCallFunction
+	if tools.GetToolType(funcName) == tools.AgentToolType {
+		maxRetries = 1
+	}
+
+	for idx := 0; idx <= maxRetries; idx++ {
+		if idx == maxRetries {
 			err = fmt.Errorf("reached max retries to call function: %w", err)
 			logger.WithError(err).Error("failed to exec function")
+			// Fix Issue-5: Record failure in circuit breaker
+			if toolCB != nil {
+				toolCB.RecordFailure(funcName)
+			}
 			return "", fmt.Errorf("failed to exec function '%s': %w", funcName, err)
 		}
 
@@ -2387,6 +2490,10 @@ func (fp *flowProvider) execToolCall(
 				return "", fmt.Errorf("failed to fix tool call args: %w", err)
 			}
 		} else {
+			// Fix Issue-5: Record success in circuit breaker to reset failure counter
+			if toolCB != nil {
+				toolCB.RecordSuccess(funcName)
+			}
 			break
 		}
 	}
@@ -3281,4 +3388,178 @@ func isReadOnlyToolCall(funcName string, funcArgs string) bool {
 	default:
 		return false
 	}
+}
+
+// isScriptExecution returns true if a terminal tool call is executing a script
+// (Python, Node, Ruby, Perl, Bash/sh with a file argument).
+// FIX Issue-2: Uses JSON-aware extraction per VERDICT direction.
+func isScriptExecution(toolArgs string) bool {
+	var termArgs struct {
+		Input string `json:"input"`
+	}
+	if err := json.Unmarshal([]byte(toolArgs), &termArgs); err != nil {
+		return false
+	}
+	input := strings.TrimSpace(termArgs.Input)
+	if input == "" {
+		return false
+	}
+	// Extract primary command (before pipes)
+	primaryCmd := input
+	if idx := strings.IndexByte(primaryCmd, '|'); idx != -1 {
+		primaryCmd = strings.TrimSpace(primaryCmd[:idx])
+	}
+	lower := strings.ToLower(primaryCmd)
+	// Check for script interpreters as primary command
+	scriptPrefixes := []string{
+		"python3 ", "python ", "python3\n", "python\n",
+		"node ", "ruby ", "perl ",
+		"bash ", "sh ",
+	}
+	for _, prefix := range scriptPrefixes {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	// Check for running .py/.sh/.js files directly
+	scriptExtensions := []string{".py", ".sh", ".js", ".rb", ".pl"}
+	for _, ext := range scriptExtensions {
+		if strings.Contains(lower, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+// isScriptFailure returns true if a terminal response indicates a script execution
+// failure. Uses specific error patterns per VERDICT direction (NOT generic "error:").
+// FIX Issue-2: Only matches unambiguous failure indicators.
+func isScriptFailure(response string) bool {
+	if response == "" {
+		return false
+	}
+	lower := strings.ToLower(response)
+	// Python tracebacks — the most reliable indicator
+	if strings.Contains(lower, "traceback (most recent call last)") {
+		return true
+	}
+	// Specific Python/Node errors — not generic "error:"
+	specificErrors := []string{
+		"importerror:",
+		"modulenotfounderror:",
+		"syntaxerror:",
+		"nameerror:",
+		"typeerror:",
+		"valueerror:",
+		"attributeerror:",
+		"indentationerror:",
+		"filenotfounderror:",
+		"permissionerror:",
+		"oserror:",
+		"keyerror:",
+		"zerodivisionerror:",
+		"runtimeerror:",
+		// Node.js specific
+		"referenceerror:",
+		"cannot find module",
+		"syntaxerror: unexpected",
+	}
+	for _, pattern := range specificErrors {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	// Exit code indicators
+	exitPatterns := []string{
+		"exit code 1", "exit code 2", "exited with code 1",
+		"exited with code 2", "exit status 1", "exit status 2",
+		"returned non-zero",
+	}
+	for _, pattern := range exitPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractWrittenFindingsContent extracts the content being written to FINDINGS.md
+// from a tool call's arguments. Returns empty string if not a FINDINGS.md write.
+// FIX Issue-12 RC3: Captures findings at write-time to eliminate reliance on deferred sync.
+func extractWrittenFindingsContent(funcName, toolArgs string) string {
+	switch funcName {
+	case "file":
+		var action struct {
+			Action  string `json:"action"`
+			Path    string `json:"path"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal([]byte(toolArgs), &action); err == nil {
+			if action.Action == "update_file" && strings.Contains(strings.ToUpper(action.Path), "FINDINGS") {
+				return action.Content
+			}
+		}
+	case "terminal":
+		var termArgs struct {
+			Input string `json:"input"`
+		}
+		if err := json.Unmarshal([]byte(toolArgs), &termArgs); err == nil {
+			input := termArgs.Input
+			// Check if this is a write to FINDINGS.md (heredoc or redirect)
+			if strings.Contains(strings.ToUpper(input), "FINDINGS") &&
+				(strings.Contains(input, "<<") || strings.Contains(input, "cat >") || strings.Contains(input, "tee")) {
+				if heredocContent := extractFindingsHeredocContent(input); heredocContent != "" {
+					return heredocContent
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// findingsHeredocRegex matches heredoc delimiters with single quotes, double quotes, or no quotes.
+// FIX Issue-12 RC3 per VERDICT: Handle double-quoted delimiters (<<"EOF"), not just single-quoted.
+var findingsHeredocRegex = regexp.MustCompile(`<<-?\s*['"]?(\w+)['"]?\s*\n`)
+
+// extractFindingsHeredocContent extracts the body of a heredoc from a shell command.
+// E.g., from: cat > /work/FINDINGS.md << 'EOF'\ncontent here\nEOF
+// Returns: content here
+func extractFindingsHeredocContent(command string) string {
+	match := findingsHeredocRegex.FindStringSubmatch(command)
+	if len(match) < 2 {
+		return ""
+	}
+	delimiter := match[1]
+
+	// Find content between opening and closing delimiter
+	startIdx := strings.Index(command, match[0]) + len(match[0])
+	if startIdx >= len(command) {
+		return ""
+	}
+
+	// Find closing delimiter on its own line
+	content := command[startIdx:]
+	endPattern := "\n" + delimiter
+	endIdx := strings.Index(content, endPattern)
+	if endIdx == -1 {
+		// Try at end of string (delimiter without trailing newline)
+		if strings.HasSuffix(strings.TrimSpace(content), delimiter) {
+			endIdx = strings.LastIndex(content, delimiter)
+			if endIdx > 0 {
+				result := content[:endIdx]
+				if len(result) > 32768 {
+					result = result[:32768]
+				}
+				return result
+			}
+		}
+		return ""
+	}
+
+	// FIX Issue-12 RC3 per VERDICT: Content size guard (32KB max).
+	result := content[:endIdx]
+	if len(result) > 32768 {
+		result = result[:32768]
+	}
+	return result
 }

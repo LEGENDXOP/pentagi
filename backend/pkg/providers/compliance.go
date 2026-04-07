@@ -310,8 +310,11 @@ var knownAliases = map[string]string{
 // normalizeKey lowercases and trims the input, then resolves aliases.
 func normalizeKey(vulnType string) string {
 	key := strings.TrimSpace(strings.ToLower(vulnType))
-	// Replace common separators with underscore for uniform lookup.
+	// FIX Issue-12 RC2: Replace all common separators with underscore.
+	// The widened vulnTypeRegex now captures hyphens and spaces in tags
+	// (e.g., "command-injection" or "SQL Injection"), so we must normalize them.
 	key = strings.ReplaceAll(key, "-", "_")
+	key = strings.ReplaceAll(key, " ", "_")
 	if alias, ok := knownAliases[key]; ok {
 		return alias
 	}

@@ -60,7 +60,8 @@ var vulnTypePatterns = map[string]string{
 }
 
 // vulnTypeRegex matches [VULN_TYPE: <tag>] markers in subtask results.
-var vulnTypeRegex = regexp.MustCompile(`\[VULN_TYPE:\s*(\w+)\]`)
+// FIX Issue-12 RC2: Accept hyphens and spaces in tag names (LLMs deviate from canonical format).
+var vulnTypeRegex = regexp.MustCompile(`\[VULN_TYPE:\s*([\w]+(?:[- ][\w]+)*)\]`)
 
 // ExtractCrossFlowInsights processes raw cross-flow finding rows from the
 // database and produces sanitized insights suitable for prompt injection.

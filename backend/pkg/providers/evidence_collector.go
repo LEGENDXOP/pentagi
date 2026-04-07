@@ -217,7 +217,12 @@ func (fr *FindingRegistry) CheckAndRegister(
 		return nil, false // Exact fingerprint duplicate
 	}
 
-	// Semantic dedup: same vuln_type with empty-vs-populated endpoint
+	// FIX Issue-12 RC1: Semantic dedup based on generalized host+path, not just host.
+	// Previously, any two findings of the same vuln_type on the same host were deduped,
+	// even if they targeted completely different endpoints (e.g., /api/users vs /api/products).
+	// Now we use generalizeEndpoint() which preserves path structure while normalizing IDs,
+	// so /api/users/123 and /api/users/456 are still deduped (both become /api/users/{id})
+	// but /api/users and /api/products are treated as distinct findings.
 	normalizedVT := NormalizeVulnType(vulnType)
 	for i, existing := range fr.findings {
 		if existing.VulnType != normalizedVT {
@@ -225,11 +230,23 @@ func (fr *FindingRegistry) CheckAndRegister(
 		}
 		existingEP := normalizeEndpointForFingerprint(existing.Endpoint)
 		newEP := normalizeEndpointForFingerprint(endpoint)
+		existingGenEP := generalizeEndpoint(existingEP)
+		newGenEP := generalizeEndpoint(newEP)
 
-		// Case 1: One has empty endpoint, the other doesn't → same finding
-		// Case 2: Same host after normalization → same finding
-		isSemDupe := (existingEP == "" || newEP == "") ||
-			extractHost(existingEP) == extractHost(newEP)
+		var isSemDupe bool
+		if existingGenEP == "" && newGenEP == "" {
+			// Both vague → true duplicate
+			isSemDupe = true
+		} else if existingGenEP == "" && newGenEP != "" {
+			// Existing is vague, new has details → upgrade existing (mark as dupe, upgrade below)
+			isSemDupe = true
+		} else if existingGenEP != "" && newGenEP == "" {
+			// New is vague, existing has details → skip the vague one
+			isSemDupe = true
+		} else {
+			// Both have endpoints → compare generalized full endpoint (host+path)
+			isSemDupe = existingGenEP == newGenEP
+		}
 
 		if isSemDupe {
 			// Keep the more specific version (the one WITH an endpoint)
@@ -419,6 +436,9 @@ func (fr *FindingRegistry) PersistFindings(ctx context.Context, db database.Quer
 //
 // This mirrors the in-memory semantic dedup in CheckAndRegister but operates
 // against the DB state, catching cross-subtask duplicates.
+// isSemanticDBDuplicate checks whether a finding is a semantic duplicate of any
+// existing DB finding. FIX Issue-12 RC1: Uses generalizeEndpoint() for host+path
+// comparison instead of just extractHost(). This matches the in-memory dedup logic.
 func isSemanticDBDuplicate(f ReportFinding, existing []database.Finding) bool {
 	if len(existing) == 0 {
 		return false
@@ -426,7 +446,7 @@ func isSemanticDBDuplicate(f ReportFinding, existing []database.Finding) bool {
 
 	newVT := NormalizeVulnType(f.VulnType)
 	newEP := normalizeEndpointForFingerprint(f.Endpoint)
-	newHost := extractHost(newEP)
+	newGenEP := generalizeEndpoint(newEP)
 
 	for _, ex := range existing {
 		exVT := NormalizeVulnType(ex.VulnType)
@@ -435,15 +455,22 @@ func isSemanticDBDuplicate(f ReportFinding, existing []database.Finding) bool {
 		}
 
 		exEP := normalizeEndpointForFingerprint(ex.Endpoint)
+		exGenEP := generalizeEndpoint(exEP)
 
-		// Same vuln type + one endpoint empty → semantic duplicate
-		if exEP == "" || newEP == "" {
+		// Both vague → duplicate
+		if exGenEP == "" && newGenEP == "" {
 			return true
 		}
-
-		// Same vuln type + same host → semantic duplicate
-		exHost := extractHost(exEP)
-		if exHost != "" && newHost != "" && exHost == newHost {
+		// Existing vague, new specific → upgrade case (treated as dupe)
+		if exGenEP == "" && newGenEP != "" {
+			return true
+		}
+		// New vague, existing specific → skip vague
+		if exGenEP != "" && newGenEP == "" {
+			return true
+		}
+		// Both have endpoints → compare generalized full endpoint
+		if exGenEP == newGenEP {
 			return true
 		}
 	}
@@ -574,12 +601,18 @@ var findingsMDBlockRegex = regexp.MustCompile(
 //   ### [CRITICAL] [CONFIRMED] F-001: Title here
 //   [VULN_TYPE: sqli]
 //   - **Target:** https://example.com/api
-// It splits on ### headers that contain F-NNN patterns.
+// FIX Issue-12 RC2: Made more flexible per VERDICT direction.
+//   - Accepts ##, ###, #### heading levels (was: ### only)
+//   - Accepts zero or more [bracketed] groups (was: 1-2)
+//   - Accepts F-NNN or Finding-NNN numbering (not #NNN — too ambiguous per VERDICT)
 var findingsMDHeaderBlockRegex = regexp.MustCompile(
-	`(?m)^###\s+\[.+?\]\s+(?:\[.+?\]\s+)?F-\d+`,
+	`(?m)^#{2,4}\s+(?:\[.+?\]\s+)*(?:F-\d+|Finding[- ]\d+)`,
 )
 
-var findingsMDVulnTypeRegex = regexp.MustCompile(`\[VULN_TYPE:\s*(\w+)\]`)
+// FIX Issue-12 RC2: Accept hyphens and spaces in VULN_TYPE tags.
+// LLMs often write [VULN_TYPE: command-injection] or [VULN_TYPE: SQL Injection]
+// instead of the canonical [VULN_TYPE: command_injection].
+var findingsMDVulnTypeRegex = regexp.MustCompile(`\[VULN_TYPE:\s*([\w]+(?:[- ][\w]+)*)\]`)
 var findingsMDSeverityRegex = regexp.MustCompile(`(?i)(?:Severity:\s*|###\s*\[)(Critical|High|Medium|Low|Info)`)
 var findingsMDTargetRegex = regexp.MustCompile(`(?i)(?:Target:|\*\*Target:\*\*)\s*(.+)`)
 var findingsMDTitleRegex = regexp.MustCompile(`(?i)(?:Title:\s*|F-\d+:\s*)(.+)`)
@@ -712,12 +745,93 @@ func splitByHeaderBlocks(content string) []string {
 			end = locs[i+1][0]
 		}
 		block := content[start:end]
-		// Only include blocks that have a VULN_TYPE tag (required for registration)
+
+		// If block has explicit VULN_TYPE tag, include as-is
 		if findingsMDVulnTypeRegex.MatchString(block) {
 			blocks = append(blocks, block)
+			continue
 		}
+
+		// FIX Issue-12 RC2: Try to infer VULN_TYPE from block content keywords.
+		// Blocks without explicit tags are normally silently dropped, causing
+		// finding loss. This fallback injects a synthetic tag when possible.
+		if inferred := inferVulnTypeFromBlock(block); inferred != "" {
+			block = block + "\n[VULN_TYPE: " + inferred + "]"
+			blocks = append(blocks, block)
+			logrus.WithFields(logrus.Fields{
+				"inferred_type": inferred,
+				"block_preview": truncateString(block, 200),
+			}).Info("FINDINGS.md sync: inferred VULN_TYPE for block missing explicit tag")
+		}
+		// If inference fails, the block is still dropped (truly unrecoverable)
 	}
 	return blocks
+}
+
+// inferVulnTypeFromBlock tries to determine the vulnerability type from
+// a finding block's content when the [VULN_TYPE:] tag is missing.
+// Returns the canonical vuln type tag, or empty string if inference fails.
+//
+// FIX Issue-12 RC2: Per VERDICT, this is a last-resort fallback that only fires
+// for blocks already matched by findingsMDHeaderBlockRegex (confirmed findings).
+// Patterns are ordered most-specific first to avoid misclassification.
+func inferVulnTypeFromBlock(block string) string {
+	lower := strings.ToLower(block)
+
+	// Check against known patterns, most specific first
+	patterns := []struct {
+		keywords   []string
+		vulnType   string
+		confidence string // HIGH or LOW_CONFIDENCE — per VERDICT requirement
+	}{
+		{[]string{"sql injection", "sqli", "union select", "' or "}, "sqli", "HIGH"},
+		{[]string{"stored xss", "stored cross-site"}, "xss_stored", "HIGH"},
+		{[]string{"reflected xss", "reflected cross-site"}, "xss_reflected", "HIGH"},
+		{[]string{"dom xss", "dom-based xss", "dom based xss"}, "xss_dom", "HIGH"},
+		{[]string{"cross-site scripting", "xss"}, "xss_reflected", "HIGH"},
+		{[]string{"idor", "insecure direct object", "bola"}, "idor", "HIGH"},
+		{[]string{"authentication bypass", "auth bypass"}, "auth_bypass", "HIGH"},
+		{[]string{"privilege escalation", "privesc"}, "privilege_escalation", "HIGH"},
+		{[]string{"path traversal", "directory traversal", "lfi", "local file inclusion"}, "path_traversal", "HIGH"},
+		{[]string{"ssrf", "server-side request forgery"}, "ssrf", "HIGH"},
+		{[]string{"csrf", "cross-site request forgery"}, "csrf", "HIGH"},
+		{[]string{"command injection", "rce", "remote code execution", "os command"}, "command_injection", "HIGH"},
+		{[]string{"ssti", "server-side template injection", "template injection"}, "ssti", "HIGH"},
+		{[]string{"open redirect"}, "open_redirect", "HIGH"},
+		{[]string{"xxe", "xml external entity"}, "xxe", "HIGH"},
+		{[]string{"deserialization"}, "deserialization", "HIGH"},
+		{[]string{"account takeover"}, "account_takeover", "HIGH"},
+		{[]string{"jwt", "json web token"}, "jwt_manipulation", "HIGH"},
+		{[]string{"file upload", "unrestricted upload"}, "file_upload", "HIGH"},
+		{[]string{"mass assignment"}, "mass_assignment", "HIGH"},
+		{[]string{"race condition"}, "race_condition", "HIGH"},
+		// LOW_CONFIDENCE inferences — generic keywords per VERDICT requirement
+		{[]string{"information disclosure", "info disclosure", "data leak"}, "information_disclosure", "LOW_CONFIDENCE"},
+		{[]string{"sensitive data exposure", "data exposure"}, "sensitive_data_exposure", "LOW_CONFIDENCE"},
+		{[]string{"security misconfiguration", "misconfiguration"}, "security_misconfiguration", "LOW_CONFIDENCE"},
+		{[]string{"broken authentication", "broken auth"}, "broken_auth", "LOW_CONFIDENCE"},
+		{[]string{"cors misconfiguration", "cors"}, "cors_misconfiguration", "LOW_CONFIDENCE"},
+		{[]string{"missing rate limit", "rate limit"}, "missing_rate_limit", "LOW_CONFIDENCE"},
+		{[]string{"business logic"}, "business_logic", "LOW_CONFIDENCE"},
+		{[]string{"api abuse", "bfla", "broken function"}, "api_abuse", "LOW_CONFIDENCE"},
+	}
+
+	for _, p := range patterns {
+		for _, kw := range p.keywords {
+			if strings.Contains(lower, kw) {
+				if p.confidence == "LOW_CONFIDENCE" {
+					logrus.WithFields(logrus.Fields{
+						"keyword":    kw,
+						"vuln_type":  p.vulnType,
+						"confidence": "LOW_CONFIDENCE",
+					}).Warn("inferVulnTypeFromBlock: low-confidence inference — review recommended")
+				}
+				return p.vulnType
+			}
+		}
+	}
+
+	return ""
 }
 
 // ─── Report Generator ────────────────────────────────────────────────────────

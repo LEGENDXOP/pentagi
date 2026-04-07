@@ -53,7 +53,12 @@ const (
 	defaultFileReadCacheTTL  = 8 * time.Minute
 	maxFileReadEntries       = 100
 	maxFileReadCacheSize     = 64 * 1024 // 64 KB
-	defaultSoftThreshold     = 3
+	// FIX Issue-1: Reduced from 3 to 2. The second read now gets intercepted.
+	// Combined with checkReadCap (3 free reads per file), the effective behavior is:
+	// - Reads 1: passes InterceptTerminalRead (hitCount=1 < 2) → cache populated
+	// - Read 2: intercepted by InterceptTerminalRead (hitCount=2 >= 2) → cached returned
+	// checkReadCap independently allows 3 reads, but InterceptTerminalRead fires first.
+	defaultSoftThreshold     = 2
 	defaultHardThreshold     = 6
 	defaultWorkDir           = "/work"
 )
@@ -368,13 +373,15 @@ func (fc *FileReadCache) InterceptTerminalRead(command string) (string, bool) {
 	entry.hitCount++ // v8: Count every read attempt, even below threshold
 	if entry.hitCount < fc.softThreshold {
 		// Below threshold: don't intercept, let it execute
-		// (hitCount will be incremented by StoreFileRead on re-store,
-		// or by CheckFileRead if called from the standard path)
 		return "", false
 	}
 
+	// FIX Issue-1: Removed the second entry.hitCount++ that was here.
+	// Previously, above-threshold reads incremented hitCount TWICE (+2),
+	// while below-threshold reads only incremented once (+1). This caused
+	// escalation from warning→block to happen at (hardThreshold-1) instead
+	// of hardThreshold. Now all reads increment exactly once.
 	fc.hits++
-	entry.hitCount++
 
 	prefix := fc.formatCacheHitPrefix(filepath, entry)
 	return prefix + entry.content, true

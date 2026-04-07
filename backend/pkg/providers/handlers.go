@@ -333,7 +333,15 @@ func (fp *flowProvider) GetAskAdviceHandler(ctx context.Context, taskID, subtask
 
 		enriches, err := enricherHandler(ctx, ask)
 		if err != nil {
-			return "", err
+			// Fix Issue-3: Graceful degradation — fall back to original question context
+			// instead of hard-failing. The adviser LLM can answer questions without enrichment.
+			// VERDICT required: include Code and Output alongside Question for full context.
+			logrus.WithContext(ctx).WithError(err).Warn("enricher failed, proceeding with advice using original question only")
+			enriches = fmt.Sprintf(
+				"Note: Context enrichment was not available. Proceed with the original question.\n"+
+					"Original question: %s\nCode: %s\nOutput: %s",
+				ask.Question, ask.Code, ask.Output,
+			)
 		}
 
 		advice, err := adviserHandler(ctx, ask, enriches)

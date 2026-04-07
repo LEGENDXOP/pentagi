@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -32,13 +33,19 @@ const maxArgValueLength = 1024 // 1 KB limit for argument values
 
 // Default tool call timeouts (seconds)
 const (
-	defaultToolCallTimeoutAgent   = 2700 // 45 min for agent-type tools (coder, pentester, etc.)
-	defaultToolCallTimeoutDefault = 300 // 5 min for other tools (terminal, browser, etc.)
+	defaultToolCallTimeoutAgent   = 1200 // Fix Issue-11: reduced from 2700 (45 min) to 1200 (20 min) — 45 min was excessive for nested agents
+	defaultToolCallTimeoutDefault = 300  // 5 min for other tools (terminal, browser, etc.)
+	defaultToolCallTimeoutNuclei  = 720  // Fix Issue-4: dedicated nuclei timeout (12 min) — longer than default 5 min but shorter than agent
 )
 
 // getToolCallTimeout returns the configured timeout for a tool call based on its type.
 // Agent tools (coder, pentester, maintenance, search, memorist, advice) get a longer timeout.
+// Fix Issue-4: Nuclei gets its own dedicated timeout (12 min) to align with its internal scan time.
 func getToolCallTimeout(toolName string) time.Duration {
+	// Fix Issue-4: nuclei gets a dedicated timeout, longer than default but shorter than agent
+	if toolName == NucleiToolName {
+		return time.Duration(getEnvInt("TOOL_CALL_TIMEOUT_NUCLEI", defaultToolCallTimeoutNuclei)) * time.Second
+	}
 	toolType := GetToolType(toolName)
 	var seconds int
 	switch toolType {
@@ -387,7 +394,10 @@ func (ce *customExecutor) Execute(
 	wrapHandler := func(ctx context.Context, name string, args json.RawMessage) (string, database.MsglogResultFormat, error) {
 		resultFormat := getMessageResultFormat(name)
 		result, err := handler(ctx, name, args)
-		if err != nil && ctx.Err() == context.DeadlineExceeded {
+		// Fix Issue-10: Check BOTH the tool context's own Err() AND whether the underlying
+		// error wraps context.DeadlineExceeded. When a parent context expires but the tool's
+		// own timeout hasn't, ctx.Err() may return Canceled instead of DeadlineExceeded.
+		if err != nil && (ctx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded)) {
 			// Tool call timed out — return a timeout error message instead of
 			// propagating the raw context error. This lets the subtask continue.
 			durationDelta := time.Since(startTime).Seconds()

@@ -40,6 +40,10 @@ type MemorySearchLimiter struct {
 	lowRelevanceScore      float64 // score threshold for "low relevance" (default: 0.75)
 	memoryBudgetPercent    float64 // max % of total tool calls that can be memory searches (default: 0.15)
 
+	// FIX Issue-8: Absolute hard cap on memory searches per flow.
+	// Prevents unbounded memory search accumulation even within budget ratio.
+	absoluteSearchCap int // hard cap on total memory searches (default: 20)
+
 	// State: per-subtask consecutive search tracking
 	// Reset when a non-memory tool is called OR when subtask changes
 	consecutiveSearches int
@@ -64,6 +68,7 @@ type MemorySearchLimiterConfig struct {
 	LowRelevanceThreshold  int
 	LowRelevanceScore      float64
 	MemoryBudgetPercent    float64
+	AbsoluteSearchCap      int // FIX Issue-8: hard cap on total searches per flow
 }
 
 // DefaultMemorySearchLimiterConfig returns defaults, overridable by env vars.
@@ -73,6 +78,7 @@ func DefaultMemorySearchLimiterConfig() MemorySearchLimiterConfig {
 		LowRelevanceThreshold:  2,
 		LowRelevanceScore:      0.75,
 		MemoryBudgetPercent:    0.15,
+		AbsoluteSearchCap:      20, // FIX Issue-8: 20 per flow allows ~4 per subtask in 5-subtask flows
 	}
 
 	if v := os.Getenv("MEMORY_SEARCH_MAX_CONSECUTIVE"); v != "" {
@@ -95,6 +101,11 @@ func DefaultMemorySearchLimiterConfig() MemorySearchLimiterConfig {
 			cfg.MemoryBudgetPercent = f
 		}
 	}
+	if v := os.Getenv("MEMORY_SEARCH_ABSOLUTE_CAP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 5 {
+			cfg.AbsoluteSearchCap = n
+		}
+	}
 
 	return cfg
 }
@@ -106,6 +117,7 @@ func NewMemorySearchLimiter(cfg MemorySearchLimiterConfig) *MemorySearchLimiter 
 		lowRelevanceThreshold:  cfg.LowRelevanceThreshold,
 		lowRelevanceScore:      cfg.LowRelevanceScore,
 		memoryBudgetPercent:    cfg.MemoryBudgetPercent,
+		absoluteSearchCap:      cfg.AbsoluteSearchCap,
 	}
 }
 
@@ -154,18 +166,48 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 	}
 
 	if !isMemorySearch {
-		// Non-memory tool call: reset all consecutive counters
-		msl.consecutiveSearches = 0
+		// FIX Issue-8: Decay consecutive counter by 1 instead of full reset.
+		// Previously, interleaving a single non-memory tool call (e.g., `ls`)
+		// reset the counter from 3→0, allowing 3 more immediate searches.
+		// Now it decays by 1, so after 3 searches + 1 non-memory call,
+		// the counter goes 3→2, allowing only 1 more search before block.
+		if msl.consecutiveSearches > 0 {
+			msl.consecutiveSearches--
+		}
+		if msl.consecutiveSearches == 0 {
+			msl.consecutiveBlocked = false
+		}
 		msl.consecutiveLowRelevance = 0
-		msl.consecutiveBlocked = false
 		msl.lowRelevanceBlocked = false
 		return false, ""
 	}
 
 	// --- This is a memory search tool call ---
 
+	// FIX Issue-8: Absolute hard cap on total memory searches across the flow.
+	// This is a safety net that fires regardless of budget ratio or warm-up.
+	// Set to 20 to allow multi-task flows with ~5 subtasks to average 4 searches each.
+	if msl.absoluteSearchCap > 0 && msl.totalMemorySearches >= msl.absoluteSearchCap {
+		logrus.WithFields(logrus.Fields{
+			"tool":               name,
+			"total_searches":     msl.totalMemorySearches,
+			"absolute_cap":       msl.absoluteSearchCap,
+		}).Warn("memory search limiter: absolute search cap reached")
+
+		return true, fmt.Sprintf(
+			"Memory search absolute limit reached (%d/%d total searches this flow). "+
+				"No more memory searches are allowed. "+
+				"ALTERNATIVE: Use files on disk — `cat /work/HANDOFF.md`, `cat /work/FINDINGS.md`, `ls /work/`. "+
+				"Or use terminal/browser tools directly to continue testing.",
+			msl.totalMemorySearches, msl.absoluteSearchCap,
+		)
+	}
+
 	// Check 1: Per-flow budget (hardest limit, cannot be reset)
-	if msl.totalToolCalls > 10 { // only enforce after warm-up period of 10 total calls
+	// FIX Issue-8: Reduced warm-up from 10 to 5 total tool calls.
+	// The consecutive limit of 3 still applies during warm-up, so
+	// the agent can do at most 3 searches in the first 5 calls.
+	if msl.totalToolCalls > 5 { // only enforce after warm-up period of 5 total calls
 		budgetUsed := float64(msl.totalMemorySearches) / float64(msl.totalToolCalls)
 		if budgetUsed >= msl.memoryBudgetPercent {
 			logrus.WithFields(logrus.Fields{
