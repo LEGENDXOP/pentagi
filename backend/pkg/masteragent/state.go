@@ -179,12 +179,13 @@ func (cs *CycleState) UpdateFindingsCounts(total, confirmed int) {
 	cs.ConfirmedCount = confirmed
 }
 
-// Snapshot returns a copy of the state for building prompts.
-func (cs *CycleState) Snapshot() CycleState {
+// Snapshot returns a pointer to a copy of the state for building prompts.
+// Returns *CycleState (not value) to avoid copying the embedded sync.Mutex.
+func (cs *CycleState) Snapshot() *CycleState {
 	cs.mx.Lock()
 	defer cs.mx.Unlock()
 
-	snap := CycleState{
+	snap := &CycleState{
 		FlowID:         cs.FlowID,
 		Cycle:          cs.Cycle,
 		LastMessageID:  cs.LastMessageID,
