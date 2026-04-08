@@ -461,9 +461,11 @@ func isSemanticDBDuplicate(f ReportFinding, existing []database.Finding) bool {
 		if exGenEP == "" && newGenEP == "" {
 			return true
 		}
-		// Existing vague, new specific → upgrade case (treated as dupe)
+		// Existing vague, new specific → NOT a duplicate. The new finding has
+		// concrete endpoint details that the vague one lacks. Let it through so
+		// the DB gets the more informative record.
 		if exGenEP == "" && newGenEP != "" {
-			return true
+			continue
 		}
 		// New vague, existing specific → skip vague
 		if exGenEP != "" && newGenEP == "" {

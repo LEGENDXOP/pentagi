@@ -156,9 +156,16 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 	// Always increment total tool calls for budget tracking
 	msl.totalToolCalls++
 
-	// Check if subtask changed — reset consecutive counters
+	// Check if subtask changed — reset consecutive counters.
+	// Deep-copy the value to avoid pointer aliasing: if the caller reuses
+	// the same *int64 and mutates it, we'd miss future transitions.
 	if subtaskChanged(msl.currentSubtaskID, subtaskID) {
-		msl.currentSubtaskID = subtaskID
+		if subtaskID != nil {
+			id := *subtaskID
+			msl.currentSubtaskID = &id
+		} else {
+			msl.currentSubtaskID = nil
+		}
 		msl.consecutiveSearches = 0
 		msl.consecutiveLowRelevance = 0
 		msl.consecutiveBlocked = false

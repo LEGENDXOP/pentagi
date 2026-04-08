@@ -56,10 +56,12 @@ type flowWorker struct {
 	taskMX    *sync.Mutex
 	taskST    context.CancelFunc
 	taskWG    *sync.WaitGroup
-	input     chan flowInput
-	closeOnce sync.Once
-	flowCtx   *FlowContext
-	logger    *logrus.Entry
+	input       chan flowInput
+	closeOnce   sync.Once
+	cleanupOnce sync.Once
+	cleanupDone bool
+	flowCtx     *FlowContext
+	logger      *logrus.Entry
 }
 
 type newFlowWorkerCtx struct {
@@ -654,6 +656,12 @@ func (fw *flowWorker) Finish(ctx context.Context) (retErr error) {
 		return err
 	}
 
+	// If checkAndFinishIfDone already ran cleanup via cleanupOnce,
+	// skip redundant cleanup to avoid double-release/double-fail.
+	if fw.cleanupDone {
+		return nil
+	}
+
 	for _, task := range fw.tc.ListTasks(ctx) {
 		if !task.IsCompleted() {
 			if err := task.Finish(ctx); err != nil {
@@ -671,7 +679,6 @@ func (fw *flowWorker) Finish(ctx context.Context) (retErr error) {
 		}
 	}
 
-	// Zombie cleanup: fail all remaining running toolcalls for this flow
 	if cleanupErr := fw.flowCtx.DB.FailRunningToolcallsByFlow(
 		ctx,
 		"flow finished",
@@ -843,47 +850,46 @@ func (fw *flowWorker) checkAndFinishIfDone() bool {
 
 	fw.logger.Info("all tasks completed — performing inline flow cleanup")
 
-	// Use a background context for cleanup so it isn't cancelled prematurely.
-	cleanupCtx := context.Background()
+	// Guard against concurrent cleanup: both the worker (via checkAndFinishIfDone)
+	// and the watchdog (via checkFlowCompletion) can reach here. Without this,
+	// Executor.Release / FailRunningToolcallsByFlow can race.
+	fw.cleanupOnce.Do(func() {
+		fw.cleanupDone = true
+		cleanupCtx := context.Background()
 
-	// Finish incomplete tasks (should be none, but belt-and-suspenders).
-	for _, task := range tasks {
-		if !task.IsCompleted() {
-			if err := task.Finish(cleanupCtx); err != nil {
-				fw.logger.WithError(err).Errorf("cleanup: failed to finish task %d", task.GetTaskID())
+		for _, task := range tasks {
+			if !task.IsCompleted() {
+				if err := task.Finish(cleanupCtx); err != nil {
+					fw.logger.WithError(err).Errorf("cleanup: failed to finish task %d", task.GetTaskID())
+				}
 			}
 		}
-	}
 
-	// Finish assistants.
-	fw.awsMX.Lock()
-	for _, aw := range fw.aws {
-		if err := aw.Finish(cleanupCtx); err != nil {
-			fw.logger.WithError(err).Errorf("cleanup: failed to finish assistant %d", aw.GetAssistantID())
+		fw.awsMX.Lock()
+		for _, aw := range fw.aws {
+			if err := aw.Finish(cleanupCtx); err != nil {
+				fw.logger.WithError(err).Errorf("cleanup: failed to finish assistant %d", aw.GetAssistantID())
+			}
 		}
-	}
-	fw.awsMX.Unlock()
+		fw.awsMX.Unlock()
 
-	// Zombie toolcall cleanup.
-	if err := fw.flowCtx.DB.FailRunningToolcallsByFlow(
-		cleanupCtx,
-		"flow finished: all tasks completed",
-		fw.flowCtx.FlowID,
-	); err != nil {
-		fw.logger.WithError(err).Warn("cleanup: failed to clean up zombie toolcalls")
-	}
+		if err := fw.flowCtx.DB.FailRunningToolcallsByFlow(
+			cleanupCtx,
+			"flow finished: all tasks completed",
+			fw.flowCtx.FlowID,
+		); err != nil {
+			fw.logger.WithError(err).Warn("cleanup: failed to clean up zombie toolcalls")
+		}
 
-	// Release Docker containers / executor resources.
-	if err := fw.flowCtx.Executor.Release(cleanupCtx); err != nil {
-		fw.logger.WithError(err).Error("cleanup: failed to release executor resources")
-	}
+		if err := fw.flowCtx.Executor.Release(cleanupCtx); err != nil {
+			fw.logger.WithError(err).Error("cleanup: failed to release executor resources")
+		}
 
-	// Set final status.
-	if err := fw.SetStatus(cleanupCtx, database.FlowStatusFinished); err != nil {
-		fw.logger.WithError(err).Error("cleanup: failed to set flow status to finished")
-	}
+		if err := fw.SetStatus(cleanupCtx, database.FlowStatusFinished); err != nil {
+			fw.logger.WithError(err).Error("cleanup: failed to set flow status to finished")
+		}
+	})
 
-	// Cancel context and close input so worker + watchdog exit cleanly.
 	fw.cancel()
 	fw.closeOnce.Do(func() { close(fw.input) })
 

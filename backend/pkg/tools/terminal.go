@@ -237,8 +237,11 @@ func (t *terminal) ExecCommand(
 		return "", fmt.Errorf("failed to put terminal log (stdin): %w", err)
 	}
 
-	if timeout <= 0 || timeout > 20*time.Minute {
+	maxExecTimeout := 20 * time.Minute
+	if timeout <= 0 {
 		timeout = defaultExecCommandTimeout
+	} else if timeout > maxExecTimeout {
+		timeout = maxExecTimeout
 	}
 
 	createResp, err := t.dockerClient.ContainerExecCreate(ctx, containerName, container.ExecOptions{

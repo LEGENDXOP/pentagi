@@ -92,6 +92,15 @@ func getMaxNestingDepth() int {
 	return defaultMaxNestingDepth
 }
 
+func getMaxScriptFailures() int {
+	if v := os.Getenv("MAX_SCRIPT_FAILURES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 3
+}
+
 // nestingDepthKey is a context key for tracking agent delegation depth.
 type nestingDepthKey struct{}
 
@@ -292,7 +301,7 @@ func (fp *flowProvider) performAgentChain(
 		// the same broken Python script. Uses JSON-aware extraction per VERDICT
 		// (not crude string matching).
 		scriptFailureCount = 0
-		maxScriptFailures  = 3
+		maxScriptFailures  = getMaxScriptFailures()
 
 		// Fix 13: Auto-done safety net — tracks calls since the last
 		// delegation tool returned results. If the primary agent keeps

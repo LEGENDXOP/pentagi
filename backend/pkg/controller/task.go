@@ -616,10 +616,12 @@ func (tw *taskWorker) runSubtaskWithRetry(
 				// in performAgentChain fires (it requires ToolCallCount > 0).
 				preservedState.ToolCallCount = 1
 				if stateJSON, jsonErr := preservedState.ToJSON(); jsonErr == nil {
-					tw.taskCtx.DB.UpdateSubtaskContextWithTimestamp(ctx, database.UpdateSubtaskContextWithTimestampParams{
+					if dbErr := tw.taskCtx.DB.UpdateSubtaskContextWithTimestamp(ctx, database.UpdateSubtaskContextWithTimestampParams{
 						ID:      st.GetSubtaskID(),
 						Context: stateJSON,
-					})
+					}); dbErr != nil {
+						logger.WithError(dbErr).Warn("failed to persist execution state for retry — context will be lost on resume")
+					}
 				}
 				logger.WithFields(logrus.Fields{
 					"subtask_id":      st.GetSubtaskID(),

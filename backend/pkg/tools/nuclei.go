@@ -420,15 +420,35 @@ func (n *nucleiTool) readResultsFile(ctx context.Context, containerName string) 
 	}
 	defer resp.Close()
 
-	var buf strings.Builder
-	scanner := bufio.NewScanner(resp.Reader)
-	scanner.Buffer(make([]byte, 64*1024), nucleiMaxOutputSize)
-	for scanner.Scan() {
-		buf.WriteString(scanner.Text())
-		buf.WriteString("\n")
-	}
+	// Close the reader when readCtx expires so scanner.Scan() unblocks.
+	// Without this, the scanner blocks indefinitely if the container hangs.
+	go func() {
+		<-readCtx.Done()
+		resp.Close()
+	}()
 
-	return buf.String(), nil
+	var buf strings.Builder
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		scanner := bufio.NewScanner(resp.Reader)
+		scanner.Buffer(make([]byte, 64*1024), nucleiMaxOutputSize)
+		for scanner.Scan() {
+			buf.WriteString(scanner.Text())
+			buf.WriteString("\n")
+		}
+	}()
+
+	select {
+	case <-doneCh:
+		return buf.String(), nil
+	case <-readCtx.Done():
+		<-doneCh
+		if buf.Len() > 0 {
+			return buf.String(), nil
+		}
+		return "", fmt.Errorf("reading nuclei results timed out: %w", readCtx.Err())
+	}
 }
 
 // nucleiFinding represents a parsed nuclei result

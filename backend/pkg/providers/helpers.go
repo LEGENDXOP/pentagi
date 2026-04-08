@@ -581,14 +581,14 @@ func (rd *repeatingDetector) clearCallArguments(toolCall *llms.FunctionCall) llm
 
 	delete(v, "message")
 
-	// For delegation tools, we keep "question" because it contains the unique
-	// task description that differentiates legitimate calls. Only "message"
-	// (the large identical prompt template) is stripped above. Without
-	// "question", all calls hash identically (e.g. 'coder{}'), which triggers
-	// the repeating detector after just 3 calls and blocks all subsequent use.
-	switch toolCall.Name {
-	case "coder", "installer", "maintenance", "pentester":
-		// "question" preserved intentionally — see comment above
+	// For the advice tool, also strip "code" and "output" — these contain
+	// large terminal output / code snippets that vary slightly between calls
+	// but don't represent unique intent. Keeping them prevents the repeating
+	// detector from catching advice-call loops and bloats the call history.
+	// Only "question" is preserved for fingerprinting.
+	if toolCall.Name == "advice" {
+		delete(v, "code")
+		delete(v, "output")
 	}
 
 	canonical, err := json.Marshal(v)
