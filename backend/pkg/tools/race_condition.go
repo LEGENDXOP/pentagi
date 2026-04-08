@@ -316,7 +316,7 @@ func (rc *raceConditionTool) Handle(ctx context.Context, name string, args json.
 	if err := rc.ensureAiohttp(ctx, containerName, logger); err != nil {
 		errMsg := fmt.Sprintf("[ERROR] Failed to install aiohttp: %v.\n\nFallback: you can run a basic race test with:\n"+
 			"  for i in $(seq 1 %d); do curl -s -o /dev/null -w '%%{http_code} %%{time_total}\\n' -X %s '%s' & done; wait",
-			concurrency, method, targetURL)
+			err, concurrency, method, targetURL)
 		rc.logOutput(ctx, errMsg)
 		return errMsg, nil
 	}

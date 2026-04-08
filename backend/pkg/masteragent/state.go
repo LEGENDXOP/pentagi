@@ -185,6 +185,7 @@ func (cs *CycleState) Snapshot() CycleState {
 	defer cs.mx.Unlock()
 
 	snap := *cs
+	snap.mx = sync.Mutex{} // zero out the mutex so the copy doesn't alias the lock
 	snap.HealthHistory = make([]HealthStatus, len(cs.HealthHistory))
 	copy(snap.HealthHistory, cs.HealthHistory)
 	snap.CriticalEvents = make([]string, len(cs.CriticalEvents))
