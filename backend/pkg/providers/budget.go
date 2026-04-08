@@ -12,6 +12,9 @@ import (
 const (
 	defaultGlobalMaxToolCalls = 500
 	defaultGlobalMaxDuration  = 60 * time.Minute
+	reportReserve             = 50
+	budgetWarningPercent      = 80
+	budgetCriticalPercent     = 90
 )
 
 // getGlobalMaxToolCalls returns the global tool call budget, configurable via
@@ -102,6 +105,47 @@ func (b *ExecutionBudget) TimeRemaining() time.Duration {
 		return 0
 	}
 	return remaining
+}
+
+// Status returns the current budget usage: calls used, max allowed, and percentage consumed.
+func (b *ExecutionBudget) Status() (used, max int, pct float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.maxToolCalls == 0 {
+		return b.totalToolCalls, b.maxToolCalls, 0
+	}
+	pct = float64(b.totalToolCalls) / float64(b.maxToolCalls) * 100
+	return b.totalToolCalls, b.maxToolCalls, pct
+}
+
+// Remaining returns the number of tool calls remaining in the budget.
+func (b *ExecutionBudget) Remaining() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	r := b.maxToolCalls - b.totalToolCalls
+	if r < 0 {
+		return 0
+	}
+	return r
+}
+
+// IsWarning returns true when budget consumption exceeds 80%.
+func (b *ExecutionBudget) IsWarning() bool {
+	_, _, pct := b.Status()
+	return pct >= budgetWarningPercent
+}
+
+// IsCritical returns true when budget consumption exceeds 90%.
+func (b *ExecutionBudget) IsCritical() bool {
+	_, _, pct := b.Status()
+	return pct >= budgetCriticalPercent
+}
+
+// ReportReserve returns the number of tool calls reserved for the report phase.
+func (b *ExecutionBudget) ReportReserve() int {
+	return reportReserve
 }
 
 // GetBudget retrieves the ExecutionBudget from a context, or nil if none is set.

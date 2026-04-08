@@ -383,6 +383,19 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 	})
 
 	for len(tw.stc.ListSubtasks(ctx)) < providers.TasksNumberLimit+3 {
+		if budget := providers.GetBudget(ctx); budget != nil {
+			used, maxCalls, pct := budget.Status()
+			if pct >= 90 {
+				logger.WithFields(logrus.Fields{
+					"used":      used,
+					"max":       maxCalls,
+					"pct":       pct,
+					"remaining": budget.Remaining(),
+				}).Warn("budget nearly exhausted (>=90%), skipping remaining subtasks to preserve report budget")
+				break
+			}
+		}
+
 		st, err := tw.stc.PopSubtask(ctx, tw)
 		if err != nil {
 			return err
@@ -478,7 +491,27 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 
 	jobResult, err := tw.taskCtx.Provider.GetTaskResult(ctx, tw.taskCtx.TaskID)
 	if err != nil {
-		return fmt.Errorf("failed to get task %d result: %w", tw.taskCtx.TaskID, err)
+		// Issue 4: If report generation fails (e.g., budget exhausted), still mark
+		// the task as finished with a partial result so the flow can complete
+		// instead of getting stuck in 'waiting' or 'running' status forever.
+		logger.WithError(err).Warn("GetTaskResult failed, generating fallback result")
+		fallbackResult := "[PARTIAL REPORT — budget or time exhausted before report generation]\n"
+		fallbackResult += "The task completed its subtasks but the final report could not be generated.\n"
+		fallbackResult += "Review individual subtask results for findings.\n"
+		_ = tw.SetResult(ctx, fallbackResult)
+		_ = tw.SetStatus(ctx, database.TaskStatusFinished)
+
+		format := database.MsglogResultFormatMarkdown
+		_, _ = tw.taskCtx.MsgLog.PutTaskMsgResult(
+			ctx,
+			database.MsglogTypeReport,
+			tw.taskCtx.TaskID,
+			"",
+			tw.taskCtx.TaskTitle,
+			fallbackResult,
+			format,
+		)
+		return nil
 	}
 
 	var taskStatus database.TaskStatus

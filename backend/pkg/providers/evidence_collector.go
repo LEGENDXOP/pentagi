@@ -282,6 +282,18 @@ func (fr *FindingRegistry) CheckAndRegister(
 	// Get remediation text.
 	remediation := FormatRemediation(normalized)
 
+	effectiveSeverity := severity
+	if (strings.EqualFold(severity, "critical") || strings.EqualFold(severity, "high")) &&
+		endpoint == "" && len(evidence) == 0 {
+		effectiveSeverity = "medium"
+		description = "[UNCONFIRMED — registered without endpoint or evidence, downgraded from " + severity + "] " + description
+		logrus.WithFields(logrus.Fields{
+			"vuln_type":         normalized,
+			"original_severity": severity,
+			"new_severity":      effectiveSeverity,
+		}).Warn("finding downgraded: critical/high severity without endpoint or evidence")
+	}
+
 	finding := ReportFinding{
 		ID:          fmt.Sprintf("F-%04d", fr.idCounter),
 		FlowID:      fr.flowID,
@@ -289,7 +301,7 @@ func (fr *FindingRegistry) CheckAndRegister(
 		VulnType:    normalized,
 		Title:       generateFindingTitle(normalized, endpoint),
 		Description: description,
-		Severity:    severity,
+		Severity:    effectiveSeverity,
 		Endpoint:    endpoint,
 		Evidence:    evidence,
 		Fingerprint: fp,

@@ -57,6 +57,10 @@ type MemorySearchLimiter struct {
 	totalToolCalls        int
 	totalMemorySearches   int
 
+	// State: consecutive empty result tracking
+	consecutiveEmptyResults int
+	emptyResultBlocked      bool
+
 	// State: whether we are in a blocked state
 	consecutiveBlocked    bool // blocked due to consecutive limit
 	lowRelevanceBlocked   bool // blocked due to low-relevance auto-stop
@@ -168,16 +172,14 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 		}
 		msl.consecutiveSearches = 0
 		msl.consecutiveLowRelevance = 0
+		msl.consecutiveEmptyResults = 0
 		msl.consecutiveBlocked = false
 		msl.lowRelevanceBlocked = false
+		msl.emptyResultBlocked = false
 	}
 
 	if !isMemorySearch {
 		// FIX Issue-8: Decay consecutive counter by 1 instead of full reset.
-		// Previously, interleaving a single non-memory tool call (e.g., `ls`)
-		// reset the counter from 3→0, allowing 3 more immediate searches.
-		// Now it decays by 1, so after 3 searches + 1 non-memory call,
-		// the counter goes 3→2, allowing only 1 more search before block.
 		if msl.consecutiveSearches > 0 {
 			msl.consecutiveSearches--
 		}
@@ -186,6 +188,8 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 		}
 		msl.consecutiveLowRelevance = 0
 		msl.lowRelevanceBlocked = false
+		msl.consecutiveEmptyResults = 0
+		msl.emptyResultBlocked = false
 		return false, ""
 	}
 
@@ -267,7 +271,23 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 		)
 	}
 
-	// Check 3: Low-relevance auto-stop
+	// Check 3: Consecutive empty results — if 3+ searches returned nothing, block
+	if msl.emptyResultBlocked {
+		logrus.WithFields(logrus.Fields{
+			"tool":                    name,
+			"consecutive_empty":       msl.consecutiveEmptyResults,
+		}).Warn("memory search limiter: still blocked (consecutive empty results)")
+
+		return true, fmt.Sprintf(
+			"Memory searches returning empty results for %d consecutive searches. "+
+				"The data does NOT exist in memory. Searching more will NOT help. "+
+				"ALTERNATIVE: Use files on disk — `cat /work/HANDOFF.md`, `cat /work/FINDINGS.md`, `ls /work/`. "+
+				"Or use terminal/browser tools directly to continue testing.",
+			msl.consecutiveEmptyResults,
+		)
+	}
+
+	// Check 4: Low-relevance auto-stop
 	if msl.lowRelevanceBlocked {
 		logrus.WithFields(logrus.Fields{
 			"tool":                     name,
@@ -311,6 +331,30 @@ func (msl *MemorySearchLimiter) RecordRelevanceScore(score float64) {
 		// Good relevance — reset the low-relevance counter
 		msl.consecutiveLowRelevance = 0
 	}
+}
+
+// RecordEmptyResult records that a memory search returned no results.
+// After 3 consecutive empty results, further searches are blocked until
+// a non-memory tool call is made.
+func (msl *MemorySearchLimiter) RecordEmptyResult() {
+	msl.mu.Lock()
+	defer msl.mu.Unlock()
+
+	msl.consecutiveEmptyResults++
+	if msl.consecutiveEmptyResults >= 3 {
+		msl.emptyResultBlocked = true
+		logrus.WithFields(logrus.Fields{
+			"consecutive_empty": msl.consecutiveEmptyResults,
+		}).Warn("memory search limiter: consecutive empty results block triggered")
+	}
+}
+
+// RecordNonEmptyResult resets the empty result counter on a successful search.
+func (msl *MemorySearchLimiter) RecordNonEmptyResult() {
+	msl.mu.Lock()
+	defer msl.mu.Unlock()
+
+	msl.consecutiveEmptyResults = 0
 }
 
 // GetStats returns current limiter state for debugging/logging.

@@ -591,6 +591,25 @@ func (rd *repeatingDetector) clearCallArguments(toolCall *llms.FunctionCall) llm
 		delete(v, "output")
 	}
 
+	// For the coder tool, strip the actual code/script content. When the coder
+	// fails, agents retry with slightly different code but the same intent
+	// (same language, same goal). Stripping "code"/"script"/"content" lets the
+	// repeating detector catch "same coder tool, same intent, different code" loops.
+	if toolCall.Name == "coder" {
+		delete(v, "code")
+		delete(v, "script")
+		delete(v, "content")
+	}
+
+	// For terminal tool, strip the actual command input when the command is
+	// a script execution. This catches "run python script, fail, retry with
+	// slightly different script" loops that evade exact-match detection.
+	if toolCall.Name == "terminal" {
+		if input, ok := v["input"].(string); ok && isScriptLikeCommand(input) {
+			v["input"] = extractScriptIntent(input)
+		}
+	}
+
 	canonical, err := json.Marshal(v)
 	if err != nil {
 		return *toolCall
@@ -600,6 +619,30 @@ func (rd *repeatingDetector) clearCallArguments(toolCall *llms.FunctionCall) llm
 		Name:      toolCall.Name,
 		Arguments: string(canonical),
 	}
+}
+
+var scriptPrefixes = []string{"python", "python3", "node", "ruby", "perl", "bash", "sh"}
+
+func isScriptLikeCommand(input string) bool {
+	primary := extractPrimaryCommand(input)
+	lower := strings.ToLower(strings.TrimSpace(primary))
+	for _, prefix := range scriptPrefixes {
+		if strings.HasPrefix(lower, prefix+" ") || strings.HasPrefix(lower, prefix+"\n") {
+			return true
+		}
+	}
+	return strings.Contains(lower, "<<") && (strings.Contains(lower, "python") || strings.Contains(lower, "node"))
+}
+
+func extractScriptIntent(input string) string {
+	primary := extractPrimaryCommand(input)
+	lower := strings.ToLower(strings.TrimSpace(primary))
+	for _, prefix := range scriptPrefixes {
+		if strings.HasPrefix(lower, prefix+" ") || strings.HasPrefix(lower, prefix+"\n") {
+			return prefix + " <script>"
+		}
+	}
+	return "script_execution"
 }
 
 // ExecutionMetrics tracks real-time execution telemetry for template rendering.

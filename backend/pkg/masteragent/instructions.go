@@ -52,6 +52,16 @@ Evaluate these signals from the data provided:
 - WARNING: Subtask running >30 min with >50 tool calls and 0 findings
 - CRITICAL: Subtask running >30 min with almost no new tool calls
 
+### Signal 7: Tool Call Budget
+- HEALTHY: Budget <80% consumed
+- WARNING: Budget 80-90% consumed — STEER to wrap up and start report
+- CRITICAL: Budget >90% consumed — STEER IMMEDIATELY to stop testing and compile report
+
+When budget is WARNING or CRITICAL, your steer message MUST instruct the agent to:
+1. Stop all new testing immediately
+2. Compile a final report from existing findings
+3. Write the report as markdown directly (no scripts)
+
 ## Decision Rules
 
 1. WARMUP (cycles 1-2): DO NOTHING unless wrong target detected

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -345,6 +347,25 @@ func (a *Agent) buildPrompt(data *flowData) string {
 	b.WriteString("## Tool Call Statistics\n")
 	b.WriteString(fmt.Sprintf("- **Total Completed:** %d\n", data.ToolCallStats.TotalCount))
 	b.WriteString(fmt.Sprintf("- **Total Duration:** %.1fs\n", data.ToolCallStats.TotalDurationSeconds))
+
+	budgetMax := getGlobalMaxToolCallsForMasterAgent()
+	budgetUsed := int(data.ToolCallStats.TotalCount)
+	budgetRemaining := budgetMax - budgetUsed
+	if budgetRemaining < 0 {
+		budgetRemaining = 0
+	}
+	budgetPct := float64(0)
+	if budgetMax > 0 {
+		budgetPct = float64(budgetUsed) / float64(budgetMax) * 100
+	}
+	b.WriteString(fmt.Sprintf("- **Global Budget:** %d/%d (%.0f%% consumed, %d remaining)\n",
+		budgetUsed, budgetMax, budgetPct, budgetRemaining))
+	if budgetPct >= 90 {
+		b.WriteString("- **⚠️ BUDGET CRITICAL:** Less than 10% remaining. Report phase must start NOW.\n")
+	} else if budgetPct >= 80 {
+		b.WriteString("- **⚠️ BUDGET WARNING:** Less than 20% remaining. Agent should wrap up and start report.\n")
+	}
+
 	if len(data.ToolCallsByFunc) > 0 {
 		b.WriteString("- **By Function (top 10):**\n")
 		limit := 10
@@ -641,4 +662,13 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+func getGlobalMaxToolCallsForMasterAgent() int {
+	if v := os.Getenv("GLOBAL_MAX_TOOL_CALLS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 500
 }

@@ -579,6 +579,38 @@ func (fp *flowProvider) RefineSubtasks(ctx context.Context, taskID int64) ([]too
 			logger.WithField("has_blockers", true).Info("injected blocker context into refiner")
 		}
 
+		// Issue 7: When unconfirmed findings accumulate, inject confirmation priority.
+		if fr := GetFindingRegistry(ctx); fr != nil {
+			findings := fr.GetFindings()
+			unconfirmed := 0
+			for _, f := range findings {
+				if !f.Confirmed && !f.FalsePositive {
+					unconfirmed++
+				}
+			}
+			if unconfirmed >= 5 {
+				refinerContext["user"]["ConfirmationPriority"] = fmt.Sprintf(
+					"IMPORTANT: There are %d unconfirmed findings. The next subtask MUST focus on "+
+						"confirming existing findings rather than discovering new ones. "+
+						"Prioritize depth over breadth — validate the most critical unconfirmed findings first.",
+					unconfirmed)
+				logger.WithField("unconfirmed_count", unconfirmed).Info("injected confirmation priority into refiner")
+			}
+		}
+
+		// Issue 1: Inject budget context into refiner so it can prioritize report.
+		if budget := GetBudget(ctx); budget != nil {
+			used, maxCalls, pct := budget.Status()
+			if pct >= 70 {
+				refinerContext["user"]["BudgetContext"] = fmt.Sprintf(
+					"BUDGET WARNING: %d/%d tool calls consumed (%.0f%%). "+
+						"Plan remaining subtasks conservatively. Ensure a report/summary subtask is scheduled NEXT. "+
+						"Write the report directly as markdown — do NOT use Python scripts or dump tools.",
+					used, maxCalls, pct)
+				logger.WithFields(logrus.Fields{"budget_pct": pct}).Info("injected budget context into refiner")
+			}
+		}
+
 		refinerTmpl, err = fp.prompter.RenderTemplate(templates.PromptTypeSubtasksRefiner, refinerContext["user"])
 		if err != nil {
 			return nil, wrapErrorEndEvaluatorSpan(ctx, refinerEvaluator, "failed to get task subtasks refiner template (2)", err)

@@ -568,6 +568,21 @@ func (fp *flowProvider) performAgentChain(
 			if timebox.MaxDuration < effectiveTimeout {
 				effectiveTimeout = timebox.MaxDuration
 			}
+
+			// Issue 2: For report subtasks, inject markdown-first guidance.
+			if timebox.Category == SubtaskCategoryReport {
+				reportGuidance := llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: "[REPORT SUBTASK GUIDANCE]\n" +
+							"Write the report directly as MARKDOWN text using the result/done tool. " +
+							"Do NOT create Python scripts, dump scripts, or use the coder tool to generate reports. " +
+							"Simply compile your findings into a structured markdown document and submit it directly. " +
+							"If you need data, read workspace files (FINDINGS.md, HANDOFF.md) and synthesize."},
+					},
+				}
+				chain = append(chain, reportGuidance)
+			}
 		}
 	}
 
@@ -2189,6 +2204,43 @@ func (fp *flowProvider) performAgentChain(
 
 		// Check global budget across entire delegation tree
 		if budget := GetBudget(ctx); budget != nil {
+			used, maxCalls, pct := budget.Status()
+
+			if pct >= budgetCriticalPercent && pct < 100 {
+				warningMsg := fmt.Sprintf(
+					"[CRITICAL — GLOBAL BUDGET NEARLY EXHAUSTED: %d/%d calls (%.0f%%), only %d remaining]\n"+
+						"The ENTIRE FLOW is about to hit the global tool call limit. "+
+						"You MUST finish your current work NOW. Save all findings immediately. "+
+						"Call the result/done tool with your findings. Do NOT start new tests.",
+					used, maxCalls, pct, budget.Remaining(),
+				)
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: warningMsg},
+					},
+				})
+				logger.WithFields(logrus.Fields{
+					"used": used, "max": maxCalls, "pct": pct,
+				}).Warn("global budget critical (>=90%), injected force-finish warning")
+			} else if pct >= budgetWarningPercent && pct < budgetCriticalPercent {
+				warningMsg := fmt.Sprintf(
+					"[WARNING — GLOBAL BUDGET: %d/%d calls used (%.0f%%), %d remaining]\n"+
+						"Budget is running low. Wrap up current attack vector and prepare to summarize findings. "+
+						"Focus on confirming existing findings rather than discovering new ones.",
+					used, maxCalls, pct, budget.Remaining(),
+				)
+				chain = append(chain, llms.MessageContent{
+					Role: llms.ChatMessageTypeHuman,
+					Parts: []llms.ContentPart{
+						llms.TextContent{Text: warningMsg},
+					},
+				})
+				logger.WithFields(logrus.Fields{
+					"used": used, "max": maxCalls, "pct": pct,
+				}).Warn("global budget warning (>=80%), injected wrap-up warning")
+			}
+
 			if err := budget.Consume(len(result.funcCalls)); err != nil {
 				logger.WithError(err).Warn("global execution budget exceeded")
 				return err
