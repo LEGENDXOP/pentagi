@@ -294,6 +294,10 @@ func (fp *flowProvider) performAgentChain(
 		bootstrapCompleted = false
 		bootstrapCallCount = 0
 
+		// FIX Issue-2: Report-phase delegation block counter.
+		// After 2+ blocked delegation attempts, inject permanent chain message.
+		reportDelegationBlocks = 0
+
 		// FIX Issue-2: Script failure abandonment threshold.
 		// Tracks consecutive script execution failures. After maxScriptFailures,
 		// an abandonment message is injected telling the LLM to use a different approach.
@@ -1303,23 +1307,42 @@ func (fp *flowProvider) performAgentChain(
 				}
 			}
 
-			// FIX Issue-2: Block coder/maintenance agent delegation during report subtasks.
+			// FIX Issue-2: Block coder/maintenance/pentester agent delegation during report subtasks.
 			// Report phase must write markdown directly — delegating to coder produces
 			// Python scripts that timeout/fail, wasting 30-60 minutes.
 			var reportPhaseIntercepted bool
 			var reportPhaseResponse string
 			if !v5Intercepted && timebox != nil && timebox.Category == SubtaskCategoryReport {
-				if funcName == tools.CoderToolName || funcName == tools.MaintenanceToolName {
+				if funcName == tools.CoderToolName || funcName == tools.MaintenanceToolName || funcName == tools.PentesterToolName {
+					reportDelegationBlocks++
 					reportPhaseIntercepted = true
 					reportPhaseResponse = fmt.Sprintf(
 						"⛔ BLOCKED: '%s' tool is not allowed during the report phase. "+
 							"Write the report DIRECTLY as markdown text using the result/done tool. "+
-							"Do NOT delegate to coder or maintenance — write text directly. "+
+							"Do NOT delegate to coder, maintenance, or pentester — write text directly. "+
 							"Use terminal only for reading files (cat /work/FINDINGS.md).",
 						funcName,
 					)
-					logger.WithField("blocked_tool", funcName).
-						Warn("report phase intercept: blocked agent delegation during report subtask")
+					logger.WithFields(logrus.Fields{
+						"blocked_tool": funcName,
+						"block_count":  reportDelegationBlocks,
+					}).Warn("report phase intercept: blocked agent delegation during report subtask")
+
+					// After 2+ blocks, inject permanent chain message to stop attempts
+					if reportDelegationBlocks >= 2 {
+						chain = append(chain, llms.MessageContent{
+							Role: llms.ChatMessageTypeHuman,
+							Parts: []llms.ContentPart{
+								llms.TextContent{Text: "[PERMANENT BLOCK] Agent delegation tools (coder, pentester, maintenance) " +
+									"are PERMANENTLY DISABLED for this report subtask. Stop attempting to call them. " +
+									"Write your report as MARKDOWN TEXT using the result/done tool:\n" +
+									"1. Read /work/FINDINGS.md with terminal (cat)\n" +
+									"2. Compile findings into structured markdown\n" +
+									"3. Submit via the result tool"},
+							},
+						})
+						logger.Warn("report phase intercept: injected permanent block message after 2+ attempts")
+					}
 				}
 			}
 

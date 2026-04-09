@@ -263,6 +263,26 @@ func (fr *FindingRegistry) CheckAndRegister(
 		}
 	}
 
+	// FIX Issue-3: Jaccard similarity dedup — reject near-duplicate descriptions
+	// regardless of vuln_type or endpoint. Catches the Flow 51 pattern where
+	// the same report paragraph is registered as multiple findings.
+	if len(description) > 50 {
+		for _, existing := range fr.findings {
+			if existing.Description == "" || strings.HasPrefix(existing.ID, "DB-") {
+				continue
+			}
+			if jaccardSimilarity(description, existing.Description) >= 0.80 {
+				logrus.WithFields(logrus.Fields{
+					"new_vuln_type":      vulnType,
+					"existing_vuln_type": existing.VulnType,
+					"existing_id":        existing.ID,
+				}).Warn("Jaccard dedup: rejecting near-duplicate finding description (≥80% similar)")
+				fr.seenFingerprints[fp] = true
+				return nil, false
+			}
+		}
+	}
+
 	fr.seenFingerprints[fp] = true
 
 	fr.idCounter++
@@ -434,7 +454,7 @@ func (fr *FindingRegistry) PersistFindings(ctx context.Context, db database.Quer
 			SubtaskID:     subtaskID,
 			VulnType:      f.VulnType,
 			Title:         f.Title,
-			Description:   truncateString(f.Description, 8192),
+			Description:   truncateString(f.Description, 2000),
 			Severity:      f.Severity,
 			Endpoint:      f.Endpoint,
 			Fingerprint:   f.Fingerprint,
@@ -720,7 +740,7 @@ func (fr *FindingRegistry) ParseAndSyncFindingsMD(content string, subtaskID *int
 		for _, match := range matches {
 			if len(match) >= 2 {
 				vulnType := match[1]
-				severity := severityFromVulnType(vulnType)
+				severity := severityFromVulnTypeWithAgentFallback(vulnType, content)
 				_, isNew := fr.CheckAndRegister(
 					vulnType, "", truncateString(content, 4096), severity, subtaskID, nil,
 				)
@@ -740,30 +760,8 @@ func (fr *FindingRegistry) ParseAndSyncFindingsMD(content string, subtaskID *int
 		}
 		vulnType := vtMatch[1]
 
-		// Fix AUDITOR-4: Use CVSS-based severity as primary, but fall back to
-		// agent's written severity when the vuln type is not in ComplianceMappings.
-		// This fixes the Flow 25 bug where agent classified as MEDIUM/LOW but DB
-		// stored "info" — which happened because unmapped vuln types defaulted to
-		// "medium" via severityFromVulnType, but in edge cases could produce "info".
-		severity := severityFromVulnType(vulnType)
-		if sevMatch := findingsMDSeverityRegex.FindStringSubmatch(block); len(sevMatch) >= 2 {
-			agentSev := strings.ToLower(sevMatch[1])
-			// If the vuln type is not in ComplianceMappings, prefer the agent's
-			// severity — the agent has context about the specific finding.
-			if GetComplianceForVulnType(vulnType) == nil && agentSev != "" {
-				severity = agentSev
-				logrus.WithFields(logrus.Fields{
-					"vuln_type":      vulnType,
-					"agent_severity": agentSev,
-				}).Debug("FINDINGS.md sync: using agent severity for unmapped vuln type")
-			} else if agentSev != severity {
-				logrus.WithFields(logrus.Fields{
-					"vuln_type":      vulnType,
-					"agent_severity": agentSev,
-					"cvss_severity":  severity,
-				}).Debug("FINDINGS.md sync: agent severity differs from CVSS — using CVSS")
-			}
-		}
+		// FIX Issue-3: Use CVSS-based severity with agent fallback for unmapped types.
+		severity := severityFromVulnTypeWithAgentFallback(vulnType, block)
 
 		// Extract endpoint — sanitize to strip template variables like ${port}${path}
 		// and trailing backslashes that the LLM may inject (Fix ECHO-2).
@@ -1486,12 +1484,60 @@ func severityFromVulnType(vulnType string) string {
 			return "info"
 		}
 	}
-	return "medium" // safe default for unmapped vuln types
+	return "medium"
 }
 
-// inferSeverityFromResponse was removed — it matched "critical" anywhere in
-// response text (including prompt templates), causing all findings to be CRITICAL.
-// Use severityFromVulnType() which uses authoritative CVSS scores instead.
+// severityFromVulnTypeWithAgentFallback uses CVSS-based severity for mapped vuln types,
+// but for UNMAPPED types, extracts the agent's declared severity from response text.
+// Only falls back to "medium" if both CVSS mapping and regex extraction fail.
+var agentSeverityRegex = regexp.MustCompile(`(?i)(?:\[SEVERITY:\s*|(?:\*{0,2})Severity(?:\*{0,2}):\s*)(critical|high|medium|low|info)`)
+
+func severityFromVulnTypeWithAgentFallback(vulnType, responseText string) string {
+	cvss := severityFromVulnType(vulnType)
+	if GetComplianceForVulnType(NormalizeVulnType(vulnType)) != nil {
+		return cvss
+	}
+	if match := agentSeverityRegex.FindStringSubmatch(responseText); len(match) >= 2 {
+		extracted := strings.ToLower(match[1])
+		logrus.WithFields(logrus.Fields{
+			"vuln_type":          vulnType,
+			"extracted_severity": extracted,
+		}).Debug("severity fallback: using agent-declared severity for unmapped vuln type")
+		return extracted
+	}
+	return cvss
+}
+
+// ─── Jaccard Similarity Dedup ────────────────────────────────────────────────
+
+func wordTrigrams(text string) map[string]bool {
+	words := strings.Fields(strings.ToLower(text))
+	trigrams := make(map[string]bool)
+	for i := 0; i+2 < len(words); i++ {
+		trigram := words[i] + " " + words[i+1] + " " + words[i+2]
+		trigrams[trigram] = true
+	}
+	return trigrams
+}
+
+func jaccardSimilarity(a, b string) float64 {
+	setA := wordTrigrams(a)
+	setB := wordTrigrams(b)
+	if len(setA) == 0 || len(setB) == 0 {
+		return 0.0
+	}
+	intersection := 0
+	for k := range setA {
+		if setB[k] {
+			intersection++
+		}
+	}
+	union := len(setA) + len(setB) - intersection
+	if union == 0 {
+		return 0.0
+	}
+	return float64(intersection) / float64(union)
+}
 
 // ─── Context propagation ─────────────────────────────────────────────────────
 
