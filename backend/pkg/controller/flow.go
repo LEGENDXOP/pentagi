@@ -26,7 +26,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const stopTaskTimeout = 5 * time.Second
+const stopTaskTimeout = 30 * time.Second
 
 type FlowWorker interface {
 	GetFlowID() int64
@@ -702,6 +702,16 @@ func (fw *flowWorker) Stop(ctx context.Context) error {
 	ctx, span := obs.Observer.NewSpan(ctx, obs.SpanKindInternal, "controller.flowWorker.Stop")
 	defer span.End()
 
+	// Set the abort flag so the agent's CheckPoint sees it immediately.
+	// performAgentChain at depth 0 uses context.WithoutCancel(), so
+	// cancelling the task context alone won't reach the agent. The abort
+	// flag is checked every loop iteration via CheckPoint.
+	if fw.flowCtx.FlowControl != nil {
+		if _, abortErr := fw.flowCtx.FlowControl.Abort(fw.flowCtx.FlowID); abortErr != nil {
+			fw.logger.WithError(abortErr).Warn("Stop: failed to set abort flag")
+		}
+	}
+
 	fw.taskMX.Lock()
 	defer fw.taskMX.Unlock()
 
@@ -717,11 +727,9 @@ func (fw *flowWorker) Stop(ctx context.Context) error {
 
 	select {
 	case <-timer.C:
-		// Even on timeout, clean up zombie toolcalls
 		_ = fw.flowCtx.DB.FailRunningToolcallsByFlow(ctx, "flow stopped (timeout)", fw.flowCtx.FlowID)
 		return fmt.Errorf("task stop timeout")
 	case <-done:
-		// Clean up any remaining running toolcalls
 		_ = fw.flowCtx.DB.FailRunningToolcallsByFlow(ctx, "flow stopped", fw.flowCtx.FlowID)
 		return nil
 	}

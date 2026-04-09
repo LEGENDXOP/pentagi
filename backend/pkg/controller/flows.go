@@ -503,6 +503,18 @@ func (fc *flowController) StopFlow(ctx context.Context, flowID int64) error {
 		fc.masterSupervisor.StopForFlow(flowID)
 	}
 
+	// Set the abort flag BEFORE calling Stop so the agent's CheckPoint
+	// sees the abort immediately. Without this, flowWorker.Stop() cancels
+	// the task context, but performAgentChain uses context.WithoutCancel()
+	// at depth 0 — so the cancellation never reaches the agent loop.
+	// The abort flag is the only mechanism the detached agent respects.
+	if fc.flowControl != nil {
+		if _, abortErr := fc.flowControl.Abort(flowID); abortErr != nil {
+			logrus.WithError(abortErr).WithField("flow_id", flowID).
+				Warn("failed to set abort flag on flow control manager")
+		}
+	}
+
 	err := flow.Stop(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to stop flow %d: %w", flowID, err)

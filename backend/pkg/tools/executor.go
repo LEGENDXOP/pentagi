@@ -454,6 +454,10 @@ func (ce *customExecutor) Execute(
 
 	if msg == "" { // no arg message to log and execute handler immediately
 		result, _, err := wrapHandler(toolCtx, name, args)
+		// FIX Issue-4: Track empty/non-empty results for memory search limiter.
+		if ce.memorySearchLimiter != nil && IsMemorySearchTool(name) && err == nil {
+			trackMemorySearchResult(ce.memorySearchLimiter, result)
+		}
 		obsWrapper.end(result, err, time.Since(startTime).Seconds())
 		return result, err
 	}
@@ -462,6 +466,11 @@ func (ce *customExecutor) Execute(
 	if err != nil {
 		obsWrapper.end(result, err, time.Since(startTime).Seconds())
 		return "", err
+	}
+
+	// FIX Issue-4: Track empty/non-empty results for memory search limiter.
+	if ce.memorySearchLimiter != nil && IsMemorySearchTool(name) {
+		trackMemorySearchResult(ce.memorySearchLimiter, result)
 	}
 
 	if err := ce.storeToolResult(ctx, name, result, args); err != nil {
@@ -706,6 +715,22 @@ func (ce *customExecutor) storeToolResult(ctx context.Context, name, result stri
 	}
 
 	return nil
+}
+
+// trackMemorySearchResult records empty/non-empty status and relevance for
+// memory search results, enabling the limiter to block futile searches.
+func trackMemorySearchResult(msl *MemorySearchLimiter, result string) {
+	trimmed := strings.TrimSpace(result)
+	if trimmed == "" || trimmed == "[]" || trimmed == "null" ||
+		strings.Contains(trimmed, "no results") || strings.Contains(trimmed, "No results") ||
+		strings.Contains(trimmed, "nothing found") || strings.Contains(trimmed, "Nothing found") ||
+		len(trimmed) < 20 {
+		msl.RecordEmptyResult()
+		msl.RecordRelevanceScore(0.0)
+	} else {
+		msl.RecordNonEmptyResult()
+		msl.RecordRelevanceScore(0.8)
+	}
 }
 
 func (ce *customExecutor) argsToMarkdown(args json.RawMessage) (string, error) {

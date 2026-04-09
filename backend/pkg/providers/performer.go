@@ -1259,6 +1259,26 @@ func (fp *flowProvider) performAgentChain(
 				}
 			}
 
+			// FIX Issue-2: Block coder/maintenance agent delegation during report subtasks.
+			// Report phase must write markdown directly — delegating to coder produces
+			// Python scripts that timeout/fail, wasting 30-60 minutes.
+			var reportPhaseIntercepted bool
+			var reportPhaseResponse string
+			if !v5Intercepted && timebox != nil && timebox.Category == SubtaskCategoryReport {
+				if funcName == tools.CoderToolName || funcName == tools.MaintenanceToolName {
+					reportPhaseIntercepted = true
+					reportPhaseResponse = fmt.Sprintf(
+						"⛔ BLOCKED: '%s' tool is not allowed during the report phase. "+
+							"Write the report DIRECTLY as markdown text using the result/done tool. "+
+							"Do NOT delegate to coder or maintenance — write text directly. "+
+							"Use terminal only for reading files (cat /work/FINDINGS.md).",
+						funcName,
+					)
+					logger.WithField("blocked_tool", funcName).
+						Warn("report phase intercept: blocked agent delegation during report subtask")
+				}
+			}
+
 			// FIX: Pre-execution budget check — if this specific tool's budget is
 			// exhausted (time or failure limit), block the call and return a clear
 			// message telling the agent to use terminal directly instead.
@@ -1320,6 +1340,8 @@ func (fp *flowProvider) performAgentChain(
 			var err error
 			if v5Intercepted {
 				response = v5Response
+			} else if reportPhaseIntercepted {
+				response = reportPhaseResponse
 			} else if budgetIntercepted {
 				response = budgetResponse
 			} else if memoristIntercepted {

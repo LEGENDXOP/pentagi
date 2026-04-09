@@ -78,11 +78,11 @@ type MemorySearchLimiterConfig struct {
 // DefaultMemorySearchLimiterConfig returns defaults, overridable by env vars.
 func DefaultMemorySearchLimiterConfig() MemorySearchLimiterConfig {
 	cfg := MemorySearchLimiterConfig{
-		MaxConsecutiveSearches: 3,
+		MaxConsecutiveSearches: 2,
 		LowRelevanceThreshold:  2,
 		LowRelevanceScore:      0.75,
-		MemoryBudgetPercent:    0.15,
-		AbsoluteSearchCap:      20, // FIX Issue-8: 20 per flow allows ~4 per subtask in 5-subtask flows
+		MemoryBudgetPercent:    0.12,
+		AbsoluteSearchCap:      15, // FIX Issue-4: tightened from 20→15, ~3 per subtask in 5-subtask flows
 	}
 
 	if v := os.Getenv("MEMORY_SEARCH_MAX_CONSECUTIVE"); v != "" {

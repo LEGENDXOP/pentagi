@@ -282,6 +282,19 @@ func (fr *FindingRegistry) CheckAndRegister(
 	// Get remediation text.
 	remediation := FormatRemediation(normalized)
 
+	// FIX Issue-3: Cap description length at registration time to prevent
+	// report text dumps from being stored as finding descriptions.
+	const maxDescriptionLen = 2000
+	if len(description) > maxDescriptionLen {
+		description = description[:maxDescriptionLen] + "...[truncated at registration]"
+		logrus.WithFields(logrus.Fields{
+			"vuln_type":    normalized,
+			"original_len": len(description),
+		}).Warn("finding description truncated at registration (exceeded 2000 chars)")
+	}
+
+	// FIX Issue-3: Detect phantom findings — high CVSS with no endpoint AND no evidence
+	// AND description looks like dumped report text (contains multiple finding markers).
 	effectiveSeverity := severity
 	if (strings.EqualFold(severity, "critical") || strings.EqualFold(severity, "high")) &&
 		endpoint == "" && len(evidence) == 0 {
@@ -292,6 +305,19 @@ func (fr *FindingRegistry) CheckAndRegister(
 			"original_severity": severity,
 			"new_severity":      effectiveSeverity,
 		}).Warn("finding downgraded: critical/high severity without endpoint or evidence")
+	}
+
+	// FIX Issue-3: Detect duplicate content in descriptions — if description contains
+	// multiple finding markers (F-NNN, [VULN_TYPE:], ### [CRITICAL]), it's likely a
+	// report dump rather than a single finding description.
+	if isReportDumpDescription(description) {
+		effectiveSeverity = "info"
+		description = "[REPORT-DUMP — description contains multiple finding markers, likely a pasted report section] " + description
+		logrus.WithFields(logrus.Fields{
+			"vuln_type":         normalized,
+			"original_severity": severity,
+			"new_severity":      "info",
+		}).Warn("finding downgraded to info: description looks like pasted report dump")
 	}
 
 	finding := ReportFinding{
@@ -598,6 +624,41 @@ func (fr *FindingRegistry) GetFindingCount() int {
 		}
 	}
 	return count
+}
+
+// GetUnconfirmedCount returns the number of non-false-positive, unconfirmed findings.
+func (fr *FindingRegistry) GetUnconfirmedCount() int {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+
+	count := 0
+	for _, f := range fr.findings {
+		if !f.FalsePositive && !f.Confirmed && !strings.HasPrefix(f.ID, "DB-") {
+			count++
+		}
+	}
+	return count
+}
+
+// GetConfirmationRate returns the percentage of confirmed findings (0.0 to 1.0).
+func (fr *FindingRegistry) GetConfirmationRate() float64 {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+
+	total := 0
+	confirmed := 0
+	for _, f := range fr.findings {
+		if !f.FalsePositive && !strings.HasPrefix(f.ID, "DB-") {
+			total++
+			if f.Confirmed {
+				confirmed++
+			}
+		}
+	}
+	if total == 0 {
+		return 1.0
+	}
+	return float64(confirmed) / float64(total)
 }
 
 // ─── FINDINGS.md Sync (Fallback) ─────────────────────────────────────────────
@@ -1379,6 +1440,31 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "...[truncated]"
+}
+
+// isReportDumpDescription detects descriptions that contain multiple finding markers,
+// indicating the agent pasted an entire report section as a single finding's description.
+func isReportDumpDescription(desc string) bool {
+	lower := strings.ToLower(desc)
+	markers := 0
+
+	findingIDCount := strings.Count(lower, "f-0")
+	if findingIDCount >= 2 {
+		markers += findingIDCount
+	}
+
+	vulnTypeCount := len(findingsMDVulnTypeRegex.FindAllString(desc, -1))
+	markers += vulnTypeCount
+
+	sevHeaders := 0
+	for _, sev := range []string{"[critical]", "[high]", "[medium]", "[low]"} {
+		sevHeaders += strings.Count(lower, sev)
+	}
+	if sevHeaders >= 2 {
+		markers += sevHeaders
+	}
+
+	return markers >= 3
 }
 
 // severityFromVulnType determines severity using the authoritative CVSS scores
