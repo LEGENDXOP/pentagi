@@ -201,5 +201,29 @@ func (q *Queries) GetFlowFindingCount(ctx context.Context, flowID int64) (int64,
 	return count, err
 }
 
+type FlowFindingConfirmationStatsRow struct {
+	Total       int64   `json:"total"`
+	Confirmed   int64   `json:"confirmed"`
+	Unconfirmed int64   `json:"unconfirmed"`
+	Rate        float64 `json:"rate"`
+}
+
+const getFlowFindingConfirmationStats = `-- name: GetFlowFindingConfirmationStats :one
+SELECT
+  COUNT(*) AS total,
+  COUNT(*) FILTER (WHERE confirmed = TRUE) AS confirmed,
+  COUNT(*) FILTER (WHERE confirmed = FALSE) AS unconfirmed,
+  CASE WHEN COUNT(*) > 0 THEN COUNT(*) FILTER (WHERE confirmed = TRUE)::float / COUNT(*)::float ELSE 1.0 END AS rate
+FROM findings
+WHERE flow_id = $1 AND false_positive = FALSE
+`
+
+func (q *Queries) GetFlowFindingConfirmationStats(ctx context.Context, flowID int64) (FlowFindingConfirmationStatsRow, error) {
+	row := q.db.QueryRowContext(ctx, getFlowFindingConfirmationStats, flowID)
+	var i FlowFindingConfirmationStatsRow
+	err := row.Scan(&i.Total, &i.Confirmed, &i.Unconfirmed, &i.Rate)
+	return i, err
+}
+
 // Ensure unused import is used.
 var _ = time.Now

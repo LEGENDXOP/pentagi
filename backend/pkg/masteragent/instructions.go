@@ -38,9 +38,9 @@ Evaluate these signals from the data provided:
 - CRITICAL: >50% failure rate
 
 ### Signal 4: Findings Quality
-- HEALTHY: >50% of findings are confirmed
-- WARNING: <50% confirmed, or 0 confirmed with 3+ total
-- CRITICAL: 0 confirmed with 5+ total — likely hallucination
+- HEALTHY: ≥40% of findings are confirmed
+- WARNING: <40% confirmed, or 0 confirmed with 3+ total
+- CRITICAL: <20% confirmed with 5+ total — likely hallucination or missing validation
 
 ### Signal 5: Intelligence Efficiency
 - HEALTHY: Agent producing new findings or testing new vectors each cycle

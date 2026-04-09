@@ -62,6 +62,7 @@ type Querier interface {
 	GetContainers(ctx context.Context) ([]Container, error)
 	GetFindingByFingerprint(ctx context.Context, arg GetFindingByFingerprintParams) (Finding, error)
 	GetFlow(ctx context.Context, id int64) (Flow, error)
+	GetFlowFindingConfirmationStats(ctx context.Context, flowID int64) (FlowFindingConfirmationStatsRow, error)
 	GetFlowFindingCount(ctx context.Context, flowID int64) (int64, error)
 	GetFlowFindings(ctx context.Context, flowID int64) ([]Finding, error)
 	GetFlowAgentLog(ctx context.Context, arg GetFlowAgentLogParams) (Agentlog, error)

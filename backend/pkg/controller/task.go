@@ -382,6 +382,7 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 		"flow_id": tw.taskCtx.FlowID,
 	})
 
+	var confirmationSubtasksInjected int
 	for len(tw.stc.ListSubtasks(ctx)) < providers.TasksNumberLimit+3 {
 		if budget := providers.GetBudget(ctx); budget != nil {
 			used, maxCalls, pct := budget.Status()
@@ -486,6 +487,58 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 			logger.WithField("remaining_subtasks", len(remaining)).
 				Info("refiner recovery: continuing with remaining subtasks")
 			continue
+		}
+
+		completedTestingSubtasks := 0
+		for _, sub := range tw.stc.ListSubtasks(ctx) {
+			if sub.IsCompleted() {
+				completedTestingSubtasks++
+			}
+		}
+		confirmStats := providers.GetFlowConfirmationStats(ctx, tw.taskCtx.DB, tw.taskCtx.FlowID)
+		if providers.NeedsConfirmationSubtask(confirmStats, completedTestingSubtasks, confirmationSubtasksInjected) {
+			title, desc := providers.BuildConfirmationSubtaskDescription(ctx, tw.taskCtx.DB, tw.taskCtx.FlowID)
+			_, createErr := tw.taskCtx.DB.CreateSubtask(ctx, database.CreateSubtaskParams{
+				Status:      database.SubtaskStatusCreated,
+				TaskID:      tw.taskCtx.TaskID,
+				Title:       title,
+				Description: desc,
+			})
+			if createErr != nil {
+				logger.WithError(createErr).Warn("failed to inject confirmation subtask")
+			} else {
+				confirmationSubtasksInjected++
+				logger.WithFields(logrus.Fields{
+					"injected_count":     confirmationSubtasksInjected,
+					"unconfirmed":        confirmStats.Unconfirmed,
+					"confirmation_rate":  confirmStats.Rate,
+				}).Info("injected confirmation subtask after refiner")
+			}
+		}
+	}
+
+	preReportStats := providers.GetFlowConfirmationStats(ctx, tw.taskCtx.DB, tw.taskCtx.FlowID)
+	if providers.NeedsQualityGate(preReportStats, confirmationSubtasksInjected) {
+		title, desc := providers.BuildConfirmationSubtaskDescription(ctx, tw.taskCtx.DB, tw.taskCtx.FlowID)
+		_, createErr := tw.taskCtx.DB.CreateSubtask(ctx, database.CreateSubtaskParams{
+			Status:      database.SubtaskStatusCreated,
+			TaskID:      tw.taskCtx.TaskID,
+			Title:       title,
+			Description: desc,
+		})
+		if createErr != nil {
+			logger.WithError(createErr).Warn("quality gate: failed to inject confirmation subtask before report")
+		} else {
+			confirmationSubtasksInjected++
+			logger.WithFields(logrus.Fields{
+				"confirmation_rate": preReportStats.Rate,
+				"unconfirmed":       preReportStats.Unconfirmed,
+				"total_findings":    preReportStats.Total,
+			}).Info("quality gate: injected confirmation subtask before report — rate too low")
+
+			if gateSubtask, popErr := tw.stc.PopSubtask(ctx, tw); popErr == nil && gateSubtask != nil {
+				_ = gateSubtask.Run(ctx)
+			}
 		}
 	}
 
