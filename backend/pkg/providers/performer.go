@@ -592,11 +592,9 @@ func (fp *flowProvider) performAgentChain(
 		// deadline or cancellation. Critical for resumed flows where the parent
 		// context is already expired. User abort handled at flow control level.
 		freshCtx := context.WithoutCancel(ctx)
-		var cancelCause context.CancelCauseFunc
-		ctx, cancelCause = context.WithCancelCause(freshCtx)
-		var timeoutCtx context.Context
-		timeoutCtx, timeoutCancel = context.WithTimeout(ctx, effectiveTimeout)
-		ctx = timeoutCtx
+		var abortCancel context.CancelFunc
+		freshCtx, abortCancel = context.WithCancel(freshCtx)
+		ctx, timeoutCancel = context.WithTimeout(freshCtx, effectiveTimeout)
 
 		// Spawn abort listener: when the flow's abort channel is closed,
 		// cancel the detached context immediately. This bridges the gap
@@ -607,10 +605,12 @@ func (fp *flowProvider) performAgentChain(
 			go func() {
 				select {
 				case <-abortCh:
-					cancelCause(fmt.Errorf("flow aborted by operator"))
+					abortCancel()
 				case <-ctx.Done():
 				}
 			}()
+		} else {
+			defer abortCancel()
 		}
 	} else {
 		// Nested: fresh timeout that still respects parent cancellation
