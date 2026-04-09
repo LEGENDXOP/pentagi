@@ -36,3 +36,7 @@ func (a *flowControlMasterAgentAdapter) Abort(flowID int64) error {
 	_, err := a.mgr.Abort(flowID)
 	return err
 }
+
+func (a *flowControlMasterAgentAdapter) AbortChannel(flowID int64) <-chan struct{} {
+	return a.mgr.AbortChannel(flowID)
+}

@@ -225,9 +225,10 @@ func NewFlowWorker(
 	executor.SetVectorStoreLogProvider(workers.vslw)
 	executor.SetGraphitiClient(fwc.provs.GraphitiClient())
 
-	// Wire flow control checkpoint into the provider's agent loop
+	// Wire flow control checkpoint + abort channel into the provider's agent loop
 	if fwc.flowWorkerCtx.flowControl != nil {
 		flowProvider.SetFlowControlCheckpoint(fwc.flowWorkerCtx.flowControl.CheckPoint)
+		flowProvider.SetFlowAbortChannel(fwc.flowWorkerCtx.flowControl.AbortChannel)
 	}
 
 	flowCtx := &FlowContext{
@@ -394,9 +395,10 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 	executor.SetVectorStoreLogProvider(workers.vslw)
 	executor.SetGraphitiClient(fwc.provs.GraphitiClient())
 
-	// Wire flow control checkpoint into the provider's agent loop
+	// Wire flow control checkpoint + abort channel into the provider's agent loop
 	if fwc.flowControl != nil {
 		flowProvider.SetFlowControlCheckpoint(fwc.flowControl.CheckPoint)
+		flowProvider.SetFlowAbortChannel(fwc.flowControl.AbortChannel)
 	}
 
 	flowCtx := &FlowContext{

@@ -681,6 +681,16 @@ func (tw *taskWorker) runSubtaskWithRetry(
 			return lastErr
 		}
 
+		// FIX Issue-1: Flow abort errors are not retryable. ErrFlowAborted is
+		// returned by CheckPoint when the operator aborts the flow. Retrying
+		// would just hit the same abort flag again.
+		if errors.Is(lastErr, ErrFlowAborted) {
+			return lastErr
+		}
+		if strings.Contains(lastErr.Error(), "flow aborted") {
+			return lastErr
+		}
+
 		// If subtask went to waiting state (user input needed), not retryable
 		if tw.IsWaiting() || st.IsWaiting() {
 			return lastErr

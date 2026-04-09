@@ -592,7 +592,26 @@ func (fp *flowProvider) performAgentChain(
 		// deadline or cancellation. Critical for resumed flows where the parent
 		// context is already expired. User abort handled at flow control level.
 		freshCtx := context.WithoutCancel(ctx)
-		ctx, timeoutCancel = context.WithTimeout(freshCtx, effectiveTimeout)
+		var cancelCause context.CancelCauseFunc
+		ctx, cancelCause = context.WithCancelCause(freshCtx)
+		var timeoutCtx context.Context
+		timeoutCtx, timeoutCancel = context.WithTimeout(ctx, effectiveTimeout)
+		ctx = timeoutCtx
+
+		// Spawn abort listener: when the flow's abort channel is closed,
+		// cancel the detached context immediately. This bridges the gap
+		// between context.WithoutCancel (which ignores parent cancel) and
+		// the abort signal from FlowControlManager.
+		if fp.flowAbortCh != nil {
+			abortCh := fp.flowAbortCh(fp.flowID)
+			go func() {
+				select {
+				case <-abortCh:
+					cancelCause(fmt.Errorf("flow aborted by operator"))
+				case <-ctx.Done():
+				}
+			}()
+		}
 	} else {
 		// Nested: fresh timeout that still respects parent cancellation
 		nestedTimeout := getNestedTimeout(depth)
@@ -1135,6 +1154,31 @@ func (fp *flowProvider) performAgentChain(
 		for idx, toolCall := range result.funcCalls {
 			if toolCall.FunctionCall == nil {
 				continue
+			}
+
+			// FIX Issue-1: Mid-tool-call abort check. Between each tool call in
+			// a batch, check if the context was cancelled (by abort goroutine or
+			// timeout). Without this, all tool calls in a batch execute even after
+			// abort — the agent only sees abort at the next CheckPoint.
+			if ctx.Err() != nil {
+				for j := idx; j < len(result.funcCalls); j++ {
+					if result.funcCalls[j].FunctionCall == nil {
+						continue
+					}
+					chain = append(chain, llms.MessageContent{
+						Role: llms.ChatMessageTypeTool,
+						Parts: []llms.ContentPart{
+							llms.ToolCallResponse{
+								ToolCallID: result.funcCalls[j].ID,
+								Name:       result.funcCalls[j].FunctionCall.Name,
+								Content:    "⛔ Flow terminated — remaining tool calls cancelled.",
+							},
+						},
+					})
+				}
+				logger.WithField("remaining_tools", len(result.funcCalls)-idx).
+					Warn("mid-tool-call abort: cancelled remaining tool calls in batch")
+				return fmt.Errorf("flow aborted mid-tool-call: %w", ctx.Err())
 			}
 
 			funcName := toolCall.FunctionCall.Name

@@ -33,6 +33,10 @@ import (
 // The function blocks while the flow is paused.
 type FlowControlCheckpoint func(ctx context.Context, flowID int64) (steerMessage string, err error)
 
+// FlowAbortChannel is a function that returns a channel closed when the flow is aborted.
+// Used by performer.go to instantly cancel depth-0 detached contexts.
+type FlowAbortChannel func(flowID int64) <-chan struct{}
+
 const ToolPlaceholder = "Always use your function calling functionality, instead of returning a text result."
 
 const TasksNumberLimit = 15
@@ -93,6 +97,7 @@ type FlowProvider interface {
 	SetAgentLogProvider(agentLog tools.AgentLogProvider)
 	SetMsgLogProvider(msgLog tools.MsgLogProvider)
 	SetFlowControlCheckpoint(checkpoint FlowControlCheckpoint)
+	SetFlowAbortChannel(abortCh FlowAbortChannel)
 
 	GetTaskTitle(ctx context.Context, input string) (string, error)
 	GenerateSubtasks(ctx context.Context, taskID int64) ([]tools.SubtaskInfo, error)
@@ -243,6 +248,7 @@ type flowProvider struct {
 	msgLog       tools.MsgLogProvider
 	streamCb     StreamMessageHandler
 	flowControl  FlowControlCheckpoint
+	flowAbortCh  FlowAbortChannel
 
 	summarizer csum.Summarizer
 
@@ -254,6 +260,13 @@ func (fp *flowProvider) SetFlowControlCheckpoint(checkpoint FlowControlCheckpoin
 	defer fp.mx.Unlock()
 
 	fp.flowControl = checkpoint
+}
+
+func (fp *flowProvider) SetFlowAbortChannel(abortCh FlowAbortChannel) {
+	fp.mx.Lock()
+	defer fp.mx.Unlock()
+
+	fp.flowAbortCh = abortCh
 }
 
 func (fp *flowProvider) SetAgentLogProvider(agentLog tools.AgentLogProvider) {

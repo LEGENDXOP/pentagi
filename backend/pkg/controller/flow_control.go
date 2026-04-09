@@ -48,6 +48,9 @@ type FlowControlManager interface {
 	// It blocks while paused, returns steer message if steered (and resets to running),
 	// and returns an error if aborted.
 	CheckPoint(ctx context.Context, flowID int64) (steerMessage string, err error)
+	// AbortChannel returns a channel that is closed when the flow is aborted.
+	// Used by performer.go to instantly cancel depth-0 detached contexts.
+	AbortChannel(flowID int64) <-chan struct{}
 	// Remove cleans up state for a finished/deleted flow.
 	Remove(flowID int64)
 	// OnChange registers a handler for control state changes.
@@ -64,8 +67,10 @@ type flowControlManager struct {
 }
 
 type flowControlEntry struct {
-	state  FlowControlState
-	signal chan struct{} // signaled on resume/steer/abort to unblock paused agents
+	state     FlowControlState
+	signal    chan struct{} // signaled on resume/steer/abort to unblock paused agents
+	abortCh   chan struct{} // closed exactly once when abort triggers — used for instant context cancellation
+	abortOnce sync.Once
 }
 
 // NewFlowControlManager creates a new in-memory flow control manager.
@@ -85,7 +90,8 @@ func (m *flowControlManager) getOrCreate(flowID int64) *flowControlEntry {
 				Status:    FlowControlStatusRunning,
 				UpdatedAt: time.Now(),
 			},
-			signal: make(chan struct{}, 1),
+			signal:  make(chan struct{}, 1),
+			abortCh: make(chan struct{}),
 		}
 		m.states[flowID] = entry
 	}
@@ -197,6 +203,12 @@ func (m *flowControlManager) Abort(flowID int64) (FlowControlState, error) {
 	entry.state.Status = FlowControlStatusAborted
 	entry.state.UpdatedAt = time.Now()
 
+	// Close the abort channel exactly once — this instantly wakes any goroutine
+	// listening on AbortChannel(), enabling immediate context cancellation in
+	// performer.go depth-0 (which uses context.WithoutCancel and can't be
+	// cancelled via the parent context).
+	entry.abortOnce.Do(func() { close(entry.abortCh) })
+
 	// Signal to unblock any CheckPoint waiting
 	m.signalEntry(entry)
 
@@ -252,6 +264,14 @@ func (m *flowControlManager) CheckPoint(ctx context.Context, flowID int64) (stri
 			}
 		}
 	}
+}
+
+func (m *flowControlManager) AbortChannel(flowID int64) <-chan struct{} {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
+	entry := m.getOrCreate(flowID)
+	return entry.abortCh
 }
 
 func (m *flowControlManager) Remove(flowID int64) {

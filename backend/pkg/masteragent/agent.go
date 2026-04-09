@@ -27,6 +27,7 @@ type FlowControlAdapter interface {
 	Pause(flowID int64) error
 	Resume(flowID int64) error
 	Abort(flowID int64) error
+	AbortChannel(flowID int64) <-chan struct{}
 }
 
 // Agent is the LLM-powered Master Agent that supervises a single flow.
