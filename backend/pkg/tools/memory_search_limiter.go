@@ -35,44 +35,47 @@ type MemorySearchLimiter struct {
 	mu sync.Mutex
 
 	// Configuration
-	maxConsecutiveSearches int     // max consecutive memory searches before block (default: 3)
+	maxConsecutiveSearches int     // max consecutive memory searches before block (default: 2)
 	lowRelevanceThreshold  int     // consecutive low-relevance results before block (default: 2)
 	lowRelevanceScore      float64 // score threshold for "low relevance" (default: 0.75)
-	memoryBudgetPercent    float64 // max % of total tool calls that can be memory searches (default: 0.15)
-
-	// FIX Issue-8: Absolute hard cap on memory searches per flow.
-	// Prevents unbounded memory search accumulation even within budget ratio.
-	absoluteSearchCap int // hard cap on total memory searches (default: 20)
+	memoryBudgetPercent    float64 // max % of total tool calls that can be memory searches (default: 0.12)
+	absoluteSearchCap      int     // hard cap on total memory searches per flow (default: 15)
+	perSubtaskCap          int     // max memory searches per subtask (default: 10)
 
 	// State: per-subtask consecutive search tracking
-	// Reset when a non-memory tool is called OR when subtask changes
 	consecutiveSearches int
 	currentSubtaskID    *int64
 
+	// State: per-subtask search count (reset on subtask change)
+	subtaskSearchCount int
+
+	// State: exponential cooldown — requires increasing non-search calls between searches
+	// Required gap: 2^(subtaskSearchesSoFar - 1), capped at 64
+	nonSearchSinceLastSearch int
+
 	// State: low-relevance tracking
-	// Reset when a non-memory tool is called
 	consecutiveLowRelevance int
 
 	// State: per-flow budget tracking
-	totalToolCalls        int
-	totalMemorySearches   int
+	totalToolCalls      int
+	totalMemorySearches int
 
 	// State: consecutive empty result tracking
 	consecutiveEmptyResults int
 	emptyResultBlocked      bool
 
 	// State: whether we are in a blocked state
-	consecutiveBlocked    bool // blocked due to consecutive limit
-	lowRelevanceBlocked   bool // blocked due to low-relevance auto-stop
+	consecutiveBlocked  bool
+	lowRelevanceBlocked bool
 }
 
-// MemorySearchLimiterConfig holds configuration for the limiter.
 type MemorySearchLimiterConfig struct {
 	MaxConsecutiveSearches int
 	LowRelevanceThreshold  int
 	LowRelevanceScore      float64
 	MemoryBudgetPercent    float64
-	AbsoluteSearchCap      int // FIX Issue-8: hard cap on total searches per flow
+	AbsoluteSearchCap      int
+	PerSubtaskCap          int
 }
 
 // DefaultMemorySearchLimiterConfig returns defaults, overridable by env vars.
@@ -82,7 +85,8 @@ func DefaultMemorySearchLimiterConfig() MemorySearchLimiterConfig {
 		LowRelevanceThreshold:  2,
 		LowRelevanceScore:      0.75,
 		MemoryBudgetPercent:    0.12,
-		AbsoluteSearchCap:      15, // FIX Issue-4: tightened from 20→15, ~3 per subtask in 5-subtask flows
+		AbsoluteSearchCap:      15,
+		PerSubtaskCap:          10,
 	}
 
 	if v := os.Getenv("MEMORY_SEARCH_MAX_CONSECUTIVE"); v != "" {
@@ -110,6 +114,11 @@ func DefaultMemorySearchLimiterConfig() MemorySearchLimiterConfig {
 			cfg.AbsoluteSearchCap = n
 		}
 	}
+	if v := os.Getenv("MEMORY_SEARCH_PER_SUBTASK_CAP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 2 {
+			cfg.PerSubtaskCap = n
+		}
+	}
 
 	return cfg
 }
@@ -122,6 +131,7 @@ func NewMemorySearchLimiter(cfg MemorySearchLimiterConfig) *MemorySearchLimiter 
 		lowRelevanceScore:      cfg.LowRelevanceScore,
 		memoryBudgetPercent:    cfg.MemoryBudgetPercent,
 		absoluteSearchCap:      cfg.AbsoluteSearchCap,
+		perSubtaskCap:          cfg.PerSubtaskCap,
 	}
 }
 
@@ -160,9 +170,7 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 	// Always increment total tool calls for budget tracking
 	msl.totalToolCalls++
 
-	// Check if subtask changed — reset consecutive counters.
-	// Deep-copy the value to avoid pointer aliasing: if the caller reuses
-	// the same *int64 and mutates it, we'd miss future transitions.
+	// Check if subtask changed — reset per-subtask counters.
 	if subtaskChanged(msl.currentSubtaskID, subtaskID) {
 		if subtaskID != nil {
 			id := *subtaskID
@@ -171,6 +179,8 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 			msl.currentSubtaskID = nil
 		}
 		msl.consecutiveSearches = 0
+		msl.subtaskSearchCount = 0
+		msl.nonSearchSinceLastSearch = 0
 		msl.consecutiveLowRelevance = 0
 		msl.consecutiveEmptyResults = 0
 		msl.consecutiveBlocked = false
@@ -179,13 +189,11 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 	}
 
 	if !isMemorySearch {
-		// FIX Issue-8: Decay consecutive counter by 1 instead of full reset.
-		if msl.consecutiveSearches > 0 {
-			msl.consecutiveSearches--
-		}
-		if msl.consecutiveSearches == 0 {
-			msl.consecutiveBlocked = false
-		}
+		// FIX Issue-4: Full reset of consecutive counter (not -1 decay).
+		// The -1 decay was exploitable: search→ls→search→ls bypassed limits.
+		msl.consecutiveSearches = 0
+		msl.consecutiveBlocked = false
+		msl.nonSearchSinceLastSearch++
 		msl.consecutiveLowRelevance = 0
 		msl.lowRelevanceBlocked = false
 		msl.consecutiveEmptyResults = 0
@@ -195,9 +203,45 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 
 	// --- This is a memory search tool call ---
 
-	// FIX Issue-8: Absolute hard cap on total memory searches across the flow.
-	// This is a safety net that fires regardless of budget ratio or warm-up.
-	// Set to 20 to allow multi-task flows with ~5 subtasks to average 4 searches each.
+	// FIX Issue-4: Per-subtask cap — prevent one subtask from burning the flow budget.
+	if msl.perSubtaskCap > 0 && msl.subtaskSearchCount >= msl.perSubtaskCap {
+		logrus.WithFields(logrus.Fields{
+			"tool":             name,
+			"subtask_searches": msl.subtaskSearchCount,
+			"per_subtask_cap":  msl.perSubtaskCap,
+		}).Warn("memory search limiter: per-subtask search cap reached")
+
+		return true, fmt.Sprintf(
+			"Memory search per-subtask limit reached (%d/%d searches this subtask). "+
+				"ALTERNATIVE: Use files on disk — `cat /work/HANDOFF.md`, `cat /work/FINDINGS.md`, `ls /work/`. "+
+				"Or use terminal/browser tools directly to continue testing.",
+			msl.subtaskSearchCount, msl.perSubtaskCap,
+		)
+	}
+
+	// FIX Issue-4: Exponential cooldown — require increasing non-search calls between searches.
+	// 1st search: free, 2nd: 1 non-search gap, 3rd: 2, 4th: 4, 5th: 8, capped at 64.
+	if msl.subtaskSearchCount > 0 {
+		requiredGap := 1 << (msl.subtaskSearchCount - 1) // 2^(n-1)
+		if requiredGap > 64 {
+			requiredGap = 64
+		}
+		if msl.nonSearchSinceLastSearch < requiredGap {
+			logrus.WithFields(logrus.Fields{
+				"tool":             name,
+				"required_gap":     requiredGap,
+				"non_search_since": msl.nonSearchSinceLastSearch,
+			}).Warn("memory search limiter: exponential cooldown not met")
+
+			return true, fmt.Sprintf(
+				"Memory search cooldown: need %d non-search tool calls before next search (have %d). "+
+					"Use terminal, browser, or other tools first, then retry.",
+				requiredGap, msl.nonSearchSinceLastSearch,
+			)
+		}
+	}
+
+	// Absolute hard cap on total memory searches across the flow.
 	if msl.absoluteSearchCap > 0 && msl.totalMemorySearches >= msl.absoluteSearchCap {
 		logrus.WithFields(logrus.Fields{
 			"tool":               name,
@@ -306,6 +350,8 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 	// Allowed — record the search
 	msl.consecutiveSearches++
 	msl.totalMemorySearches++
+	msl.subtaskSearchCount++
+	msl.nonSearchSinceLastSearch = 0
 
 	return false, ""
 }
