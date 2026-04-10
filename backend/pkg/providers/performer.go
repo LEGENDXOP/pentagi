@@ -342,6 +342,18 @@ func (fp *flowProvider) performAgentChain(
 		// force-injects pre-generated report and done instruction.
 		reportVerifyCycles = 0
 		lastReportAction   = "" // "write" or "read"
+
+		// Fix 1: Track the last injected steer message to avoid duplicating it
+		// in the chain on every CheckPoint call (steers now persist until cleared).
+		lastInjectedSteer = ""
+
+		// Fix 3+4: Track recon vs exploit tool call counts for dynamic metrics.
+		reconToolCalls   = 0
+		exploitToolCalls = 0
+		filesReadCount   = 0
+
+		// Fix 7: Progress ledger — injected into system prompt every LLM call.
+		progressLedger = NewProgressLedger()
 	)
 
 	// Silence unused variable warnings for guard booleans (set inside loop).
@@ -862,16 +874,19 @@ func (fp *flowProvider) performAgentChain(
 				logger.WithError(fcErr).Warn("flow control: checkpoint returned error (abort or context cancel)")
 				return fmt.Errorf("flow control checkpoint: %w", fcErr)
 			}
-			if steerMsg != "" {
-				// Inject operator override as a system message into the chain
+			// Fix 1+2: Steers now persist (not consumed after one read).
+			// Only inject when the steer is NEW (different from last injected).
+			// Fix 2: Use ChatMessageTypeSystem for higher LLM attention.
+			if steerMsg != "" && steerMsg != lastInjectedSteer {
 				overrideContent := fmt.Sprintf("[OPERATOR OVERRIDE] %s", steerMsg)
 				chain = append(chain, llms.MessageContent{
-					Role: llms.ChatMessageTypeHuman,
+					Role: llms.ChatMessageTypeSystem,
 					Parts: []llms.ContentPart{
 						llms.TextContent{Text: overrideContent},
 					},
 				})
-				logger.WithField("steer_message", steerMsg).Info("flow control: operator steer message injected into chain")
+				lastInjectedSteer = steerMsg
+				logger.WithField("steer_message", steerMsg).Info("flow control: operator steer message injected into chain (system role, persistent)")
 			}
 		}
 
@@ -927,6 +942,21 @@ func (fp *flowProvider) performAgentChain(
 					if knownDataBlock := knownData.FormatForInjection(); knownDataBlock != "" {
 						updated = injectKnownDataBlock(updated, knownDataBlock)
 					}
+
+					// Fix 7: Update and inject progress ledger into system prompt.
+					{
+						ledgerPhase := ""
+						if execState != nil {
+							ledgerPhase = execState.Phase
+						}
+						progressLedger.Update(
+							reconToolCalls, exploitToolCalls,
+							metrics.FindingsCount,
+							0, 0, ledgerPhase,
+							lastInjectedSteer,
+						)
+					}
+					updated = injectProgressLedger(updated, progressLedger.Format())
 
 					chain[0].Parts[0] = llms.TextContent{Text: updated}
 				}
@@ -1197,6 +1227,19 @@ func (fp *flowProvider) performAgentChain(
 			funcName := toolCall.FunctionCall.Name
 			metrics.AddCommand(funcName)
 			metrics.LastToolName = funcName
+
+			// Fix 3: Track recon vs exploit tool call counts using phase classifier.
+			phase := ClassifyToolPhase(funcName)
+			switch phase {
+			case AttackPhaseRecon:
+				reconToolCalls++
+			case AttackPhaseAttack:
+				exploitToolCalls++
+			}
+			// Track file reads
+			if strings.Contains(strings.ToLower(funcName), "read") || funcName == "file_read" {
+				filesReadCount++
+			}
 
 			// v5/v6: Pre-execution checks — completed work re-run + file read cache + loop block.
 			var v5Intercepted bool
@@ -1935,6 +1978,38 @@ func (fp *flowProvider) performAgentChain(
 
 		toolCallCount += len(result.funcCalls)
 		metrics.ToolCallCount = toolCallCount
+		// Fix 3: Sync phase-aware counters into metrics.
+		metrics.ReconToolCalls = reconToolCalls
+		metrics.ExploitToolCalls = exploitToolCalls
+		metrics.FilesReadCount = filesReadCount
+		if findingRegistry != nil {
+			metrics.FindingsCount = findingRegistry.GetFindingCount()
+		}
+
+		// Fix 4: Reflexion/self-check injection every 10 tool calls.
+		if toolCallCount > 0 && toolCallCount%10 == 0 {
+			last5 := toolHistory.GetLast(5)
+			var last5Names []string
+			for _, th := range last5 {
+				last5Names = append(last5Names, th.Name)
+			}
+			findingsNow := 0
+			if findingRegistry != nil {
+				findingsNow = findingRegistry.GetFindingCount()
+			}
+			selfCheck := fmt.Sprintf(
+				"[SELF-CHECK] %d tool calls made. Last 5: [%s]. "+
+					"Findings: %d. Recon: %d, Exploit: %d. "+
+					"Are you progressing toward EXPLOITATION? If last 5 were all recon, switch to exploitation NOW.",
+				toolCallCount, strings.Join(last5Names, ", "),
+				findingsNow, reconToolCalls, exploitToolCalls,
+			)
+			chain = append(chain, llms.MessageContent{
+				Role:  llms.ChatMessageTypeSystem,
+				Parts: []llms.ContentPart{llms.TextContent{Text: selfCheck}},
+			})
+			logger.WithField("tool_call_count", toolCallCount).Debug("injected self-check reflection")
+		}
 
 		// v5/v6: Read loop detection — check for cyclic read patterns after each batch.
 		if loopDetector != nil {

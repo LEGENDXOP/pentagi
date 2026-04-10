@@ -51,6 +51,9 @@ type FlowControlManager interface {
 	// AbortChannel returns a channel that is closed when the flow is aborted.
 	// Used by performer.go to instantly cancel depth-0 detached contexts.
 	AbortChannel(flowID int64) <-chan struct{}
+	// ClearSteer removes the persisted steer message so subsequent CheckPoint
+	// calls return empty. Use after the steer has been fully acted upon.
+	ClearSteer(flowID int64)
 	// Remove cleans up state for a finished/deleted flow.
 	Remove(flowID int64)
 	// OnChange registers a handler for control state changes.
@@ -229,13 +232,21 @@ func (m *flowControlManager) CheckPoint(ctx context.Context, flowID int64) (stri
 
 		switch status {
 		case FlowControlStatusRunning:
+			// Fix 1: Return persisted steer message even in Running state.
+			// This makes the steer persist across multiple tool-call iterations
+			// until ClearSteer() or Resume() explicitly clears it.
+			msg := entry.state.SteerMessage
 			m.mx.Unlock()
-			return "", nil
+			return msg, nil
 
 		case FlowControlStatusSteered:
 			msg := entry.state.SteerMessage
 			entry.state.Status = FlowControlStatusRunning
-			entry.state.SteerMessage = ""
+			// Fix 1: Do NOT clear entry.state.SteerMessage here.
+			// The steer persists until the MA sends a new steer, Resume()
+			// is called, or ClearSteer() explicitly clears it. This ensures
+			// the performer re-injects the steer into every LLM call instead
+			// of losing it after a single consumption.
 			entry.state.UpdatedAt = time.Now()
 			m.notifyHandlers(entry.state)
 			m.mx.Unlock()
@@ -272,6 +283,18 @@ func (m *flowControlManager) AbortChannel(flowID int64) <-chan struct{} {
 
 	entry := m.getOrCreate(flowID)
 	return entry.abortCh
+}
+
+func (m *flowControlManager) ClearSteer(flowID int64) {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
+	entry, ok := m.states[flowID]
+	if !ok {
+		return
+	}
+	entry.state.SteerMessage = ""
+	entry.state.UpdatedAt = time.Now()
 }
 
 func (m *flowControlManager) Remove(flowID int64) {

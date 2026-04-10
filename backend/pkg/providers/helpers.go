@@ -648,12 +648,17 @@ func extractScriptIntent(input string) string {
 // ExecutionMetrics tracks real-time execution telemetry for template rendering.
 // Templates reference these fields via {{.ExecutionMetrics.FieldName}} in conditional blocks.
 type ExecutionMetrics struct {
-	ToolCallCount  int      `json:"tool_call_count"`
-	ElapsedSeconds int      `json:"elapsed_seconds"`
-	UniqueCommands []string `json:"unique_commands"`
-	ErrorCount     int      `json:"error_count"`
-	LastToolName   string   `json:"last_tool_name"`
-	RepeatedCalls  int      `json:"repeated_calls"`
+	ToolCallCount   int      `json:"tool_call_count"`
+	ElapsedSeconds  int      `json:"elapsed_seconds"`
+	UniqueCommands  []string `json:"unique_commands"`
+	ErrorCount      int      `json:"error_count"`
+	LastToolName    string   `json:"last_tool_name"`
+	RepeatedCalls   int      `json:"repeated_calls"`
+	// Fix 3: Phase-aware counters for dynamic variable injection.
+	ReconToolCalls  int `json:"recon_tool_calls"`
+	ExploitToolCalls int `json:"exploit_tool_calls"`
+	FilesReadCount  int `json:"files_read_count"`
+	FindingsCount   int `json:"findings_count"`
 }
 
 // AddCommand records a tool/command name, maintaining uniqueness.
@@ -677,15 +682,27 @@ func (em *ExecutionMetrics) Snapshot(startTime time.Time) ExecutionMetrics {
 // in a rendered system prompt. This avoids full template re-rendering.
 // timeRemainingMinutes is injected when >= 0 (pass -1 to omit).
 func injectMetricsIntoSystemPrompt(systemPrompt string, metrics ExecutionMetrics, timeRemainingMinutes int) string {
+	// Fix 3: Include recon/exploit/files-read/findings counters for self-regulation.
+	elapsedMin := metrics.ElapsedSeconds / 60
 	metricsBlock := fmt.Sprintf(
 		"<execution_metrics>\n"+
 			"  <tool_calls_made>%d</tool_calls_made>\n"+
 			"  <elapsed_seconds>%d</elapsed_seconds>\n"+
 			"  <unique_commands_used>%v</unique_commands_used>\n"+
+			"  <recon_tool_calls>%d</recon_tool_calls>\n"+
+			"  <exploit_tool_calls>%d</exploit_tool_calls>\n"+
+			"  <files_read>%d</files_read>\n"+
+			"  <findings_confirmed>%d</findings_confirmed>\n"+
+			"  <time_elapsed_minutes>%d</time_elapsed_minutes>\n"+
 			"</execution_metrics>",
 		metrics.ToolCallCount,
 		metrics.ElapsedSeconds,
 		metrics.UniqueCommands,
+		metrics.ReconToolCalls,
+		metrics.ExploitToolCalls,
+		metrics.FilesReadCount,
+		metrics.FindingsCount,
+		elapsedMin,
 	)
 
 	// Try to replace existing block

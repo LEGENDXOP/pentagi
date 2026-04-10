@@ -29,6 +29,10 @@ type FlowControlAdapter interface {
 	Abort(flowID int64) error
 	AbortChannel(flowID int64) <-chan struct{}
 	HardStop(flowID int64) error // full flow termination (DB + container + goroutine cleanup)
+	// Fix 5: Force-complete the current subtask and advance to the next.
+	SkipSubtask(flowID int64) error
+	// Fix 6: Create a new subtask inserted as the next to execute.
+	InjectSubtask(flowID int64, description string) error
 }
 
 // Agent is the LLM-powered Master Agent that supervises a single flow.
@@ -612,9 +616,21 @@ func parseLLMResponse(text string) (*LLMDecision, error) {
 		decision.Action = ActionSteer
 	}
 
+	// Fix 6: Handle INJECT_SUBTASK:<description> format
+	if strings.HasPrefix(string(decision.Action), "INJECT_SUBTASK") {
+		if decision.SubtaskDescription == "" && strings.Contains(string(decision.Action), ":") {
+			parts := strings.SplitN(string(decision.Action), ":", 2)
+			if len(parts) == 2 {
+				decision.SubtaskDescription = strings.TrimSpace(parts[1])
+			}
+		}
+		decision.Action = ActionInjectSubtask
+	}
+
 	// Validate
 	switch decision.Action {
-	case ActionNone, ActionSteer, ActionPause, ActionResume, ActionStop, ActionHardStop:
+	case ActionNone, ActionSteer, ActionPause, ActionResume, ActionStop, ActionHardStop,
+		ActionSkipSubtask, ActionInjectSubtask:
 		// valid
 	default:
 		return nil, fmt.Errorf("unknown action: %s", decision.Action)
@@ -765,6 +781,46 @@ func (a *Agent) executeDecision(ctx context.Context, decision *LLMDecision, data
 
 		a.logger.WithField("ignored_steers", snap.ConsecutiveIgnoredSteers).
 			Warn("flow hard stopped by master agent")
+		return nil
+
+	case ActionSkipSubtask:
+		// Fix 5: Skip the current subtask and advance.
+		snap := a.state.Snapshot()
+
+		if err := a.flowControl.SkipSubtask(a.flowID); err != nil {
+			return fmt.Errorf("skip subtask: %w", err)
+		}
+
+		a.state.RecordCriticalEvent(fmt.Sprintf("cycle %d: SKIP_SUBTASK — %s",
+			snap.Cycle, truncate(decision.Reasoning, 100)))
+
+		a.sendTelegramNotification(fmt.Sprintf("⏭ [MASTER AGENT] Flow %d SKIP_SUBTASK (Cycle %d)\n%s",
+			a.flowID, snap.Cycle, truncate(decision.Reasoning, 200)))
+
+		a.logger.Info("current subtask skipped")
+		return nil
+
+	case ActionInjectSubtask:
+		// Fix 6: Inject a new subtask as the next to execute.
+		if decision.SubtaskDescription == "" {
+			a.logger.Warn("inject_subtask action with empty description, skipping")
+			return nil
+		}
+
+		snap := a.state.Snapshot()
+
+		if err := a.flowControl.InjectSubtask(a.flowID, decision.SubtaskDescription); err != nil {
+			return fmt.Errorf("inject subtask: %w", err)
+		}
+
+		a.state.RecordCriticalEvent(fmt.Sprintf("cycle %d: INJECT_SUBTASK — %s",
+			snap.Cycle, truncate(decision.SubtaskDescription, 100)))
+
+		a.sendTelegramNotification(fmt.Sprintf("➕ [MASTER AGENT] Flow %d INJECT_SUBTASK (Cycle %d)\n%s",
+			a.flowID, snap.Cycle, truncate(decision.SubtaskDescription, 200)))
+
+		a.logger.WithField("description", truncate(decision.SubtaskDescription, 100)).
+			Info("new subtask injected")
 		return nil
 
 	default:

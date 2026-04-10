@@ -294,6 +294,37 @@ Every multi-class subtask is wasted money and time.
 - "✅ Race condition testing on payment and withdrawal endpoints" → ONE class (Race Conditions)
 - "✅ Business logic testing — price manipulation, coupon stacking, fee removal" → ONE class (Business Logic)
 
+### STRUCTURED SUBTASK DESCRIPTIONS (MANDATORY for exploitation subtasks)
+Do NOT write vague category labels like "SSRF testing on URL params." Every exploitation subtask description MUST use this structured format:
+
+```
+OBJECTIVE: <one sentence of what to prove>
+FIRST COMMAND: <exact terminal command to start with — grep HANDOFF.md for targets>
+SUCCESS CRITERIA: <what a confirmed finding looks like>
+CHAIN-IF-FOUND: <what to test next if confirmed>
+EXPECTED TOOL CALLS: <number estimate>
+```
+
+**Example structured exploitation subtask:**
+```
+OBJECTIVE: Prove IDOR on user API endpoints
+FIRST COMMAND: curl -v https://target/api/users/2 -H "Authorization: Bearer $USER_A_TOKEN"
+SUCCESS CRITERIA: Response contains user 2's data while authenticated as user 1
+CHAIN-IF-FOUND: Try PUT/DELETE for write escalation, test with admin endpoints
+EXPECTED TOOL CALLS: 10-15
+```
+
+**Example structured SSRF subtask:**
+```
+OBJECTIVE: Confirm SSRF via URL parameters and escalate to cloud metadata
+FIRST COMMAND: curl -v "https://target/api/preview?url=http://INTERACTSH_URL"
+SUCCESS CRITERIA: OOB callback received OR cloud metadata (169.254.169.254) in response body
+CHAIN-IF-FOUND: Extract IAM credentials, test internal port scan via SSRF
+EXPECTED TOOL CALLS: 12-18
+```
+
+Recon and report subtasks do NOT need this format — only exploitation subtasks (Phase 2-4).
+
 ### Scope Validation Test
 Before finalizing each subtask, ask: "Does this subtask mention more than ONE vulnerability class?"
 - If YES → SPLIT IT into separate subtasks, one per class

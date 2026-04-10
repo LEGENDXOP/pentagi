@@ -18,20 +18,23 @@ const (
 type Action string
 
 const (
-	ActionNone     Action = "NONE"
-	ActionSteer    Action = "STEER"
-	ActionPause    Action = "PAUSE"
-	ActionResume   Action = "RESUME"
-	ActionStop     Action = "STOP"
-	ActionHardStop Action = "HARD_STOP" // forced termination with full cleanup
+	ActionNone          Action = "NONE"
+	ActionSteer         Action = "STEER"
+	ActionPause         Action = "PAUSE"
+	ActionResume        Action = "RESUME"
+	ActionStop          Action = "STOP"
+	ActionHardStop      Action = "HARD_STOP"       // forced termination with full cleanup
+	ActionSkipSubtask   Action = "SKIP_SUBTASK"    // force-complete current subtask, advance to next
+	ActionInjectSubtask Action = "INJECT_SUBTASK"  // create new subtask as next-to-execute
 )
 
 // LLMDecision represents the parsed response from the LLM.
 type LLMDecision struct {
-	Action       Action       `json:"action"`
-	SteerMessage string       `json:"steer_message,omitempty"`
-	Health       HealthStatus `json:"health"`
-	Reasoning    string       `json:"reasoning"`
+	Action              Action       `json:"action"`
+	SteerMessage        string       `json:"steer_message,omitempty"`
+	SubtaskDescription  string       `json:"subtask_description,omitempty"` // Fix 6: for INJECT_SUBTASK
+	Health              HealthStatus `json:"health"`
+	Reasoning           string       `json:"reasoning"`
 }
 
 // SteerRecord tracks a single steer's lifecycle: sent → consumed → effective/ignored.
