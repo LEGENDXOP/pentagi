@@ -45,9 +45,11 @@ const (
 	DefaultExploitMaxDuration = 60 * time.Minute
 
 	// DefaultReportMaxDuration is the maximum time for report/documentation subtasks.
-	// Reports need time to read findings, compile, and format. Set higher than
-	// generic because report generation involves file I/O and summarization.
-	DefaultReportMaxDuration = 45 * time.Minute
+	// Fix SURGEON-C #1: Reduced from 45 min to 15 min. Report subtasks should be
+	// write-only (compile findings → markdown → result tool). The 45 min budget
+	// enabled death spiral loops (write→read→verify→rewrite) consuming 94 min in
+	// Flow 53. With the pre-generated report from ReportGenerator, 15 min is ample.
+	DefaultReportMaxDuration = 15 * time.Minute
 
 	// DefaultGenericMaxDuration is the fallback for subtasks that don't match
 	// a known category.

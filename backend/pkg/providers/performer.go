@@ -336,6 +336,12 @@ func (fp *flowProvider) performAgentChain(
 		// Complements isWriteOperation() in helpers.go which exempts writes from
 		// the repeat detector — this catches same-content loops specifically.
 		writeDedup = NewWriteDeduplicator()
+
+		// Fix SURGEON-C #1: Report verification loop breaker.
+		// Tracks write→read→write cycles for report files. After 2 cycles,
+		// force-injects pre-generated report and done instruction.
+		reportVerifyCycles = 0
+		lastReportAction   = "" // "write" or "read"
 	)
 
 	// Silence unused variable warnings for guard booleans (set inside loop).
@@ -573,8 +579,11 @@ func (fp *flowProvider) performAgentChain(
 				effectiveTimeout = timebox.MaxDuration
 			}
 
-			// Issue 2: For report subtasks, inject markdown-first guidance.
+			// Issue 2: For report subtasks, inject markdown-first guidance
+			// and block ALL memory searches (they add zero value during report writing).
 			if timebox.Category == SubtaskCategoryReport {
+				fp.executor.SetMemorySearchReportPhase(true)
+				defer fp.executor.SetMemorySearchReportPhase(false) // clear on subtask exit
 				reportGuidance := llms.MessageContent{
 					Role: llms.ChatMessageTypeHuman,
 					Parts: []llms.ContentPart{
@@ -1342,6 +1351,57 @@ func (fp *flowProvider) performAgentChain(
 							},
 						})
 						logger.Warn("report phase intercept: injected permanent block message after 2+ attempts")
+					}
+				}
+			}
+
+			// Fix SURGEON-C #1: Report verification loop breaker.
+			// Detect write→read→write cycles for report files during report subtasks.
+			// After 2 full cycles, inject the pre-generated report and force done.
+			if !v5Intercepted && !reportPhaseIntercepted && timebox != nil && timebox.Category == SubtaskCategoryReport {
+				if funcName == "terminal" {
+					var termArgs map[string]interface{}
+					if err := json.Unmarshal(json.RawMessage(toolCall.FunctionCall.Arguments), &termArgs); err == nil {
+						if input, ok := termArgs["input"].(string); ok {
+							inputLower := strings.ToLower(input)
+							isReportWrite := (strings.Contains(inputLower, "report") || strings.Contains(inputLower, "findings")) &&
+								(strings.Contains(inputLower, "cat >") || strings.Contains(inputLower, "echo") ||
+									strings.Contains(inputLower, "tee ") || strings.Contains(inputLower, "heredoc") ||
+									strings.Contains(inputLower, "<<"))
+							isReportRead := (strings.Contains(inputLower, "report") || strings.Contains(inputLower, "findings")) &&
+								(strings.Contains(inputLower, "cat ") || strings.Contains(inputLower, "head ") ||
+									strings.Contains(inputLower, "tail ") || strings.Contains(inputLower, "wc ") ||
+									strings.Contains(inputLower, "less ") || strings.Contains(inputLower, "md5sum"))
+
+							if isReportWrite {
+								if lastReportAction == "read" {
+									reportVerifyCycles++
+								}
+								lastReportAction = "write"
+							} else if isReportRead {
+								lastReportAction = "read"
+							}
+
+							if reportVerifyCycles >= 2 {
+								v5Intercepted = true
+								// Generate report from registered findings and inject it
+								var preGenReport string
+								if findingRegistry != nil && findingRegistry.GetFindingCount() > 0 {
+									rg := NewReportGenerator(fp.flowID, "Penetration Test", findingRegistry, evidenceCollector, nil)
+									preGenReport = rg.GenerateMarkdownReport()
+								}
+								v5Response = fmt.Sprintf(
+									"🛑 REPORT LOOP DETECTED: You have written and re-read the report %d times. "+
+										"STOP the write→read→verify→rewrite cycle.\n\n"+
+										"A structured report has been pre-generated from registered findings. "+
+										"Call the result/done tool NOW with this report. Do NOT write another version.\n\n"+
+										"PRE-GENERATED REPORT:\n%s",
+									reportVerifyCycles, preGenReport,
+								)
+								logger.WithField("report_verify_cycles", reportVerifyCycles).
+									Warn("SURGEON-C #1: report verification loop detected, injecting pre-generated report")
+							}
+						}
 					}
 				}
 			}

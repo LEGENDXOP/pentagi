@@ -447,7 +447,21 @@ func (fr *FindingRegistry) PersistFindings(ctx context.Context, db database.Quer
 		var rootCauseID sql.NullInt64
 
 		// Fix AUDITOR-4: Auto-confirm findings with strong evidence patterns.
-		confirmed := f.Confirmed || autoConfirmFromEvidence(f)
+		// Guard: skip auto-confirm for report-dump and unconfirmed-flagged findings
+		// whose descriptions naturally contain words like "confirmed" and "successfully".
+		isReportDump := strings.HasPrefix(f.Description, "[REPORT-DUMP") ||
+			strings.HasPrefix(f.Description, "[UNCONFIRMED")
+		hasReportDumpEvidence := false
+		for _, ev := range f.Evidence {
+			if isReportDumpDescription(ev.Content) {
+				hasReportDumpEvidence = true
+				break
+			}
+		}
+		confirmed := f.Confirmed
+		if !isReportDump && !hasReportDumpEvidence {
+			confirmed = confirmed || autoConfirmFromEvidence(f)
+		}
 
 		newFinding, createErr := db.CreateFinding(ctx, database.CreateFindingParams{
 			FlowID:        f.FlowID,
@@ -570,10 +584,10 @@ func autoConfirmFromEvidence(f ReportFinding) bool {
 	}
 
 	// Pattern 3: Data extraction evidence
+	// Removed "successfully" and "confirmed" — too generic, matches report text
 	dataPatterns := []string{
 		"extracted", "dumped", "leaked", "disclosed",
 		"password", "token", "secret", "credential",
-		"successfully", "confirmed",
 	}
 
 	// Pattern 4: Active exploitation evidence
@@ -620,7 +634,7 @@ func autoConfirmFromEvidence(f ReportFinding) bool {
 			dataMatches++
 		}
 	}
-	if dataMatches >= 2 {
+	if dataMatches >= 3 {
 		return true
 	}
 
@@ -1468,6 +1482,11 @@ func isReportDumpDescription(desc string) bool {
 // severityFromVulnType determines severity using the authoritative CVSS scores
 // from ComplianceMappings, keyed by normalized vulnerability type. This replaces
 // the broken inferSeverityFromResponse which matched "critical" anywhere in text.
+//
+// Fix SURGEON-C #2: For unmapped vuln types, applies keyword-based severity
+// floors instead of blindly defaulting to "medium". This fixes Flow 53 where
+// PayPal IPN forgery (CRITICAL) and MySQL 3306 exposed (HIGH) were both
+// registered as MEDIUM.
 func severityFromVulnType(vulnType string) string {
 	normalized := NormalizeVulnType(vulnType)
 	if cm := GetComplianceForVulnType(normalized); cm != nil {
@@ -1484,7 +1503,75 @@ func severityFromVulnType(vulnType string) string {
 			return "info"
 		}
 	}
-	return "medium"
+
+	// Fix SURGEON-C #2: Keyword-based severity floors for unmapped vuln types.
+	// The agent often reports vuln types that don't have exact ComplianceMappings
+	// entries (e.g., "payment_manipulation", "exposed_database", "version_disclosure").
+	// Instead of defaulting all to "medium", apply security-domain heuristics.
+	return severityFloorFromKeywords(normalized)
+}
+
+// severityFloorFromKeywords returns a minimum severity for unmapped vuln types
+// based on keyword patterns in the normalized vuln type string.
+// This fixes the Flow 53 pattern where domain-critical vulns got "medium".
+func severityFloorFromKeywords(normalizedVuln string) string {
+	lower := strings.ToLower(normalizedVuln)
+
+	// CRITICAL floor: payment/financial manipulation, RCE indicators
+	criticalKeywords := []string{
+		"payment", "paypal", "stripe", "billing", "financial",
+		"ipn", "webhook_forgery", "transaction",
+		"rce", "remote_code", "code_execution",
+		"supply_chain", "backdoor",
+	}
+	for _, kw := range criticalKeywords {
+		if strings.Contains(lower, kw) {
+			return "critical"
+		}
+	}
+
+	// HIGH floor: exposed databases, auth issues, sensitive exposure
+	highKeywords := []string{
+		"exposed_database", "database_exposed", "mysql_exposed", "postgres_exposed",
+		"mongodb_exposed", "redis_exposed", "exposed_service", "exposed_port",
+		"admin_panel", "admin_exposed", "debug_endpoint",
+		"credential_leak", "hardcoded_credential", "default_credential",
+		"unauthenticated_access", "no_authentication",
+		"privilege", "escalation",
+		"data_breach", "data_dump",
+	}
+	for _, kw := range highKeywords {
+		if strings.Contains(lower, kw) {
+			return "high"
+		}
+	}
+
+	// INFO floor: version disclosure, informational items, positive findings
+	infoKeywords := []string{
+		"version_disclosure", "server_version", "banner_disclosure",
+		"version_info", "header_disclosure",
+		"no_vulnerability", "not_vulnerable", "properly_configured",
+		"no_enumeration", "rate_limited", "secure_implementation",
+		"best_practice", "positive_finding",
+	}
+	for _, kw := range infoKeywords {
+		if strings.Contains(lower, kw) {
+			return "info"
+		}
+	}
+
+	// LOW floor: informational-adjacent patterns
+	lowKeywords := []string{
+		"cookie_flag", "missing_header", "clickjacking",
+		"content_type", "x_frame", "hsts",
+	}
+	for _, kw := range lowKeywords {
+		if strings.Contains(lower, kw) {
+			return "low"
+		}
+	}
+
+	return "medium" // True unknown — conservative fallback
 }
 
 // severityFromVulnTypeWithAgentFallback uses CVSS-based severity for mapped vuln types,

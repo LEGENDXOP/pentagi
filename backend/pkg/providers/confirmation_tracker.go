@@ -58,10 +58,14 @@ func NeedsQualityGate(stats ConfirmationStats, injectedCount int) bool {
 	return stats.Rate < 0.30
 }
 
+// ConfirmationSubtaskPrefix is the prefix used to mark system-injected confirmation
+// subtasks so the refiner cannot delete them.
+const ConfirmationSubtaskPrefix = "[CONFIRMATION] "
+
 func BuildConfirmationSubtaskDescription(ctx context.Context, db database.Querier, flowID int64) (string, string) {
 	findings, err := db.GetFlowFindings(ctx, flowID)
 	if err != nil {
-		return "Finding Confirmation",
+		return ConfirmationSubtaskPrefix + "Finding Confirmation",
 			"Re-test and validate unconfirmed findings from previous subtasks."
 	}
 
@@ -73,7 +77,7 @@ func BuildConfirmationSubtaskDescription(ctx context.Context, db database.Querie
 	}
 
 	if len(unconfirmed) == 0 {
-		return "Finding Confirmation",
+		return ConfirmationSubtaskPrefix + "Finding Confirmation",
 			"All findings are confirmed. Verify edge cases for highest-severity items."
 	}
 
@@ -91,7 +95,7 @@ func BuildConfirmationSubtaskDescription(ctx context.Context, db database.Querie
 	}
 	desc += "\nFor each finding: reproduce the issue, capture HTTP evidence, and mark as confirmed or false positive."
 
-	return "Finding Confirmation & Validation", desc
+	return ConfirmationSubtaskPrefix + "Finding Confirmation & Validation", desc
 }
 
 func FormatConfirmationForRefiner(stats ConfirmationStats) string {

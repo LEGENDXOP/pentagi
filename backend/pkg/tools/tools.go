@@ -304,6 +304,10 @@ type FlowToolsExecutor interface {
 	GetMemoristExecutor(cfg MemoristExecutorConfig) (ContextToolsExecutor, error)
 	GetEnricherExecutor(cfg EnricherExecutorConfig) (ContextToolsExecutor, error)
 	GetReporterExecutor(cfg ReporterExecutorConfig) (ContextToolsExecutor, error)
+
+	// SetMemorySearchReportPhase enables/disables report-phase memory search blocking.
+	// When enabled, ALL memory searches are blocked for the duration of the report subtask.
+	SetMemorySearchReportPhase(blocked bool)
 }
 
 func NewFlowToolsExecutor(
@@ -389,6 +393,12 @@ func (fte *flowToolsExecutor) SetGraphitiClient(client *graphiti.Client) {
 	// Wire up fallback pgvector store for circuit breaker fallback
 	if client != nil && fte.store != nil {
 		client.SetFallbackStore(fte.store)
+	}
+}
+
+func (fte *flowToolsExecutor) SetMemorySearchReportPhase(blocked bool) {
+	if fte.memorySearchLimiter != nil {
+		fte.memorySearchLimiter.SetReportPhase(blocked)
 	}
 }
 

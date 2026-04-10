@@ -225,5 +225,51 @@ func (q *Queries) GetFlowFindingConfirmationStats(ctx context.Context, flowID in
 	return i, err
 }
 
+// ─── Finding Update Operations ──────────────────────────────────────────────
+// These were defined in sqlc/models/reporting.sql but never generated into Go.
+// Fix SURGEON-C #4: Manual implementation to support FP auto-correction.
+
+const updateFindingConfirmed = `-- name: UpdateFindingConfirmed :exec
+UPDATE findings SET confirmed = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1
+`
+
+type UpdateFindingConfirmedParams struct {
+	ID        int64 `json:"id"`
+	Confirmed bool  `json:"confirmed"`
+}
+
+func (q *Queries) UpdateFindingConfirmed(ctx context.Context, arg UpdateFindingConfirmedParams) error {
+	_, err := q.db.ExecContext(ctx, updateFindingConfirmed, arg.ID, arg.Confirmed)
+	return err
+}
+
+const updateFindingFalsePositive = `-- name: UpdateFindingFalsePositive :exec
+UPDATE findings SET false_positive = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1
+`
+
+type UpdateFindingFalsePositiveParams struct {
+	ID            int64 `json:"id"`
+	FalsePositive bool  `json:"false_positive"`
+}
+
+func (q *Queries) UpdateFindingFalsePositive(ctx context.Context, arg UpdateFindingFalsePositiveParams) error {
+	_, err := q.db.ExecContext(ctx, updateFindingFalsePositive, arg.ID, arg.FalsePositive)
+	return err
+}
+
+const updateFindingSeverity = `-- name: UpdateFindingSeverity :exec
+UPDATE findings SET severity = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1
+`
+
+type UpdateFindingSeverityParams struct {
+	ID       int64  `json:"id"`
+	Severity string `json:"severity"`
+}
+
+func (q *Queries) UpdateFindingSeverity(ctx context.Context, arg UpdateFindingSeverityParams) error {
+	_, err := q.db.ExecContext(ctx, updateFindingSeverity, arg.ID, arg.Severity)
+	return err
+}
+
 // Ensure unused import is used.
 var _ = time.Now

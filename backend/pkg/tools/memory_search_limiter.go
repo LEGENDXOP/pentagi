@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/sirupsen/logrus"
@@ -38,9 +39,9 @@ type MemorySearchLimiter struct {
 	maxConsecutiveSearches int     // max consecutive memory searches before block (default: 2)
 	lowRelevanceThreshold  int     // consecutive low-relevance results before block (default: 2)
 	lowRelevanceScore      float64 // score threshold for "low relevance" (default: 0.75)
-	memoryBudgetPercent    float64 // max % of total tool calls that can be memory searches (default: 0.12)
-	absoluteSearchCap      int     // hard cap on total memory searches per flow (default: 15)
-	perSubtaskCap          int     // max memory searches per subtask (default: 10)
+	memoryBudgetPercent    float64 // max % of total tool calls that can be memory searches (default: 0.10)
+	absoluteSearchCap      int     // hard cap on total memory searches per flow (default: 12)
+	perSubtaskCap          int     // max memory searches per subtask (default: 5)
 
 	// State: per-subtask consecutive search tracking
 	consecutiveSearches int
@@ -67,6 +68,9 @@ type MemorySearchLimiter struct {
 	// State: whether we are in a blocked state
 	consecutiveBlocked  bool
 	lowRelevanceBlocked bool
+
+	// State: report-phase blocking
+	reportPhaseBlocked bool // when true, ALL memory searches are blocked
 }
 
 type MemorySearchLimiterConfig struct {
@@ -84,9 +88,9 @@ func DefaultMemorySearchLimiterConfig() MemorySearchLimiterConfig {
 		MaxConsecutiveSearches: 2,
 		LowRelevanceThreshold:  2,
 		LowRelevanceScore:      0.75,
-		MemoryBudgetPercent:    0.12,
-		AbsoluteSearchCap:      15,
-		PerSubtaskCap:          10,
+		MemoryBudgetPercent:    0.10,
+		AbsoluteSearchCap:      12,
+		PerSubtaskCap:          5,
 	}
 
 	if v := os.Getenv("MEMORY_SEARCH_MAX_CONSECUTIVE"); v != "" {
@@ -155,6 +159,25 @@ func IsMemorySearchTool(name string) bool {
 	return memorySearchToolNames[name]
 }
 
+// SetReportPhase enables or disables report-phase blocking.
+// When enabled, ALL memory searches are blocked unconditionally.
+// Call with true when a report-category subtask starts, false otherwise.
+func (msl *MemorySearchLimiter) SetReportPhase(blocked bool) {
+	msl.mu.Lock()
+	defer msl.mu.Unlock()
+	msl.reportPhaseBlocked = blocked
+	if blocked {
+		logrus.Info("memory search limiter: report phase activated — all memory searches blocked")
+	}
+}
+
+// IsReportPhaseBlocked returns whether report-phase blocking is active.
+func (msl *MemorySearchLimiter) IsReportPhaseBlocked() bool {
+	msl.mu.Lock()
+	defer msl.mu.Unlock()
+	return msl.reportPhaseBlocked
+}
+
 // CheckAndRecord checks whether a tool call should be allowed and records it.
 // Returns (blocked bool, message string).
 // If blocked=true, the caller should return `message` instead of executing the tool.
@@ -202,6 +225,18 @@ func (msl *MemorySearchLimiter) CheckAndRecord(name string, subtaskID *int64) (b
 	}
 
 	// --- This is a memory search tool call ---
+
+	// Report-phase hard block: zero memory searches allowed during report writing.
+	if msl.reportPhaseBlocked {
+		logrus.WithFields(logrus.Fields{
+			"tool": name,
+		}).Warn("memory search limiter: blocked during report phase")
+
+		return true, "Memory searches are DISABLED during the report phase. " +
+			"You already have all findings in /work/FINDINGS.md and /work/HANDOFF.md. " +
+			"Read those files with `cat` and compile your report directly. " +
+			"Do NOT search memory — write the report from existing files."
+	}
 
 	// FIX Issue-4: Per-subtask cap — prevent one subtask from burning the flow budget.
 	if msl.perSubtaskCap > 0 && msl.subtaskSearchCount >= msl.perSubtaskCap {
@@ -408,6 +443,23 @@ func (msl *MemorySearchLimiter) GetStats() (consecutiveSearches, totalMemory, to
 	msl.mu.Lock()
 	defer msl.mu.Unlock()
 	return msl.consecutiveSearches, msl.totalMemorySearches, msl.totalToolCalls
+}
+
+// IsReportSubtask checks if a subtask title/description indicates a report-phase subtask.
+// Uses the same keyword-based classification as subtask_timebox.go but lives in the tools
+// package to avoid import cycles.
+func IsReportSubtask(title, description string) bool {
+	combined := strings.ToLower(title + " " + description)
+	reportKeywords := []string{
+		"report", "document", "summary", "findings", "remediation",
+		"final report", "compile", "consolidate",
+	}
+	for _, kw := range reportKeywords {
+		if strings.Contains(combined, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // subtaskChanged checks if the subtask ID has changed.

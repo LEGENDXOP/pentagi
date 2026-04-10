@@ -150,6 +150,10 @@ func (stc *subtaskController) GenerateSubtasks(ctx context.Context) error {
 	return nil
 }
 
+// confirmationSubtaskPrefix is used to mark system-injected confirmation subtasks
+// so the refiner cannot delete them.
+const confirmationSubtaskPrefix = "[CONFIRMATION] "
+
 func (stc *subtaskController) RefineSubtasks(ctx context.Context) error {
 	subtasks, err := stc.taskCtx.DB.GetTaskSubtasks(ctx, stc.taskCtx.TaskID)
 	if err != nil {
@@ -168,6 +172,14 @@ func (stc *subtaskController) RefineSubtasks(ctx context.Context) error {
 	subtaskIDs := make([]int64, 0, len(subtasks))
 	for _, subtask := range subtasks {
 		if subtask.Status == database.SubtaskStatusCreated {
+			// Never delete system-injected confirmation subtasks
+			if strings.HasPrefix(subtask.Title, confirmationSubtaskPrefix) {
+				logrus.WithFields(logrus.Fields{
+					"subtask_id": subtask.ID,
+					"title":      subtask.Title,
+				}).Info("refiner: preserving system-injected confirmation subtask")
+				continue
+			}
 			subtaskIDs = append(subtaskIDs, subtask.ID)
 		}
 	}

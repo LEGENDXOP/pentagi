@@ -18,11 +18,12 @@ const (
 type Action string
 
 const (
-	ActionNone   Action = "NONE"
-	ActionSteer  Action = "STEER"
-	ActionPause  Action = "PAUSE"
-	ActionResume Action = "RESUME"
-	ActionStop   Action = "STOP"
+	ActionNone     Action = "NONE"
+	ActionSteer    Action = "STEER"
+	ActionPause    Action = "PAUSE"
+	ActionResume   Action = "RESUME"
+	ActionStop     Action = "STOP"
+	ActionHardStop Action = "HARD_STOP" // forced termination with full cleanup
 )
 
 // LLMDecision represents the parsed response from the LLM.
@@ -31,6 +32,15 @@ type LLMDecision struct {
 	SteerMessage string       `json:"steer_message,omitempty"`
 	Health       HealthStatus `json:"health"`
 	Reasoning    string       `json:"reasoning"`
+}
+
+// SteerRecord tracks a single steer's lifecycle: sent → consumed → effective/ignored.
+type SteerRecord struct {
+	Cycle        int    `json:"cycle"`
+	Message      string `json:"message"`
+	ConsumedAt   int    `json:"consumed_at"`   // cycle when steer was consumed (0 = still pending)
+	WasEffective bool   `json:"was_effective"` // true if agent behavior changed after consumption
+	Evaluated    bool   `json:"evaluated"`     // true if effectiveness was checked
 }
 
 // CycleState tracks the Master Agent's state for a flow across cycles.
@@ -50,6 +60,12 @@ type CycleState struct {
 	HealthHistory   []HealthStatus `json:"health_history"`    // last 10
 	CriticalEvents  []string     `json:"critical_events"`    // last 20
 	NoProgressWindow []bool      `json:"no_progress_window"` // last 10
+
+	// Steer effectiveness tracking (Issue A: HARD_STOP authority)
+	SteerHistory             []SteerRecord `json:"steer_history"`              // last 10 steers
+	ConsecutiveIgnoredSteers int           `json:"consecutive_ignored_steers"` // reset on effective steer or HARD_STOP
+	LastSteerConsumedCycle   int           `json:"last_steer_consumed_cycle"` // cycle when last steer was consumed
+	PreSteerToolPattern      string        `json:"pre_steer_tool_pattern"`    // tool call pattern before steer (for comparison)
 }
 
 // NewCycleState creates a fresh cycle state for a flow.
@@ -106,13 +122,74 @@ func (cs *CycleState) RecordCriticalEvent(event string) {
 	}
 }
 
-// RecordSteer records that a steer was performed this cycle.
+// RecordSteer records that a steer was performed this cycle (legacy — used when no pattern tracking needed).
 func (cs *CycleState) RecordSteer() {
 	cs.mx.Lock()
 	defer cs.mx.Unlock()
 
 	cs.TotalSteers++
 	cs.LastSteerCycle = cs.Cycle
+}
+
+// RecordSteerSent records a new steer with pre-steer context for later effectiveness evaluation.
+func (cs *CycleState) RecordSteerSent(cycle int, message string, currentToolPattern string) {
+	cs.mx.Lock()
+	defer cs.mx.Unlock()
+
+	cs.TotalSteers++
+	cs.LastSteerCycle = cycle
+	cs.PreSteerToolPattern = currentToolPattern
+
+	record := SteerRecord{
+		Cycle:   cycle,
+		Message: message,
+	}
+	cs.SteerHistory = append(cs.SteerHistory, record)
+	if len(cs.SteerHistory) > 10 {
+		cs.SteerHistory = cs.SteerHistory[len(cs.SteerHistory)-10:]
+	}
+}
+
+// MarkSteerConsumed records that the pending steer was consumed by the agent checkpoint.
+func (cs *CycleState) MarkSteerConsumed(cycle int) {
+	cs.mx.Lock()
+	defer cs.mx.Unlock()
+
+	if len(cs.SteerHistory) == 0 {
+		return
+	}
+	last := &cs.SteerHistory[len(cs.SteerHistory)-1]
+	if last.ConsumedAt == 0 {
+		last.ConsumedAt = cycle
+		cs.LastSteerConsumedCycle = cycle
+	}
+}
+
+// EvaluateSteerEffectiveness checks if the most recent consumed steer changed agent behavior.
+// Call this 2 cycles after a steer was consumed.
+// currentToolPattern is a fingerprint of recent tool calls.
+func (cs *CycleState) EvaluateSteerEffectiveness(currentToolPattern string) {
+	cs.mx.Lock()
+	defer cs.mx.Unlock()
+
+	if len(cs.SteerHistory) == 0 {
+		return
+	}
+
+	last := &cs.SteerHistory[len(cs.SteerHistory)-1]
+	if last.Evaluated || last.ConsumedAt == 0 {
+		return // not consumed yet or already evaluated
+	}
+
+	// Compare: if tool pattern is substantially the same, steer was ignored
+	last.Evaluated = true
+	if currentToolPattern == cs.PreSteerToolPattern || currentToolPattern == "" {
+		last.WasEffective = false
+		cs.ConsecutiveIgnoredSteers++
+	} else {
+		last.WasEffective = true
+		cs.ConsecutiveIgnoredSteers = 0 // reset on success
+	}
 }
 
 // RecordPause records that a pause was performed this cycle.
@@ -186,15 +263,18 @@ func (cs *CycleState) Snapshot() *CycleState {
 	defer cs.mx.Unlock()
 
 	snap := &CycleState{
-		FlowID:         cs.FlowID,
-		Cycle:          cs.Cycle,
-		LastMessageID:  cs.LastMessageID,
-		LastCheckTS:    cs.LastCheckTS,
-		FindingsCount:  cs.FindingsCount,
-		ConfirmedCount: cs.ConfirmedCount,
-		TotalSteers:    cs.TotalSteers,
-		TotalPauses:    cs.TotalPauses,
-		LastSteerCycle: cs.LastSteerCycle,
+		FlowID:                  cs.FlowID,
+		Cycle:                   cs.Cycle,
+		LastMessageID:           cs.LastMessageID,
+		LastCheckTS:             cs.LastCheckTS,
+		FindingsCount:           cs.FindingsCount,
+		ConfirmedCount:          cs.ConfirmedCount,
+		TotalSteers:             cs.TotalSteers,
+		TotalPauses:             cs.TotalPauses,
+		LastSteerCycle:          cs.LastSteerCycle,
+		ConsecutiveIgnoredSteers: cs.ConsecutiveIgnoredSteers,
+		LastSteerConsumedCycle:  cs.LastSteerConsumedCycle,
+		PreSteerToolPattern:     cs.PreSteerToolPattern,
 	}
 	snap.HealthHistory = make([]HealthStatus, len(cs.HealthHistory))
 	copy(snap.HealthHistory, cs.HealthHistory)
@@ -202,5 +282,7 @@ func (cs *CycleState) Snapshot() *CycleState {
 	copy(snap.CriticalEvents, cs.CriticalEvents)
 	snap.NoProgressWindow = make([]bool, len(cs.NoProgressWindow))
 	copy(snap.NoProgressWindow, cs.NoProgressWindow)
+	snap.SteerHistory = make([]SteerRecord, len(cs.SteerHistory))
+	copy(snap.SteerHistory, cs.SteerHistory)
 	return snap
 }

@@ -382,7 +382,16 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 		"flow_id": tw.taskCtx.FlowID,
 	})
 
-	var confirmationSubtasksInjected int
+	// confirmationState tracks the lifecycle of system-injected confirmation subtasks.
+	// We track completions (not just creations) because the refiner may delete subtasks
+	// before they execute, inflating the injected count while no work was done.
+	type confirmationState struct {
+		injected   int
+		completed  int
+		subtaskIDs []int64
+	}
+	var confirmState confirmationState
+
 	for len(tw.stc.ListSubtasks(ctx)) < providers.TasksNumberLimit+3 {
 		if budget := providers.GetBudget(ctx); budget != nil {
 			used, maxCalls, pct := budget.Status()
@@ -449,6 +458,30 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 			return nil
 		} // otherwise subtask is done
 
+		// Track confirmation subtask completion
+		if strings.HasPrefix(st.GetTitle(), providers.ConfirmationSubtaskPrefix) {
+			confirmState.completed++
+			logger.WithFields(logrus.Fields{
+				"subtask_id": st.GetSubtaskID(),
+				"completed":  confirmState.completed,
+			}).Info("confirmation subtask completed execution")
+		}
+
+		// Fix SURGEON-C #4: After subtask completion, process confirmation results
+		// to auto-update findings as false positive or confirmed.
+		func() {
+			subtaskResult, resultErr := st.GetResult(ctx)
+			if resultErr == nil && subtaskResult != "" {
+				providers.ProcessConfirmationResult(
+					ctx,
+					tw.taskCtx.DB,
+					tw.taskCtx.FlowID,
+					st.GetTitle(),
+					subtaskResult,
+				)
+			}
+		}()
+
 		if err := tw.stc.RefineSubtasks(ctx); err != nil {
 			if errors.Is(err, context.Canceled) {
 				// Preserve the global budget when recovering from context cancellation
@@ -496,9 +529,9 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 			}
 		}
 		confirmStats := providers.GetFlowConfirmationStats(ctx, tw.taskCtx.DB, tw.taskCtx.FlowID)
-		if providers.NeedsConfirmationSubtask(confirmStats, completedTestingSubtasks, confirmationSubtasksInjected) {
+		if providers.NeedsConfirmationSubtask(confirmStats, completedTestingSubtasks, confirmState.injected) {
 			title, desc := providers.BuildConfirmationSubtaskDescription(ctx, tw.taskCtx.DB, tw.taskCtx.FlowID)
-			_, createErr := tw.taskCtx.DB.CreateSubtask(ctx, database.CreateSubtaskParams{
+			newSubtask, createErr := tw.taskCtx.DB.CreateSubtask(ctx, database.CreateSubtaskParams{
 				Status:      database.SubtaskStatusCreated,
 				TaskID:      tw.taskCtx.TaskID,
 				Title:       title,
@@ -507,9 +540,11 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 			if createErr != nil {
 				logger.WithError(createErr).Warn("failed to inject confirmation subtask")
 			} else {
-				confirmationSubtasksInjected++
+				confirmState.injected++
+				confirmState.subtaskIDs = append(confirmState.subtaskIDs, newSubtask.ID)
 				logger.WithFields(logrus.Fields{
-					"injected_count":     confirmationSubtasksInjected,
+					"injected_count":     confirmState.injected,
+					"completed_count":    confirmState.completed,
 					"unconfirmed":        confirmStats.Unconfirmed,
 					"confirmation_rate":  confirmStats.Rate,
 				}).Info("injected confirmation subtask after refiner")
@@ -517,8 +552,20 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 		}
 	}
 
+	// Quality gate: use completed count (not injected) to decide if we need more confirmation.
+	// This fixes the ghost counter bug where the refiner deletes injected subtasks but the
+	// counter stays incremented, permanently blocking the quality gate.
 	preReportStats := providers.GetFlowConfirmationStats(ctx, tw.taskCtx.DB, tw.taskCtx.FlowID)
-	if providers.NeedsQualityGate(preReportStats, confirmationSubtasksInjected) {
+	logger.WithFields(logrus.Fields{
+		"confirmation_rate":      preReportStats.Rate,
+		"total_findings":         preReportStats.Total,
+		"confirmed_findings":     preReportStats.Confirmed,
+		"unconfirmed_findings":   preReportStats.Unconfirmed,
+		"confirmation_injected":  confirmState.injected,
+		"confirmation_completed": confirmState.completed,
+	}).Info("pre-report quality gate check")
+
+	if providers.NeedsQualityGate(preReportStats, confirmState.completed) {
 		title, desc := providers.BuildConfirmationSubtaskDescription(ctx, tw.taskCtx.DB, tw.taskCtx.FlowID)
 		_, createErr := tw.taskCtx.DB.CreateSubtask(ctx, database.CreateSubtaskParams{
 			Status:      database.SubtaskStatusCreated,
@@ -529,15 +576,30 @@ func (tw *taskWorker) Run(ctx context.Context) error {
 		if createErr != nil {
 			logger.WithError(createErr).Warn("quality gate: failed to inject confirmation subtask before report")
 		} else {
-			confirmationSubtasksInjected++
+			confirmState.injected++
 			logger.WithFields(logrus.Fields{
 				"confirmation_rate": preReportStats.Rate,
 				"unconfirmed":       preReportStats.Unconfirmed,
 				"total_findings":    preReportStats.Total,
-			}).Info("quality gate: injected confirmation subtask before report — rate too low")
+			}).Warn("QUALITY GATE TRIGGERED: injecting confirmation subtask before report — rate too low")
 
 			if gateSubtask, popErr := tw.stc.PopSubtask(ctx, tw); popErr == nil && gateSubtask != nil {
 				_ = gateSubtask.Run(ctx)
+				confirmState.completed++
+
+				// Process confirmation results from the quality gate subtask
+				func() {
+					subtaskResult, resultErr := gateSubtask.GetResult(ctx)
+					if resultErr == nil && subtaskResult != "" {
+						providers.ProcessConfirmationResult(
+							ctx,
+							tw.taskCtx.DB,
+							tw.taskCtx.FlowID,
+							gateSubtask.GetTitle(),
+							subtaskResult,
+						)
+					}
+				}()
 			}
 		}
 	}

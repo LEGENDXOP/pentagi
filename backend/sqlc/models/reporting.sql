@@ -47,6 +47,9 @@ UPDATE findings SET confirmed = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1
 -- name: UpdateFindingFalsePositive :exec
 UPDATE findings SET false_positive = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1;
 
+-- name: UpdateFindingSeverity :exec
+UPDATE findings SET severity = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1;
+
 -- name: GetFlowFindingCount :one
 SELECT COUNT(*) FROM findings WHERE flow_id = $1 AND false_positive = FALSE;
 

@@ -262,6 +262,10 @@ type Querier interface {
 	UpdateUserRole(ctx context.Context, arg UpdateUserRoleParams) (User, error)
 	UpdateUserStatus(ctx context.Context, arg UpdateUserStatusParams) (User, error)
 	UpsertUserPreferences(ctx context.Context, arg UpsertUserPreferencesParams) (UserPreference, error)
+	// Finding update operations (Fix SURGEON-C #4: FP auto-correction)
+	UpdateFindingConfirmed(ctx context.Context, arg UpdateFindingConfirmedParams) error
+	UpdateFindingFalsePositive(ctx context.Context, arg UpdateFindingFalsePositiveParams) error
+	UpdateFindingSeverity(ctx context.Context, arg UpdateFindingSeverityParams) error
 	// Zombie cleanup: fail all running toolcalls for a subtask
 	FailRunningToolcallsBySubtask(ctx context.Context, reason string, subtaskID int64) error
 	// Zombie cleanup: fail all running toolcalls for a flow

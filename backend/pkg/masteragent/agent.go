@@ -28,6 +28,7 @@ type FlowControlAdapter interface {
 	Resume(flowID int64) error
 	Abort(flowID int64) error
 	AbortChannel(flowID int64) <-chan struct{}
+	HardStop(flowID int64) error // full flow termination (DB + container + goroutine cleanup)
 }
 
 // Agent is the LLM-powered Master Agent that supervises a single flow.
@@ -112,6 +113,9 @@ func (a *Agent) RunCycle(ctx context.Context) error {
 		return nil
 	}
 
+	// 1.5. Check steer consumption and evaluate effectiveness
+	a.evaluateSteerEffectiveness(data)
+
 	// 2. Build the LLM prompt
 	prompt := a.buildPrompt(data)
 
@@ -129,17 +133,66 @@ func (a *Agent) RunCycle(ctx context.Context) error {
 		"reason":  decision.Reasoning,
 	}).Info("LLM decision received")
 
+	// 3.5. Code-level failsafe: override LLM decision if chronic steer ignoring detected
+	snap := a.state.Snapshot()
+	if snap.ConsecutiveIgnoredSteers >= 5 && decision.Action != ActionHardStop {
+		a.logger.Warn("overriding LLM decision: 5+ ignored steers, forcing HARD_STOP")
+		decision.Action = ActionHardStop
+		decision.Reasoning = fmt.Sprintf("CODE FAILSAFE: %d consecutive steers ignored. Original decision: %s. %s",
+			snap.ConsecutiveIgnoredSteers, decision.Action, decision.Reasoning)
+	}
+
 	// 4. Record state
 	a.state.RecordHealth(decision.Health)
 
 	// 5. Execute the decision
-	if err := a.executeDecision(ctx, decision); err != nil {
+	if err := a.executeDecision(ctx, decision, data); err != nil {
 		a.logger.WithError(err).Error("failed to execute decision")
 		return fmt.Errorf("execute decision: %w", err)
 	}
 
 	a.logger.WithField("cycle", cycle).Info("master agent cycle complete")
 	return nil
+}
+
+// evaluateSteerEffectiveness checks if previous steers were consumed and effective.
+func (a *Agent) evaluateSteerEffectiveness(data *flowData) {
+	snap := a.state.Snapshot()
+
+	// If there's a pending steer that's now consumed (status no longer "steered"), mark it
+	if snap.TotalSteers > 0 && len(snap.SteerHistory) > 0 {
+		last := snap.SteerHistory[len(snap.SteerHistory)-1]
+		if last.ConsumedAt == 0 {
+			// Check if steer was consumed (status returned to "running")
+			if data.ControlStatus != "steered" {
+				a.state.MarkSteerConsumed(snap.Cycle)
+				a.logger.WithField("cycle", snap.Cycle).Info("steer consumed by agent")
+			}
+		}
+	}
+
+	// 2 cycles after consumption, evaluate if behavior changed
+	if snap.LastSteerConsumedCycle > 0 && snap.Cycle >= snap.LastSteerConsumedCycle+2 {
+		currentPattern := buildToolPattern(data.RecentMessages)
+		a.state.EvaluateSteerEffectiveness(currentPattern)
+	}
+}
+
+// buildToolPattern creates a fingerprint of recent tool call types.
+// This is used to detect if agent behavior changed after a steer.
+func buildToolPattern(msgs []database.Msglog) string {
+	var tools []string
+	for _, m := range msgs {
+		if m.Type == "tool_call" || m.Type == "function" {
+			// Use the message content (typically the function name or call description)
+			tools = append(tools, m.Message)
+		}
+	}
+	// Take last 10 tool types as pattern
+	if len(tools) > 10 {
+		tools = tools[len(tools)-10:]
+	}
+	return strings.Join(tools, ",")
 }
 
 // flowData holds all the data gathered for a single cycle.
@@ -301,6 +354,36 @@ func (a *Agent) buildPrompt(data *flowData) string {
 		for _, e := range snap.CriticalEvents {
 			b.WriteString(fmt.Sprintf("  - %s\n", e))
 		}
+	}
+	// Steer effectiveness tracking
+	if snap.TotalSteers > 0 {
+		b.WriteString("## Steer Effectiveness\n")
+		b.WriteString(fmt.Sprintf("- **Total Steers Sent:** %d\n", snap.TotalSteers))
+		b.WriteString(fmt.Sprintf("- **Consecutive Ignored Steers:** %d\n", snap.ConsecutiveIgnoredSteers))
+
+		if len(snap.SteerHistory) > 0 {
+			b.WriteString("- **Recent Steer History:**\n")
+			for _, sr := range snap.SteerHistory {
+				status := "pending"
+				if sr.ConsumedAt > 0 && sr.Evaluated {
+					if sr.WasEffective {
+						status = "✓ effective"
+					} else {
+						status = "✗ IGNORED"
+					}
+				} else if sr.ConsumedAt > 0 {
+					status = "consumed, evaluating..."
+				}
+				b.WriteString(fmt.Sprintf("  - Cycle %d: [%s] %s\n", sr.Cycle, status, truncate(sr.Message, 80)))
+			}
+		}
+
+		// ESCALATION WARNING
+		if snap.ConsecutiveIgnoredSteers >= 2 {
+			b.WriteString(fmt.Sprintf("\n⚠️ **ESCALATION TRIGGER: %d consecutive steers ignored. "+
+				"HARD_STOP is available and RECOMMENDED.**\n", snap.ConsecutiveIgnoredSteers))
+		}
+		b.WriteString("\n")
 	}
 	b.WriteString("\n")
 
@@ -531,7 +614,7 @@ func parseLLMResponse(text string) (*LLMDecision, error) {
 
 	// Validate
 	switch decision.Action {
-	case ActionNone, ActionSteer, ActionPause, ActionResume, ActionStop:
+	case ActionNone, ActionSteer, ActionPause, ActionResume, ActionStop, ActionHardStop:
 		// valid
 	default:
 		return nil, fmt.Errorf("unknown action: %s", decision.Action)
@@ -548,7 +631,7 @@ func parseLLMResponse(text string) (*LLMDecision, error) {
 }
 
 // executeDecision takes the LLM's decision and executes it using internal flow control.
-func (a *Agent) executeDecision(ctx context.Context, decision *LLMDecision) error {
+func (a *Agent) executeDecision(ctx context.Context, decision *LLMDecision, data *flowData) error {
 	switch decision.Action {
 	case ActionNone:
 		a.logger.Info("decision: no action needed")
@@ -577,11 +660,14 @@ func (a *Agent) executeDecision(ctx context.Context, decision *LLMDecision) erro
 			msg = fmt.Sprintf("[MASTER AGENT | Cycle %d] %s", snap.Cycle, msg)
 		}
 
+		// Build current tool pattern for later effectiveness comparison
+		currentPattern := buildToolPattern(data.RecentMessages)
+
 		// Execute steer via internal FlowControlManager
 		if err := a.flowControl.Steer(a.flowID, msg); err != nil {
 			return fmt.Errorf("steer flow: %w", err)
 		}
-		a.state.RecordSteer()
+		a.state.RecordSteerSent(snap.Cycle, msg, currentPattern)
 		a.state.RecordCriticalEvent(fmt.Sprintf("cycle %d: steered — %s",
 			snap.Cycle, truncate(decision.Reasoning, 100)))
 
@@ -630,6 +716,55 @@ func (a *Agent) executeDecision(ctx context.Context, decision *LLMDecision) erro
 			a.flowID, snap.Cycle, truncate(decision.Reasoning, 200)))
 
 		a.logger.Info("flow aborted")
+		return nil
+
+	case ActionHardStop:
+		// HARD STOP: Full flow termination with cleanup.
+		// This is the nuclear option — only used after steers have been ignored.
+		snap := a.state.Snapshot()
+
+		// Safety: block during warmup (cycles 1-2)
+		if a.state.IsWarmup() {
+			a.logger.Warn("hard stop blocked: still in warmup phase")
+			return nil
+		}
+
+		// Safety: require at least 1 steer was sent
+		if snap.TotalSteers == 0 {
+			a.logger.Warn("hard stop blocked: no steers were sent first")
+			return nil
+		}
+
+		// Safety: check if already aborted
+		ctrlStatus, _ := a.flowControl.GetControlStatus(a.flowID)
+		if ctrlStatus == "aborted" {
+			a.logger.Info("hard stop requested but flow already aborted")
+			return nil
+		}
+
+		a.logger.Warn("HARD STOP: executing forced flow termination")
+
+		// Belt-and-suspenders: abort flag first for immediate agent loop cancellation
+		if err := a.flowControl.Abort(a.flowID); err != nil {
+			a.logger.WithError(err).Warn("hard stop: abort flag failed (continuing with full stop)")
+		}
+
+		// Full flow termination (DB status + containers + goroutines)
+		if err := a.flowControl.HardStop(a.flowID); err != nil {
+			return fmt.Errorf("hard stop flow: %w", err)
+		}
+
+		a.state.RecordCriticalEvent(fmt.Sprintf("cycle %d: HARD STOP — %s",
+			snap.Cycle, truncate(decision.Reasoning, 100)))
+
+		a.sendTelegramNotification(fmt.Sprintf(
+			"🔴🔴 [MASTER AGENT] Flow %d HARD STOPPED (Cycle %d)\n"+
+				"Consecutive ignored steers: %d\n%s",
+			a.flowID, snap.Cycle, snap.ConsecutiveIgnoredSteers,
+			truncate(decision.Reasoning, 200)))
+
+		a.logger.WithField("ignored_steers", snap.ConsecutiveIgnoredSteers).
+			Warn("flow hard stopped by master agent")
 		return nil
 
 	default:

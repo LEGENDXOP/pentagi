@@ -86,13 +86,33 @@ func NewFlowController(
 ) FlowController {
 	flowCtrl := NewFlowControlManager()
 
-	// Initialize Master Agent supervisor if enabled
+	// Build the flowController first so we can pass it to the adapter.
+	fc := &flowController{
+		db:          db,
+		mx:          &sync.Mutex{},
+		cfg:         cfg,
+		flows:       make(map[int64]FlowWorker),
+		docker:      docker,
+		provs:       provs,
+		subs:        subs,
+		flowControl: flowCtrl,
+		notifier:    notifier,
+		alc:         NewAgentLogController(db),
+		mlc:         NewMsgLogController(db),
+		aslc:        NewAssistantLogController(db),
+		slc:         NewSearchLogController(db),
+		tlc:         NewTermLogController(db),
+		vslc:        NewVectorStoreLogController(db),
+		sc:          NewScreenshotController(db),
+	}
+
+	// Initialize Master Agent supervisor if enabled.
+	// The adapter receives fc so HardStop can call FinishFlow for full cleanup.
 	logrus.WithFields(logrus.Fields{
 		"master_agent_enabled": cfg.MasterAgentEnabled,
 		"master_agent_interval": cfg.MasterAgentInterval,
 		"master_agent_model": cfg.MasterAgentModel,
 	}).Info("master agent config values")
-	var maSupervisor *masteragent.Supervisor
 	if cfg.MasterAgentEnabled {
 		maCfg := masteragent.MasterAgentConfig{
 			Enabled:            true,
@@ -103,32 +123,14 @@ func NewFlowController(
 			TelegramBotToken:   cfg.TelegramBotToken,
 			TelegramChatID:     cfg.TelegramChatID,
 		}
-		maSupervisor = masteragent.NewSupervisor(cfg, maCfg, db, NewFlowControlMasterAgentAdapter(flowCtrl), notifier)
+		fc.masterSupervisor = masteragent.NewSupervisor(cfg, maCfg, db, NewFlowControlMasterAgentAdapter(flowCtrl, fc), notifier)
 		logrus.WithFields(logrus.Fields{
 			"interval": maCfg.Interval.String(),
 			"model":    maCfg.Model,
 		}).Info("master agent supervisor initialized")
 	}
 
-	return &flowController{
-		db:               db,
-		mx:               &sync.Mutex{},
-		cfg:              cfg,
-		flows:            make(map[int64]FlowWorker),
-		docker:           docker,
-		provs:            provs,
-		subs:             subs,
-		flowControl:      flowCtrl,
-		notifier:         notifier,
-		masterSupervisor: maSupervisor,
-		alc:              NewAgentLogController(db),
-		mlc:              NewMsgLogController(db),
-		aslc:             NewAssistantLogController(db),
-		slc:              NewSearchLogController(db),
-		tlc:              NewTermLogController(db),
-		vslc:             NewVectorStoreLogController(db),
-		sc:               NewScreenshotController(db),
-	}
+	return fc
 }
 
 func (fc *flowController) GetFlowControlManager() FlowControlManager {
