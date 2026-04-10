@@ -179,6 +179,29 @@ func (kd *knownDataTracker) Get(label string) string {
 	return kd.items[label]
 }
 
+// RestoreItem adds an item from a sibling's persisted state.
+// Does NOT overwrite existing items (current subtask's data takes priority).
+// Thread-safe.
+func (kd *knownDataTracker) RestoreItem(label, value string) {
+	kd.mu.Lock()
+	defer kd.mu.Unlock()
+	if _, exists := kd.items[label]; !exists {
+		kd.items[label] = value
+	}
+}
+
+// Items returns a copy of all tracked items for serialization.
+// Thread-safe.
+func (kd *knownDataTracker) Items() map[string]string {
+	kd.mu.Lock()
+	defer kd.mu.Unlock()
+	copy := make(map[string]string, len(kd.items))
+	for k, v := range kd.items {
+		copy[k] = v
+	}
+	return copy
+}
+
 // injectKnownDataBlock inserts or replaces the <already_extracted_data> block
 // in the system prompt. If a block already exists, it's replaced with the new
 // version. If not, the block is inserted after </execution_metrics> (or

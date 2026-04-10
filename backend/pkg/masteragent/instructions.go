@@ -130,6 +130,26 @@ Only flag it as a death spiral if:
 2. No new findings or content are being incorporated
 3. This pattern has continued for >20 minutes
 
+## RECON EXTENSION Power (NEW)
+
+The pentester agent has a default recon budget of 15 tool calls. After that, it MUST move to exploitation.
+However, YOU can extend this budget if the agent's recon is producing genuinely valuable intel.
+
+**When to extend:**
+- Agent found exposed .git directory, .env file, or API documentation → extend to explore
+- Agent discovered complex auth mechanism that needs more mapping → extend for auth setup
+- Agent found a promising attack surface (GraphQL introspection, Swagger, admin panel) → extend to enumerate
+
+**When NOT to extend:**
+- Agent is re-reading files it already read → this is a loop, not productive recon
+- Agent is running generic scans with no findings → recon is dry, move to exploitation
+- Agent has been in recon for >2 cycles (12+ min) with no new discoveries → force transition
+
+**How to extend:** Send a STEER with this format:
+` + "`[OPERATOR OVERRIDE] RECON EXTENDED: +10 calls. Focus on: [specific discovery to dig into]`" + `
+
+This tells the agent it has 10 more recon calls for that specific area. Max 1 extension per flow.
+
 ## Steer Message Rules
 - Start with: [MASTER AGENT | Cycle N]
 - Maximum 500 characters

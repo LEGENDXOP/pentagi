@@ -342,6 +342,10 @@ func (fp *flowProvider) performAgentChain(
 		// force-injects pre-generated report and done instruction.
 		reportVerifyCycles = 0
 		lastReportAction   = "" // "write" or "read"
+
+		// Steer compliance: tracks the active steer message so it can be
+		// injected into the system prompt during the metrics refresh cycle.
+		activeSteerMsg = ""
 	)
 
 	// Silence unused variable warnings for guard booleans (set inside loop).
@@ -708,6 +712,14 @@ func (fp *flowProvider) performAgentChain(
 					if loaded.Blockers != nil {
 						blockerTracker.RestoreFromJSON(loaded.Blockers)
 					}
+
+					// FIX-AMNESIA-B: Restore known data (JWT tokens, GraphQL endpoints, etc.)
+					// from sibling subtasks so this subtask's system prompt has them immediately.
+					if loaded.KnownData != nil {
+						for k, v := range loaded.KnownData {
+							knownData.RestoreItem(k, v)
+						}
+					}
 				}
 			}
 			if sibCtx.Len() > 0 || rescuedEvidence.Len() > 0 {
@@ -787,6 +799,72 @@ func (fp *flowProvider) performAgentChain(
 		}
 	}
 
+	// FIX-AMNESIA-A: Auto-inject HANDOFF.md content at subtask start.
+	// The agent currently wastes 2-4 tool calls per subtask reading this file.
+	// Inject it proactively so the agent starts with full context.
+	if subtaskID != nil {
+		handoffCtx, handoffCancel := context.WithTimeout(ctx, 10*time.Second)
+		handoffArgs, _ := json.Marshal(map[string]interface{}{
+			"input":   "cat /work/HANDOFF.md 2>/dev/null || echo ''",
+			"timeout": 5,
+		})
+		handoffContent, handoffErr := executor.Execute(handoffCtx, 0, "", "terminal", "", handoffArgs)
+		handoffCancel()
+
+		if handoffErr == nil && strings.TrimSpace(handoffContent) != "" && handoffContent != "''" {
+			// Truncate to 16KB to avoid bloating the chain
+			if len(handoffContent) > 16384 {
+				handoffContent = handoffContent[:16384] + "\n[TRUNCATED — read full file with `cat /work/HANDOFF.md`]\n"
+			}
+			var handoffInjection strings.Builder
+			handoffInjection.WriteString("[HANDOFF.MD — CONTEXT FROM PREVIOUS SUBTASKS]\n")
+			handoffInjection.WriteString("This data was collected by previous subtasks. DO NOT re-collect it.\n\n")
+			handoffInjection.WriteString(handoffContent)
+			handoffInjection.WriteString("\n\n⚠️ The above recon data is already collected. Do NOT re-run port scans, ")
+			handoffInjection.WriteString("endpoint enumeration, tech fingerprinting, or nuclei scans if they appear above.")
+
+			chain = append(chain, llms.MessageContent{
+				Role: llms.ChatMessageTypeHuman,
+				Parts: []llms.ContentPart{
+					llms.TextContent{Text: handoffInjection.String()},
+				},
+			})
+			logger.WithField("handoff_bytes", len(handoffContent)).
+				Info("FIX-AMNESIA-A: auto-injected HANDOFF.md content into subtask chain")
+		}
+	}
+
+	// FIX-AMNESIA-D: Auto-inject FINDINGS.md at subtask start.
+	// Prevents the agent from re-testing vulnerabilities already documented.
+	if subtaskID != nil {
+		findingsCtx, findingsCancel := context.WithTimeout(ctx, 10*time.Second)
+		findingsArgs, _ := json.Marshal(map[string]interface{}{
+			"input":   "cat /work/FINDINGS.md 2>/dev/null || echo ''",
+			"timeout": 5,
+		})
+		findingsContent, findingsErr := executor.Execute(findingsCtx, 0, "", "terminal", "", findingsArgs)
+		findingsCancel()
+
+		if findingsErr == nil && strings.TrimSpace(findingsContent) != "" && findingsContent != "''" {
+			if len(findingsContent) > 8192 {
+				findingsContent = findingsContent[:8192] + "\n[TRUNCATED]\n"
+			}
+			chain = append(chain, llms.MessageContent{
+				Role: llms.ChatMessageTypeHuman,
+				Parts: []llms.ContentPart{
+					llms.TextContent{Text: fmt.Sprintf(
+						"[FINDINGS.MD — VULNERABILITIES ALREADY DOCUMENTED]\n"+
+							"These findings have already been identified. Do NOT re-test them.\n\n%s\n\n"+
+							"⚠️ Focus on NEW vulnerability classes not covered above.",
+						findingsContent,
+					)},
+				},
+			})
+			logger.WithField("findings_bytes", len(findingsContent)).
+				Info("FIX-AMNESIA-D: auto-injected FINDINGS.md content into subtask chain")
+		}
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			// v5: If timebox is active and this is a deadline expiry (not user cancel),
@@ -863,14 +941,24 @@ func (fp *flowProvider) performAgentChain(
 				return fmt.Errorf("flow control checkpoint: %w", fcErr)
 			}
 			if steerMsg != "" {
-				// Inject operator override as a system message into the chain
-				overrideContent := fmt.Sprintf("[OPERATOR OVERRIDE] %s", steerMsg)
+				// Inject steer as BOTH a conversation message AND a system prompt block.
+				// Dual injection ensures the LLM sees it from two authority vectors.
+				overrideContent := fmt.Sprintf(
+					"⚠️ MANDATORY OPERATOR OVERRIDE — YOU MUST COMPLY ⚠️\n"+
+						"The following instruction comes from your operator (Master Agent) and OVERRIDES all previous plans:\n\n"+
+						"%s\n\n"+
+						"COMPLIANCE IS NOT OPTIONAL. Your very next action MUST demonstrate compliance with this instruction. "+
+						"If you continue your previous behavior, this flow WILL BE TERMINATED.",
+					steerMsg,
+				)
 				chain = append(chain, llms.MessageContent{
 					Role: llms.ChatMessageTypeHuman,
 					Parts: []llms.ContentPart{
 						llms.TextContent{Text: overrideContent},
 					},
 				})
+				// Store active steer for system prompt injection (Change 1B)
+				activeSteerMsg = steerMsg
 				logger.WithField("steer_message", steerMsg).Info("flow control: operator steer message injected into chain")
 			}
 		}
@@ -920,6 +1008,16 @@ func (fp *flowProvider) performAgentChain(
 						}
 					}
 					updated := injectMetricsIntoSystemPrompt(text.Text, metrics.Snapshot(metricsStartTime), timeRemainingMinutes)
+
+					// STEER COMPLIANCE: Inject active steer into system prompt for maximum LLM attention.
+					// The system prompt is position 0 in the chain — it gets the highest weight.
+					if activeSteerMsg != "" {
+						updated = injectActiveSteerIntoSystemPrompt(updated, activeSteerMsg)
+						activeSteerMsg = "" // clear after injection (steer lives in system prompt until next refresh)
+					} else {
+						// Remove stale operator steer block if present (no active steer)
+						updated = removeStaleSteerBlock(updated)
+					}
 
 					// Inject known extracted data into system prompt so the LLM
 					// always has access to JWT tokens, GraphQL endpoints, etc.
@@ -2197,6 +2295,12 @@ func (fp *flowProvider) performAgentChain(
 
 			// Fix 3: Persist blocker information into execution state.
 			execState.UpdateBlockers(blockerTracker)
+
+			// FIX-AMNESIA-B: Persist known data to execution state so siblings
+			// can restore JWT tokens, GraphQL endpoints, etc.
+			if knownData != nil && knownData.HasData() {
+				execState.KnownData = knownData.Items()
+			}
 
 			// v6/V2: Also persist tracked operations
 			if opsJSON := completedWork.OperationsToJSON(); len(opsJSON) > 0 {
