@@ -298,9 +298,8 @@ const (
 	MsglogTypeSearch   MsglogType = "search"
 	MsglogTypeAdvice   MsglogType = "advice"
 	MsglogTypeAsk      MsglogType = "ask"
-	MsglogTypeInput       MsglogType = "input"
-	MsglogTypeDone        MsglogType = "done"
-	MsglogTypeMasterAgent MsglogType = "master_agent"
+	MsglogTypeInput    MsglogType = "input"
+	MsglogTypeDone     MsglogType = "done"
 )
 
 func (e *MsglogType) Scan(src interface{}) error {

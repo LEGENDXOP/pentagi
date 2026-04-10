@@ -2,7 +2,6 @@ package masteragent
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -151,9 +150,6 @@ func (a *Agent) RunCycle(ctx context.Context) error {
 		a.logger.WithError(err).Error("failed to execute decision")
 		return fmt.Errorf("execute decision: %w", err)
 	}
-
-	// 6. Store MA cycle event in DB for observability
-	a.storeMACycleEvent(ctx, decision, data)
 
 	a.logger.WithField("cycle", cycle).Info("master agent cycle complete")
 	return nil
@@ -680,7 +676,6 @@ func (a *Agent) executeDecision(ctx context.Context, decision *LLMDecision, data
 			a.flowID, snap.Cycle, truncate(msg, 200)))
 
 		a.logger.WithField("message", msg).Info("flow steered")
-		a.storeMASteerEvent(ctx, msg, snap.Cycle)
 		return nil
 
 	case ActionPause:
@@ -770,7 +765,6 @@ func (a *Agent) executeDecision(ctx context.Context, decision *LLMDecision, data
 
 		a.logger.WithField("ignored_steers", snap.ConsecutiveIgnoredSteers).
 			Warn("flow hard stopped by master agent")
-		a.storeMAHardStopEvent(ctx, decision.Reasoning, snap.Cycle, snap.ConsecutiveIgnoredSteers)
 		return nil
 
 	default:
@@ -813,100 +807,4 @@ func getGlobalMaxToolCallsForMasterAgent() int {
 		}
 	}
 	return 500
-}
-
-// storeMACycleEvent writes the Master Agent's cycle result to the msglogs table
-// so that reporter agents (e.g., SPECTRE) can query MA activity via GetFlowMsgLogs.
-func (a *Agent) storeMACycleEvent(ctx context.Context, decision *LLMDecision, data *flowData) {
-	snap := a.state.Snapshot()
-
-	// Build a structured message summarizing the MA decision
-	message := fmt.Sprintf("[MASTER AGENT] Cycle %d | Action: %s | Health: %s",
-		snap.Cycle, decision.Action, decision.Health)
-
-	// Build a detailed result with full context
-	var resultParts []string
-	resultParts = append(resultParts, fmt.Sprintf("## Master Agent Cycle %d Report", snap.Cycle))
-	resultParts = append(resultParts, fmt.Sprintf("- **Action:** %s", decision.Action))
-	resultParts = append(resultParts, fmt.Sprintf("- **Health:** %s", decision.Health))
-	resultParts = append(resultParts, fmt.Sprintf("- **Reasoning:** %s", decision.Reasoning))
-
-	if decision.Action == ActionSteer && decision.SteerMessage != "" {
-		resultParts = append(resultParts, fmt.Sprintf("- **Steer Message:** %s", decision.SteerMessage))
-	}
-
-	if snap.TotalSteers > 0 {
-		resultParts = append(resultParts, fmt.Sprintf("- **Total Steers Sent:** %d", snap.TotalSteers))
-		resultParts = append(resultParts, fmt.Sprintf("- **Consecutive Ignored Steers:** %d", snap.ConsecutiveIgnoredSteers))
-	}
-
-	resultParts = append(resultParts, fmt.Sprintf("- **Flow Status:** %s", data.FlowStatus))
-	resultParts = append(resultParts, fmt.Sprintf("- **Tool Calls:** %d", data.ToolCallStats.TotalCount))
-	resultParts = append(resultParts, fmt.Sprintf("- **Findings:** %d total, %d confirmed",
-		data.FindingsTotal, data.FindingsConfirmed))
-
-	result := strings.Join(resultParts, "\n")
-
-	_, err := a.db.CreateResultMsgLog(ctx, database.CreateResultMsgLogParams{
-		Type:         database.MsglogTypeMasterAgent,
-		Message:      message,
-		Thinking:     sql.NullString{},
-		Result:       result,
-		ResultFormat: database.MsglogResultFormatMarkdown,
-		FlowID:       a.flowID,
-		TaskID:       sql.NullInt64{},
-		SubtaskID:    sql.NullInt64{},
-	})
-	if err != nil {
-		a.logger.WithError(err).Warn("failed to store MA cycle event in DB (non-fatal)")
-	} else {
-		a.logger.WithField("cycle", snap.Cycle).Debug("MA cycle event stored in DB")
-	}
-}
-
-// storeMASteerEvent stores a dedicated log entry when a steer is sent.
-// This ensures steers are individually trackable in the activity feed.
-func (a *Agent) storeMASteerEvent(ctx context.Context, steerMessage string, cycle int) {
-	message := fmt.Sprintf("[MASTER AGENT STEER] Cycle %d: %s", cycle, truncate(steerMessage, 200))
-	result := fmt.Sprintf("## Operator Steer Sent\n- **Cycle:** %d\n- **Message:** %s\n- **Total Steers:** %d",
-		cycle, steerMessage, a.state.Snapshot().TotalSteers)
-
-	_, err := a.db.CreateResultMsgLog(ctx, database.CreateResultMsgLogParams{
-		Type:         database.MsglogTypeMasterAgent,
-		Message:      message,
-		Thinking:     sql.NullString{},
-		Result:       result,
-		ResultFormat: database.MsglogResultFormatMarkdown,
-		FlowID:       a.flowID,
-		TaskID:       sql.NullInt64{},
-		SubtaskID:    sql.NullInt64{},
-	})
-	if err != nil {
-		a.logger.WithError(err).Warn("failed to store MA steer event in DB")
-	}
-}
-
-// storeMAHardStopEvent stores a dedicated log entry when a HARD_STOP is executed.
-func (a *Agent) storeMAHardStopEvent(ctx context.Context, reasoning string, cycle int, ignoredSteers int) {
-	message := fmt.Sprintf("[MASTER AGENT HARD_STOP] Cycle %d: Flow terminated | %d ignored steers", cycle, ignoredSteers)
-	result := fmt.Sprintf(
-		"## \u26d4 Flow Hard Stopped by Master Agent\n"+
-			"- **Cycle:** %d\n"+
-			"- **Consecutive Ignored Steers:** %d\n"+
-			"- **Reasoning:** %s",
-		cycle, ignoredSteers, reasoning)
-
-	_, err := a.db.CreateResultMsgLog(ctx, database.CreateResultMsgLogParams{
-		Type:         database.MsglogTypeMasterAgent,
-		Message:      message,
-		Thinking:     sql.NullString{},
-		Result:       result,
-		ResultFormat: database.MsglogResultFormatMarkdown,
-		FlowID:       a.flowID,
-		TaskID:       sql.NullInt64{},
-		SubtaskID:    sql.NullInt64{},
-	})
-	if err != nil {
-		a.logger.WithError(err).Warn("failed to store MA hard stop event in DB")
-	}
 }

@@ -181,11 +181,6 @@ type ExecutionState struct {
 	// V3: Blocker tracking — persists detected blockers (WAF, auth gates, CAPTCHA, etc.)
 	// so that the refiner and subsequent subtasks know which attack paths are blocked.
 	Blockers json.RawMessage `json:"blockers,omitempty"`
-
-	// V4: Known data persistence — JWT tokens, GraphQL endpoints, API keys, etc.
-	// discovered during this subtask. Restored from siblings at subtask start
-	// so the LLM always has access to previously extracted artifacts.
-	KnownData map[string]string `json:"known_data,omitempty"`
 }
 
 // MarshalJSON serializes the execution state to JSON.
