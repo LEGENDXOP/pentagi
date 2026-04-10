@@ -179,6 +179,24 @@ func extractRelevantText(resultLower string, identifiers []string) string {
 	return ""
 }
 
+// containsNegation checks if the text before a match index contains negation words.
+// It looks at up to 15 characters before the match for common negation patterns.
+func containsNegation(text string, matchIdx int) bool {
+	start := matchIdx - 15
+	if start < 0 {
+		start = 0
+	}
+	prefix := strings.ToLower(text[start:matchIdx])
+
+	negations := []string{"not ", "unable", "un", "no ", "cannot ", "can't ", "never "}
+	for _, neg := range negations {
+		if strings.Contains(prefix, neg) {
+			return true
+		}
+	}
+	return false
+}
+
 // containsFPIndicator checks if text contains false positive indicators.
 func containsFPIndicator(text string) bool {
 	fpPatterns := []string{
@@ -205,7 +223,13 @@ func containsFPIndicator(text string) bool {
 		"mitigated",
 	}
 	for _, p := range fpPatterns {
-		if strings.Contains(text, p) {
+		idx := strings.Index(text, p)
+		if idx >= 0 {
+			// Negation before an FP indicator cancels it:
+			// e.g., "not a false positive" means it IS a real vuln.
+			if containsNegation(text, idx) {
+				continue
+			}
 			return true
 		}
 	}
@@ -228,7 +252,13 @@ func containsConfirmationIndicator(text string) bool {
 		"injection successful",
 	}
 	for _, p := range confirmPatterns {
-		if strings.Contains(text, p) {
+		idx := strings.Index(text, p)
+		if idx >= 0 {
+			// Negation before a confirmation indicator cancels it:
+			// e.g., "not confirmed" means it's NOT confirmed.
+			if containsNegation(text, idx) {
+				continue
+			}
 			return true
 		}
 	}

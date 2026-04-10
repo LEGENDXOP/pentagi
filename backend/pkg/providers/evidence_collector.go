@@ -1476,6 +1476,41 @@ func isReportDumpDescription(desc string) bool {
 		markers += sevHeaders
 	}
 
+	// Heuristic: Count markdown headers (##+) as structural markers.
+	// Report dumps typically have many section headers.
+	mdHeaderCount := 0
+	for _, line := range strings.Split(desc, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "##") {
+			mdHeaderCount++
+		}
+	}
+	if mdHeaderCount >= 3 {
+		markers += mdHeaderCount
+	}
+
+	// Heuristic: Check for report section keywords.
+	reportSectionKeywords := []string{
+		"executive summary", "detailed findings", "remediation",
+		"methodology", "scope", "assessment overview",
+		"vulnerability analysis", "risk rating",
+	}
+	sectionNameCount := 0
+	for _, kw := range reportSectionKeywords {
+		if strings.Contains(lower, kw) {
+			sectionNameCount++
+		}
+	}
+	if sectionNameCount >= 2 {
+		markers += sectionNameCount
+	}
+
+	// Early reject: long descriptions with structural markers are almost certainly
+	// report dumps, even if they don't have enough traditional markers.
+	if len(desc) > 2000 && (mdHeaderCount >= 2 || sectionNameCount >= 1) {
+		return true
+	}
+
 	return markers >= 3
 }
 
